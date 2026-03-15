@@ -78,6 +78,15 @@ public sealed class VideoPlayer : IDisposable
     private string _status = "Stopped";
     public string Status => _status;
 
+    /// <summary>The path or URL most recently passed to Play(). Empty when stopped.</summary>
+    public string CurrentPath { get; private set; } = string.Empty;
+
+    /// <summary>
+    /// Fired (on a background thread) when the current media reaches its end.
+    /// Subscriber is responsible for deciding whether to loop, advance playlist, etc.
+    /// </summary>
+    public event Action? EndOfMedia;
+
     // ── Public API ────────────────────────────────────────────────────────────
     public ID3D11ShaderResourceView? FrameSrv => _srv;
     // False when stopped — even if the GPU texture still exists from the last frame.
@@ -166,6 +175,7 @@ public sealed class VideoPlayer : IDisposable
         // version and aborts before calling StartPlayback().
         int version = Interlocked.Increment(ref _playVersion);
         Stop();
+        CurrentPath = pathOrUrl;
         _status = "Loading...";
 
         bool isUrl = pathOrUrl.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
@@ -513,15 +523,9 @@ public sealed class VideoPlayer : IDisposable
 
     private void OnEndReached(object? sender, EventArgs e)
     {
-        // Capture version so we don't restart if Play() was called since end-of-file fired.
-        int version = _playVersion;
-        Task.Run(() =>
-        {
-            if (_playVersion != version) return;
-            _player.Stop();
-            if (_playVersion != version) return;
-            _player.Play();
-        });
+        // Fire EndOfMedia on a background thread to get off LibVLC's callback thread.
+        // The subscriber (SyncCoordinator) decides whether to loop, advance playlist, etc.
+        _ = Task.Run(() => EndOfMedia?.Invoke());
     }
 
     // ── Dispose ───────────────────────────────────────────────────────────────

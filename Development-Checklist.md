@@ -185,27 +185,27 @@ LibVLC already supports HTTP natively; YouTube requires yt-dlp to extract the di
 Goal: Play a list of videos in order, automatically advancing when each one ends, then loop the list.
 
 ### Data Model
-- [ ] Add `Playlist` class or `List<string> PlaylistItems` to `Configuration.cs`
-- [ ] Add `PlaylistIndex` (current position) and `PlaylistLoop` (bool) to `Configuration.cs`
-- [ ] Persist playlist across plugin reload
+- [x] Add `Playlist` class or `List<string> PlaylistItems` to `Configuration.cs`
+- [x] Add `PlaylistIndex` (current position) and `PlaylistLoop` (bool) to `Configuration.cs`
+- [x] Persist playlist across plugin reload
 
 ### VideoPlayer / SyncCoordinator
-- [ ] `VideoPlayer`: on `EndReached`, check if playlist has a next item; advance index and play next
-- [ ] `VideoPlayer`: on last item end and `PlaylistLoop = true`, wrap index to 0 and play first
-- [ ] `SyncCoordinator`: broadcast `playlistNext` message to clients when host advances
+- [x] `VideoPlayer`: fires `EndOfMedia` event on end; SyncCoordinator decides next action
+- [x] `VideoPlayer`: on last item end and `PlaylistLoop = true`, wrap index to 0 and play first
+- [x] `SyncCoordinator`: on EndOfMedia, advance playlist or loop single file; host broadcasts play to clients via existing `BroadcastPlay`
 
 ### UI
-- [ ] Playlist panel in MainWindow: ordered list of file paths / URLs (add/remove/reorder)
-- [ ] "Add" button opens file path input; "Add URL" for network streams
-- [ ] Remove selected item button; drag-to-reorder items
-- [ ] "Loop playlist" toggle checkbox
-- [ ] Current item highlighted; index shown (e.g. "2 / 5")
-- [ ] `/fftv playlist add <path>` command appends an item
-- [ ] `/fftv playlist clear` command empties the list
+- [x] Playlist panel in MainWindow: ordered list of file paths / URLs (add/remove/reorder)
+- [x] "Add" text input + Add button for file paths and URLs
+- [x] Remove (✕) per-item button; ▲/▼ buttons for reorder
+- [x] "Loop" toggle checkbox
+- [x] Current item highlighted in green; index shown (e.g. "Item 2 / 5")
+- [x] `/fftv playlist add <path>` command appends an item
+- [x] `/fftv playlist clear` command empties the list
 
 ### Network Sync
-- [ ] Host broadcasts playlist state (items + index + loop flag) to clients on connect
-- [ ] Clients advance playlist in sync with host (via `playlistNext` message, not local EndReached)
+- [x] Host advances playlist on EndOfMedia, broadcasts play via existing SyncCoordinator.Play() (URL-only)
+- [ ] Host broadcasts playlist state (items + index + loop flag) to clients on connect (future: Phase 4 enhancement)
 
 ---
 

@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using Dalamud.Configuration;
 
 namespace FFXIVTv;
@@ -95,6 +96,17 @@ public sealed class Configuration : IPluginConfiguration
 
     /// <summary>When true, audio is muted. Local only — not synced to clients.</summary>
     public bool Muted { get; set; } = false;
+
+    // ── Playlist ──────────────────────────────────────────────────────────────
+
+    /// <summary>Ordered list of file paths / URLs to play in sequence.</summary>
+    public List<string> Playlist { get; set; } = new List<string>();
+
+    /// <summary>Index of the currently active playlist item. -1 = no active item.</summary>
+    public int PlaylistIndex { get; set; } = -1;
+
+    /// <summary>When true, the playlist wraps back to item 0 after the last item finishes.</summary>
+    public bool PlaylistLoop { get; set; } = true;
 
     public void Save() => Plugin.PluginInterface.SavePluginConfig(this);
 }

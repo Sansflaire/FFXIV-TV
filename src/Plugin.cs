@@ -54,6 +54,12 @@ public sealed class Plugin : IDalamudPlugin
         _sync.Volume = Config.Volume;
         _sync.Muted  = Config.Muted;
 
+        _sync.OnPlaylistAdvanced += idx =>
+        {
+            Config.PlaylistIndex = idx;
+            Config.Save();
+        };
+
         _sync.Client.OnScreenConfig += (cx, cy, cz, yaw, w, h) =>
         {
             Config.Screen.Center     = new System.Numerics.Vector3(cx, cy, cz);
@@ -66,7 +72,7 @@ public sealed class Plugin : IDalamudPlugin
 
         CommandManager.AddHandler(CmdMain, new CommandInfo(OnCommand)
         {
-            HelpMessage = "Open FFXIV-TV settings. /fftv place — place at player. /fftv hide — toggle. /fftv play <path> — play video. /fftv pause — pause/resume. /fftv stop — stop video."
+            HelpMessage = "Open FFXIV-TV settings. Sub-commands: place, hide, play <path|url>, pause, stop, playlist add <path|url>, playlist clear."
         });
 
         PluginInterface.UiBuilder.DisableUserUiHide = true;
@@ -96,6 +102,31 @@ public sealed class Plugin : IDalamudPlugin
     {
         var trimmed = args.Trim();
         var lower   = trimmed.ToLowerInvariant();
+
+        if (lower.StartsWith("playlist "))
+        {
+            var plArgs  = trimmed.Substring(9).Trim();
+            var plLower = plArgs.ToLowerInvariant();
+            if (plLower == "clear")
+            {
+                Config.Playlist.Clear();
+                Config.PlaylistIndex = -1;
+                Config.Save();
+                ChatGui.Print("[FFXIV-TV] Playlist cleared.");
+            }
+            else if (plLower.StartsWith("add "))
+            {
+                var entry = plArgs.Substring(4).Trim();
+                Config.Playlist.Add(entry);
+                Config.Save();
+                ChatGui.Print($"[FFXIV-TV] Added to playlist ({Config.Playlist.Count} items): {entry}");
+            }
+            else
+            {
+                ChatGui.PrintError("[FFXIV-TV] Usage: /fftv playlist add <path|url>  or  /fftv playlist clear");
+            }
+            return;
+        }
 
         if (lower.StartsWith("play "))
         {
@@ -169,9 +200,12 @@ public sealed class Plugin : IDalamudPlugin
             _videoSetupDone = true;
         }
 
-        // Keep sync mode and yt-dlp path current each frame.
-        _sync.Mode      = Config.SyncMode;
-        _sync.YtDlpPath = Config.YtDlpPath;
+        // Keep sync mode, yt-dlp path, and playlist state current each frame.
+        _sync.Mode          = Config.SyncMode;
+        _sync.YtDlpPath     = Config.YtDlpPath;
+        _sync.Playlist      = Config.Playlist;
+        _sync.PlaylistIndex = Config.PlaylistIndex;
+        _sync.PlaylistLoop  = Config.PlaylistLoop;
 
         // Auto-start/stop server based on persisted config (survives plugin reloads).
         if (Config.SyncMode == NetworkMode.Host && Config.SyncServerRunning

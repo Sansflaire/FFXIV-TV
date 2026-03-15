@@ -24,6 +24,9 @@ public sealed class MainWindow
     private int    _syncPortBuffer;
     private string _syncAddressBuffer;
 
+    // Playlist UI buffer
+    private string _playlistAddBuffer = string.Empty;
+
     // Sync coordinator — set after D3D device is available.
     private SyncCoordinator? _sync;
 
@@ -200,6 +203,12 @@ public sealed class MainWindow
             case ContentMode.UrlVideo:   DrawUrlVideoControls();   break;
         }
 
+        if (_config.ActiveMode != ContentMode.Image)
+        {
+            ImGui.Spacing();
+            DrawPlaylistSection();
+        }
+
         ImGui.Spacing();
         ImGui.Separator();
         float brightness = _config.Brightness;
@@ -357,6 +366,110 @@ public sealed class MainWindow
             _config.Save();
         }
         ImGui.TextDisabled("(Leave empty to auto-find yt-dlp.exe in plugin folder)");
+    }
+
+    private void DrawPlaylistSection()
+    {
+        if (!ImGui.CollapsingHeader("Playlist"))
+            return;
+
+        bool isClient = _config.SyncMode == NetworkMode.Client;
+        var playlist  = _config.Playlist;
+        int  count    = playlist.Count;
+
+        // Loop toggle + item count
+        bool loop = _config.PlaylistLoop;
+        if (ImGui.Checkbox("Loop##plloop", ref loop))
+        {
+            _config.PlaylistLoop = loop;
+            _config.Save();
+        }
+        if (count > 0)
+        {
+            ImGui.SameLine();
+            int cur = _config.PlaylistIndex;
+            string idxLabel = cur >= 0 && cur < count
+                ? $"  Item {cur + 1} / {count}"
+                : $"  {count} item(s)";
+            ImGui.TextDisabled(idxLabel);
+        }
+
+        ImGui.Separator();
+
+        // Item list
+        int removeIdx = -1, moveUp = -1, moveDown = -1;
+        for (int i = 0; i < count; i++)
+        {
+            bool isCurrent = i == _config.PlaylistIndex;
+            if (isCurrent) ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(0.35f, 0.9f, 0.35f, 1f));
+
+            string item  = playlist[i];
+            string label = item.Length > 48 ? "…" + item[^46..] : item;
+            ImGui.TextUnformatted($"{i + 1}. {label}");
+
+            if (isCurrent) ImGui.PopStyleColor();
+
+            ImGui.SameLine();
+            if (ImGui.SmallButton($"▲##pu{i}") && i > 0)          moveUp   = i;
+            ImGui.SameLine();
+            if (ImGui.SmallButton($"▼##pd{i}") && i < count - 1)  moveDown = i;
+            ImGui.SameLine();
+            if (!isClient && ImGui.SmallButton($"▶##pp{i}"))
+            {
+                _config.PlaylistIndex = i;
+                _config.Save();
+                _sync?.Play(playlist[i]);
+            }
+            ImGui.SameLine();
+            if (ImGui.SmallButton($"✕##pr{i}")) removeIdx = i;
+        }
+
+        if (removeIdx >= 0)
+        {
+            playlist.RemoveAt(removeIdx);
+            if (_config.PlaylistIndex >= playlist.Count)
+                _config.PlaylistIndex = playlist.Count - 1;
+            _config.Save();
+        }
+        if (moveUp >= 0)
+        {
+            (playlist[moveUp - 1], playlist[moveUp]) = (playlist[moveUp], playlist[moveUp - 1]);
+            if      (_config.PlaylistIndex == moveUp)     _config.PlaylistIndex = moveUp - 1;
+            else if (_config.PlaylistIndex == moveUp - 1) _config.PlaylistIndex = moveUp;
+            _config.Save();
+        }
+        if (moveDown >= 0)
+        {
+            (playlist[moveDown], playlist[moveDown + 1]) = (playlist[moveDown + 1], playlist[moveDown]);
+            if      (_config.PlaylistIndex == moveDown)     _config.PlaylistIndex = moveDown + 1;
+            else if (_config.PlaylistIndex == moveDown + 1) _config.PlaylistIndex = moveDown;
+            _config.Save();
+        }
+
+        ImGui.Separator();
+
+        // Add new item
+        ImGui.SetNextItemWidth(-82);
+        ImGui.InputText("##pladd", ref _playlistAddBuffer, 1024);
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Add##pladd") && !string.IsNullOrWhiteSpace(_playlistAddBuffer))
+        {
+            playlist.Add(_playlistAddBuffer.Trim());
+            _playlistAddBuffer = string.Empty;
+            _config.Save();
+        }
+        ImGui.TextDisabled("File path or URL");
+
+        if (count > 0)
+        {
+            ImGui.SameLine();
+            if (ImGui.SmallButton("Clear All##plclr"))
+            {
+                playlist.Clear();
+                _config.PlaylistIndex = -1;
+                _config.Save();
+            }
+        }
     }
 
     private void DrawScrubBar()

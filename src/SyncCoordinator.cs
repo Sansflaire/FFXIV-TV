@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Threading.Tasks;
 using Vortice.Direct3D11;
 
@@ -40,11 +41,21 @@ public sealed class SyncCoordinator : IDisposable
         set => _vp.YtDlpPath = value;
     }
 
+    // ── Playlist state (synced from Config each frame by Plugin.cs) ───────────
+    public List<string>? Playlist      { get; set; }
+    public int           PlaylistIndex { get; set; } = -1;
+    public bool          PlaylistLoop  { get; set; } = true;
+
+    /// <summary>Fired (on background thread) when the playlist advances. Arg = new index.</summary>
+    public event Action<int>? OnPlaylistAdvanced;
+
     // ── Constructor ───────────────────────────────────────────────────────────
 
     public SyncCoordinator(VideoPlayer vp)
     {
         _vp = vp;
+
+        _vp.EndOfMedia += OnVideoEndOfMedia;
 
         // Wire incoming client messages → VideoPlayer. These do NOT re-broadcast
         // (we're a viewer receiving commands, not a host issuing them).
@@ -53,6 +64,36 @@ public sealed class SyncCoordinator : IDisposable
         Client.OnResume += OnClientResume;
         Client.OnStop   += () => _vp.Stop();
         Client.OnSeek   += pos => _vp.Seek(pos);
+    }
+
+    // ── End-of-media / playlist advancement ──────────────────────────────────
+
+    private void OnVideoEndOfMedia() => HandleEndOfMedia();
+
+    private void HandleEndOfMedia()
+    {
+        // Clients are driven by the host — don't auto-advance locally.
+        if (Mode == NetworkMode.Client) return;
+
+        var items = Playlist;
+        if (items == null || items.Count == 0)
+        {
+            // No playlist: loop the single current file.
+            string url = _vp.CurrentPath;
+            if (!string.IsNullOrEmpty(url)) { _vp.Stop(); Play(url); }
+            return;
+        }
+
+        int next = PlaylistIndex + 1;
+        if (next >= items.Count)
+        {
+            if (PlaylistLoop) next = 0;
+            else              { _vp.Stop(); return; }
+        }
+
+        PlaylistIndex = next;
+        Play(items[next]);
+        OnPlaylistAdvanced?.Invoke(next);
     }
 
     // ── Client event handlers ─────────────────────────────────────────────────
@@ -129,6 +170,7 @@ public sealed class SyncCoordinator : IDisposable
 
     public void Dispose()
     {
+        _vp.EndOfMedia  -= OnVideoEndOfMedia;
         Client.OnPlay   -= OnClientPlay;
         Client.OnPause  -= OnClientPause;
         Client.OnResume -= OnClientResume;
