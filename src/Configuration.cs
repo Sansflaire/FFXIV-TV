@@ -9,6 +9,13 @@ public enum ContentMode
     UrlVideo,
 }
 
+public enum NetworkMode
+{
+    Off,
+    Host,
+    Client,
+}
+
 [System.Serializable]
 public sealed class Configuration : IPluginConfiguration
 {
@@ -62,6 +69,17 @@ public sealed class Configuration : IPluginConfiguration
     /// When true, draw a solid black backing rectangle behind the image/video.
     /// </summary>
     public bool ShowBlackBacking { get; set; } = true;
+
+    // ── Network Sync ──────────────────────────────────────────────────────────
+
+    /// <summary>Current network sync role (Off / Host / Client).</summary>
+    public NetworkMode SyncMode { get; set; } = NetworkMode.Off;
+
+    /// <summary>Port the sync server listens on when in Host mode.</summary>
+    public int SyncPort { get; set; } = 9834;
+
+    /// <summary>IP:port string the sync client connects to when in Client mode (e.g. "192.168.1.5:9834").</summary>
+    public string SyncHostAddress { get; set; } = string.Empty;
 
     public void Save() => Plugin.PluginInterface.SavePluginConfig(this);
 }

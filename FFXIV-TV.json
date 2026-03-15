@@ -3,8 +3,10 @@
     "Name": "FFXIV-TV",
     "InternalName": "FFXIV-TV",
     "Punchline": "Render a live video screen anywhere in the game world.",
-    "Description": "Places a virtual screen in 3D world space that displays images and video. Supports multi-player sync so all players with the plugin see the same content.",
+    "Description": "Places a virtual screen in 3D world space that displays images and video with proper depth testing. Supports local files, direct URLs, YouTube (via yt-dlp), and multi-player sync so all players with the plugin see the same content simultaneously.",
+    "RepoUrl": "https://github.com/Sansflaire/FFXIV-TV",
     "ApplicableVersion": "any",
     "DalamudApiLevel": 14,
-    "Tags": ["utility", "housing", "video", "screen"]
+    "Tags": ["utility", "housing", "video", "screen", "media"],
+    "CategoryTags": ["Social"]
 }

@@ -20,30 +20,37 @@ public sealed class MainWindow
     private string _videoUrlBuffer;
     private string _ytDlpPathBuffer;
 
-    // Video player — set after D3D device is available.
-    private VideoPlayer? _videoPlayer;
+    // Network sync buffers
+    private int    _syncPortBuffer;
+    private string _syncAddressBuffer;
 
-    private static readonly string[] ContentModeNames = { "Image", "Local Video", "URL / Stream" };
+    // Sync coordinator — set after D3D device is available.
+    private SyncCoordinator? _sync;
+
+    private static readonly string[] ContentModeNames  = { "Image", "Local Video", "URL / Stream" };
+    private static readonly string[] NetworkModeNames  = { "Off", "Host", "Client" };
 
     public MainWindow(Configuration config, IObjectTable objectTable)
     {
         _config       = config;
         _objectTable  = objectTable;
 
-        _imagePathBuffer  = config.ImagePath;
-        _videoPathBuffer  = config.VideoPath;
-        _videoUrlBuffer   = config.VideoUrl;
-        _ytDlpPathBuffer  = config.YtDlpPath;
+        _imagePathBuffer   = config.ImagePath;
+        _videoPathBuffer   = config.VideoPath;
+        _videoUrlBuffer    = config.VideoUrl;
+        _ytDlpPathBuffer   = config.YtDlpPath;
+        _syncPortBuffer    = config.SyncPort;
+        _syncAddressBuffer = config.SyncHostAddress;
     }
 
-    public void SetVideoPlayer(VideoPlayer? vp) => _videoPlayer = vp;
+    public void SetSync(SyncCoordinator sync) => _sync = sync;
 
     public void Draw()
     {
         if (!IsVisible) return;
 
-        ImGui.SetNextWindowSize(new Vector2(480, 460), ImGuiCond.FirstUseEver);
-        ImGui.SetNextWindowSizeConstraints(new Vector2(360, 300), new Vector2(800, 800));
+        ImGui.SetNextWindowSize(new Vector2(480, 520), ImGuiCond.FirstUseEver);
+        ImGui.SetNextWindowSizeConstraints(new Vector2(360, 300), new Vector2(800, 900));
 
         bool open = IsVisible;
         if (!ImGui.Begin("FFXIV-TV Settings", ref open))
@@ -57,6 +64,8 @@ public sealed class MainWindow
         DrawScreenSection();
         ImGui.Spacing();
         DrawContentSection();
+        ImGui.Spacing();
+        DrawNetworkSection();
         ImGui.Spacing();
         DrawTintSection();
 
@@ -200,64 +209,80 @@ public sealed class MainWindow
 
     private void DrawLocalVideoControls()
     {
+        bool isClient = _config.SyncMode == NetworkMode.Client;
+
         ImGui.TextDisabled("Video file path (MP4, MKV, AVI, etc.):");
         ImGui.SetNextItemWidth(-1);
         ImGui.InputText("##videopath", ref _videoPathBuffer, 512);
 
-        bool hasPlayer = _videoPlayer != null;
-        if (!hasPlayer) ImGui.BeginDisabled();
+        bool hasPlayer = _sync != null;
+        bool disableControls = !hasPlayer || isClient;
+        if (disableControls) ImGui.BeginDisabled();
 
         if (ImGui.Button("Play##vl"))
         {
             _config.VideoPath = _videoPathBuffer;
             _config.Save();
-            _videoPlayer?.Play(_videoPathBuffer);
+            _sync?.Play(_videoPathBuffer);
         }
         ImGui.SameLine();
-        if (ImGui.Button("Pause##vl")) _videoPlayer?.TogglePause();
+        if (ImGui.Button("Pause##vl")) _sync?.TogglePause();
         ImGui.SameLine();
-        if (ImGui.Button("Stop##vl")) _videoPlayer?.Stop();
+        if (ImGui.Button("Stop##vl"))  _sync?.Stop();
 
-        if (!hasPlayer) ImGui.EndDisabled();
+        if (disableControls) ImGui.EndDisabled();
 
-        if (_videoPlayer != null)
+        if (isClient)
         {
             ImGui.SameLine();
-            ImGui.TextDisabled($"  [{_videoPlayer.Status}]");
+            ImGui.TextDisabled("  [Controlled by host]");
+        }
+        else if (_sync != null)
+        {
+            ImGui.SameLine();
+            ImGui.TextDisabled($"  [{_sync.VideoStatus}]");
         }
 
-        DrawScrubBar();
+        if (!isClient) DrawScrubBar();
     }
 
     private void DrawUrlVideoControls()
     {
+        bool isClient = _config.SyncMode == NetworkMode.Client;
+
         ImGui.TextDisabled("Video URL (direct MP4/stream, YouTube, etc.):");
         ImGui.SetNextItemWidth(-1);
         ImGui.InputText("##videourl", ref _videoUrlBuffer, 1024);
 
-        bool hasPlayer = _videoPlayer != null;
-        if (!hasPlayer) ImGui.BeginDisabled();
+        bool hasPlayer = _sync != null;
+        bool disableControls = !hasPlayer || isClient;
+        if (disableControls) ImGui.BeginDisabled();
 
         if (ImGui.Button("Play##vu"))
         {
             _config.VideoUrl = _videoUrlBuffer;
             _config.Save();
-            _videoPlayer?.Play(_videoUrlBuffer);
+            _sync?.Play(_videoUrlBuffer);
         }
         ImGui.SameLine();
-        if (ImGui.Button("Pause##vu")) _videoPlayer?.TogglePause();
+        if (ImGui.Button("Pause##vu")) _sync?.TogglePause();
         ImGui.SameLine();
-        if (ImGui.Button("Stop##vu")) _videoPlayer?.Stop();
+        if (ImGui.Button("Stop##vu"))  _sync?.Stop();
 
-        if (!hasPlayer) ImGui.EndDisabled();
+        if (disableControls) ImGui.EndDisabled();
 
-        if (_videoPlayer != null)
+        if (isClient)
         {
             ImGui.SameLine();
-            ImGui.TextDisabled($"  [{_videoPlayer.Status}]");
+            ImGui.TextDisabled("  [Controlled by host]");
+        }
+        else if (_sync != null)
+        {
+            ImGui.SameLine();
+            ImGui.TextDisabled($"  [{_sync.VideoStatus}]");
         }
 
-        DrawScrubBar();
+        if (!isClient) DrawScrubBar();
 
         ImGui.Spacing();
         ImGui.TextDisabled("yt-dlp path (optional — needed for YouTube):");
@@ -278,55 +303,53 @@ public sealed class MainWindow
 
     private void DrawScrubBar()
     {
-        if (_videoPlayer == null) return;
-        if (!_videoPlayer.IsPlaying && !_videoPlayer.IsPaused) return;
+        if (_sync == null) return;
+        if (!_sync.IsPlaying && !_sync.IsPaused) return;
 
-        long timeMs   = _videoPlayer.TimeMs;
-        long lengthMs = _videoPlayer.LengthMs;
+        long timeMs   = _sync.TimeMs;
+        long lengthMs = _sync.LengthMs;
 
-        // Time label — suppress for live streams (length unknown or <= 0)
         bool hasLength = lengthMs > 0;
         string timeLabel = hasLength
             ? $"{FormatTime(timeMs)} / {FormatTime(lengthMs)}"
             : FormatTime(timeMs);
         ImGui.TextDisabled(timeLabel);
 
-        float pos = _videoPlayer.Position;
+        float pos = _sync.Position;
 
         if (!hasLength) ImGui.BeginDisabled();
         ImGui.SetNextItemWidth(-1);
         if (ImGui.SliderFloat("##scrub", ref pos, 0f, 1f, ""))
-            _videoPlayer.Seek(pos);
+            _sync.Seek(pos);
         if (!hasLength) ImGui.EndDisabled();
 
         if (!hasLength && ImGui.IsItemHovered())
             ImGui.SetTooltip("Seeking not available for live streams.");
 
         // ── A-B loop controls ─────────────────────────────────────────────────
-        if (ImGui.SmallButton("Set A")) _videoPlayer.SetLoopA();
+        if (ImGui.SmallButton("Set A")) _sync.SetLoopA();
         if (ImGui.IsItemHovered()) ImGui.SetTooltip("Mark loop start at current position.");
 
         ImGui.SameLine();
-        if (ImGui.SmallButton("Set B")) _videoPlayer.SetLoopB();
+        if (ImGui.SmallButton("Set B")) _sync.SetLoopB();
         if (ImGui.IsItemHovered()) ImGui.SetTooltip("Mark loop end at current position.");
 
         ImGui.SameLine();
 
-        bool loopOn = _videoPlayer.AbLoopActive;
+        bool loopOn = _sync.AbLoopActive;
         if (loopOn) ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.15f, 0.65f, 0.15f, 1f));
-        if (ImGui.SmallButton(loopOn ? "A-B: ON " : "A-B: OFF")) _videoPlayer.ToggleAbLoop();
+        if (ImGui.SmallButton(loopOn ? "A-B: ON " : "A-B: OFF")) _sync.ToggleAbLoop();
         if (loopOn) ImGui.PopStyleColor();
         if (ImGui.IsItemHovered()) ImGui.SetTooltip("Toggle A-B loop.");
 
         ImGui.SameLine();
-        if (ImGui.SmallButton("Clear")) _videoPlayer.ClearAbLoop();
+        if (ImGui.SmallButton("Clear")) _sync.ClearAbLoop();
         if (ImGui.IsItemHovered()) ImGui.SetTooltip("Clear A and B points.");
 
-        // Show A/B timestamps when either point has been moved from default
-        if (_videoPlayer.LoopA > 0f || _videoPlayer.LoopB < 1f)
+        if (_sync.LoopA > 0f || _sync.LoopB < 1f)
         {
-            string aStr = hasLength ? FormatTime((long)(_videoPlayer.LoopA * lengthMs)) : $"{_videoPlayer.LoopA:P0}";
-            string bStr = hasLength ? FormatTime((long)(_videoPlayer.LoopB * lengthMs)) : $"{_videoPlayer.LoopB:P0}";
+            string aStr = hasLength ? FormatTime((long)(_sync.LoopA * lengthMs)) : $"{_sync.LoopA:P0}";
+            string bStr = hasLength ? FormatTime((long)(_sync.LoopB * lengthMs)) : $"{_sync.LoopB:P0}";
             ImGui.SameLine();
             ImGui.TextDisabled($"A: {aStr}  B: {bStr}");
         }
@@ -339,6 +362,132 @@ public sealed class MainWindow
         return ts.TotalHours >= 1
             ? $"{(int)ts.TotalHours}:{ts.Minutes:D2}:{ts.Seconds:D2}"
             : $"{ts.Minutes}:{ts.Seconds:D2}";
+    }
+
+    // ─── Network Sync ─────────────────────────────────────────────────────────
+
+    private void DrawNetworkSection()
+    {
+        if (!ImGui.CollapsingHeader("Network Sync"))
+            return;
+
+        int netMode = (int)_config.SyncMode;
+        if (ImGui.Combo("Role###networkmode", ref netMode, NetworkModeNames, NetworkModeNames.Length))
+        {
+            // Changing role stops active server/client first
+            if (_config.SyncMode == NetworkMode.Host)
+                _sync?.Server.Stop();
+            else if (_config.SyncMode == NetworkMode.Client)
+                _sync?.Client.Disconnect();
+
+            _config.SyncMode = (NetworkMode)netMode;
+            _config.Save();
+        }
+
+        ImGui.Separator();
+
+        switch (_config.SyncMode)
+        {
+            case NetworkMode.Off:
+                ImGui.TextDisabled("Select Host to share video, or Client to watch a host.");
+                break;
+
+            case NetworkMode.Host:
+                DrawHostControls();
+                break;
+
+            case NetworkMode.Client:
+                DrawClientControls();
+                break;
+        }
+    }
+
+    private void DrawHostControls()
+    {
+        if (_sync == null) return;
+        var server = _sync.Server;
+
+        ImGui.TextDisabled("Port:");
+        ImGui.SameLine();
+        ImGui.SetNextItemWidth(80);
+        if (ImGui.InputInt("##syncport", ref _syncPortBuffer, 0))
+        {
+            _syncPortBuffer      = Math.Clamp(_syncPortBuffer, 1024, 65535);
+            _config.SyncPort = _syncPortBuffer;
+            _config.Save();
+        }
+
+        ImGui.SameLine();
+
+        if (server.IsRunning)
+        {
+            ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.6f, 0.15f, 0.15f, 1f));
+            if (ImGui.Button("Stop Server")) server.Stop();
+            ImGui.PopStyleColor();
+            ImGui.SameLine();
+            ImGui.TextDisabled($"Running — {server.ClientCount} client(s) connected");
+        }
+        else
+        {
+            if (ImGui.Button("Start Server")) server.Start(_config.SyncPort);
+            if (!string.IsNullOrEmpty(server.LastError))
+            {
+                ImGui.SameLine();
+                ImGui.TextColored(new Vector4(1f, 0.4f, 0.4f, 1f), $"Error: {server.LastError}");
+            }
+        }
+
+        // Warn if active content is a local file — can't be shared
+        bool localFileActive =
+            (_config.ActiveMode == ContentMode.LocalVideo && !string.IsNullOrEmpty(_config.VideoPath)) ||
+            (_config.ActiveMode == ContentMode.Image);
+        if (localFileActive)
+        {
+            ImGui.Spacing();
+            ImGui.TextColored(new Vector4(1f, 0.8f, 0.2f, 1f),
+                "Only URLs can be shared. Switch to URL mode to sync playback.");
+        }
+
+        ImGui.Spacing();
+        ImGui.TextDisabled("Tell clients to connect to: <your IP>:" + _config.SyncPort);
+    }
+
+    private void DrawClientControls()
+    {
+        if (_sync == null) return;
+        var client = _sync.Client;
+
+        ImGui.TextDisabled("Host address (IP:port):");
+        ImGui.SetNextItemWidth(-1);
+        if (ImGui.InputText("##syncaddr", ref _syncAddressBuffer, 128,
+                            ImGuiInputTextFlags.EnterReturnsTrue))
+        {
+            _config.SyncHostAddress = _syncAddressBuffer;
+            _config.Save();
+        }
+
+        if (client.IsConnected)
+        {
+            ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.6f, 0.15f, 0.15f, 1f));
+            if (ImGui.Button("Disconnect")) client.Disconnect();
+            ImGui.PopStyleColor();
+            ImGui.SameLine();
+            ImGui.TextDisabled("Connected");
+        }
+        else
+        {
+            if (ImGui.Button("Connect"))
+            {
+                _config.SyncHostAddress = _syncAddressBuffer;
+                _config.Save();
+                client.Connect(_syncAddressBuffer);
+            }
+            ImGui.SameLine();
+            ImGui.TextDisabled(client.Status);
+        }
+
+        ImGui.Spacing();
+        ImGui.TextDisabled("Playback is controlled by the host while connected.");
     }
 
     // ─── Tint / Opacity ──────────────────────────────────────────────────────

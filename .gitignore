@@ -6,3 +6,6 @@ obj/
 CLAUDE.md
 *.log
 *.dll
+*.zip
+plugins/
+yt-dlp.exe

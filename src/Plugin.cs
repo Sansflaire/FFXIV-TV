@@ -32,8 +32,11 @@ public sealed class Plugin : IDalamudPlugin
     private readonly D3DRenderer _d3dRenderer;
 
     // Phase 3: Video playback via LibVLC
-    private readonly VideoPlayer _videoPlayer;
+    private readonly VideoPlayer      _videoPlayer;
     private bool _videoSetupDone;
+
+    // Phase 4: Network sync (host/client)
+    private readonly SyncCoordinator _sync;
 
     private readonly MainWindow _mainWindow;
 
@@ -44,8 +47,9 @@ public sealed class Plugin : IDalamudPlugin
         _screenRenderer = new ScreenRenderer(GameGui, TextureProvider);
         _d3dRenderer    = new D3DRenderer(GameInterop);
         _videoPlayer    = new VideoPlayer(PluginInterface.AssemblyLocation.DirectoryName!);
+        _sync           = new SyncCoordinator(_videoPlayer);
         _mainWindow     = new MainWindow(Config, ObjectTable);
-        _mainWindow.SetVideoPlayer(_videoPlayer);
+        _mainWindow.SetSync(_sync);
 
         CommandManager.AddHandler(CmdMain, new CommandInfo(OnCommand)
         {
@@ -65,6 +69,7 @@ public sealed class Plugin : IDalamudPlugin
         PluginInterface.UiBuilder.Draw       -= OnDraw;
         PluginInterface.UiBuilder.OpenMainUi -= OnOpenMainUi;
         CommandManager.RemoveHandler(CmdMain);
+        _sync.Dispose();
         _videoPlayer.Dispose();
         _d3dRenderer.Dispose();
         _screenRenderer.Dispose();
@@ -88,7 +93,7 @@ public sealed class Plugin : IDalamudPlugin
             if (isUrl) Config.VideoUrl  = path;
             else       Config.VideoPath = path;
             Config.Save();
-            _videoPlayer.Play(path);
+            _sync.Play(path);
             return;
         }
 
@@ -107,10 +112,10 @@ public sealed class Plugin : IDalamudPlugin
                 ChatGui.Print($"[FFXIV-TV] Screen {(Config.Screen.Visible ? "shown" : "hidden")}.");
                 break;
             case "pause":
-                _videoPlayer.TogglePause();
+                _sync.TogglePause();
                 break;
             case "stop":
-                _videoPlayer.Stop();
+                _sync.Stop();
                 break;
             default:
                 ChatGui.PrintError($"[FFXIV-TV] Unknown argument '{args}'. Use /fftv, /fftv place, /fftv hide, /fftv play <path>, /fftv pause, /fftv stop.");
@@ -151,8 +156,9 @@ public sealed class Plugin : IDalamudPlugin
             _videoSetupDone = true;
         }
 
-        // Keep yt-dlp path current (cheap property set, user may update via UI at any time).
-        _videoPlayer.YtDlpPath = Config.YtDlpPath;
+        // Keep sync mode and yt-dlp path current each frame.
+        _sync.Mode        = Config.SyncMode;
+        _sync.YtDlpPath   = Config.YtDlpPath;
 
         if (_d3dRenderer.IsAvailable)
         {
