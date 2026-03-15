@@ -376,7 +376,7 @@ public sealed class VideoPlayer : IDisposable
 
         try
         {
-            var psi = new ProcessStartInfo(ytdlp, $"--get-url --format \"best[ext=mp4]/best\" \"{url}\"")
+            var psi = new ProcessStartInfo(ytdlp, $"--get-url --no-playlist --format \"best[ext=mp4]/best\" \"{url}\"")
             {
                 RedirectStandardOutput = true,
                 RedirectStandardError  = true,

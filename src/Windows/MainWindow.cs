@@ -83,6 +83,13 @@ public sealed class MainWindow
         if (!ImGui.CollapsingHeader("Screen Transform", ImGuiTreeNodeFlags.DefaultOpen))
             return;
 
+        bool isClient = _config.SyncMode == NetworkMode.Client;
+        if (isClient)
+        {
+            ImGui.TextDisabled("Screen position is controlled by the host.");
+            ImGui.BeginDisabled();
+        }
+
         var screen = _config.Screen;
         bool changed = false;
 
@@ -166,6 +173,8 @@ public sealed class MainWindow
             if (_sync?.Mode == NetworkMode.Host && _sync.Server.IsRunning)
                 _sync.Server.BroadcastScreenConfig(screen);
         }
+
+        if (isClient) ImGui.EndDisabled();
     }
 
     // ─── Content Source ──────────────────────────────────────────────────────
@@ -438,7 +447,13 @@ public sealed class MainWindow
         }
         else
         {
-            if (ImGui.Button("Start Server")) { _config.SyncServerRunning = true; _config.Save(); server.Start(_config.SyncPort); }
+            if (ImGui.Button("Start Server"))
+            {
+                _config.SyncServerRunning = true;
+                _config.Save();
+                server.Start(_config.SyncPort);
+                server.BroadcastScreenConfig(_config.Screen); // seeds _latestScreenJson for new clients
+            }
             if (!string.IsNullOrEmpty(server.LastError))
             {
                 ImGui.SameLine();
