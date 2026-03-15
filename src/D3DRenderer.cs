@@ -93,10 +93,15 @@ float4 main(float2 uv : TEXCOORD) : SV_TARGET { return tex.Sample(samp, uv); }";
         }
 
         // Vortice constructor does NOT AddRef — AddRef so our Dispose (Release) is safe.
-        _device  = new ID3D11Device(devicePtr);
+        _device = new ID3D11Device(devicePtr);
         _device.AddRef();
-        _context = new ID3D11DeviceContext(contextPtr);
-        _context.AddRef();
+
+        // Use ImmediateContext so we're on the same context as ImGui/presentation,
+        // not a deferred or pass-specific context that might be discarded.
+        // ImmediateContext property caches and returns the immediate context (AddRefs internally).
+        _context = _device.ImmediateContext;
+
+        Plugin.Log.Info($"[FFXIV-TV] D3DRenderer: device=0x{devicePtr:X}, context=0x{_context.NativePointer:X}");
 
         try
         {
@@ -178,15 +183,25 @@ float4 main(float2 uv : TEXCOORD) : SV_TARGET { return tex.Sample(samp, uv); }";
     /// Draws the screen in world space with D3D11 depth testing.
     /// textureHandle is IDalamudTextureWrap.Handle.Handle (ulong, = ID3D11ShaderResourceView*).
     /// </summary>
+    private int _drawLogCountdown = 60; // log first 60 frames then stop
+
     public void Draw(ScreenDefinition screen, ulong textureHandle)
     {
         if (!_initialized || _context == null) return;
-        if (textureHandle == 0) return;
+        if (textureHandle == 0)
+        {
+            if (_drawLogCountdown > 0) { _drawLogCountdown--; Plugin.Log.Warning("[FFXIV-TV] Draw: textureHandle is 0, skipping."); }
+            return;
+        }
 
         // ViewProj — same source as IGameGui.WorldToScreen.
         // M44 is uninitialized in game memory (Splatoon-confirmed bug) — always set to 1.
         var ctrl = Control.Instance();
-        if (ctrl == null) return;
+        if (ctrl == null)
+        {
+            if (_drawLogCountdown > 0) { _drawLogCountdown--; Plugin.Log.Warning("[FFXIV-TV] Draw: Control.Instance() is null, skipping."); }
+            return;
+        }
 
         Matrix4x4 viewProj = ctrl->ViewProjectionMatrix;
         viewProj.M44 = 1f;
@@ -199,6 +214,12 @@ float4 main(float2 uv : TEXCOORD) : SV_TARGET { return tex.Sample(samp, uv); }";
         var rtvArray = new ID3D11RenderTargetView[1];
         _context.OMGetRenderTargets(1, rtvArray, out ID3D11DepthStencilView? dsv);
         bool hasDepth = dsv != null;
+
+        if (_drawLogCountdown > 0)
+        {
+            _drawLogCountdown--;
+            Plugin.Log.Info($"[FFXIV-TV] Draw: srv=0x{textureHandle:X} hasDepth={hasDepth} rtv={rtvArray[0] != null}");
+        }
 
         SavedState saved = SaveState();
         try
@@ -318,11 +339,10 @@ float4 main(float2 uv : TEXCOORD) : SV_TARGET { return tex.Sample(samp, uv); }";
     public void Dispose()
     {
         DisposeResources();
-        _context?.Dispose();
+        _context = null; // owned by _device.ImmediateContext cache; released by device.Dispose()
         _device?.Dispose();
-        _context      = null;
-        _device       = null;
-        _initialized  = false;
+        _device      = null;
+        _initialized = false;
     }
 
     private void DisposeResources()
