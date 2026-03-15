@@ -219,7 +219,7 @@ Goal: Host PC serves a WebSocket server; all connected clients play the same con
 - [x] Settings window: Host/Client role dropdown, port input, connection count display
 - [x] Server broadcasts JSON control messages: play, pause, resume, stop, seek
 - [x] Screen config broadcast: cx, cy, cz, yaw, width, height synced to clients on connect + change
-- [ ] Heartbeat / ping to detect disconnected clients
+- [x] Heartbeat / ping to detect disconnected clients — Timer fires every 20s: broadcasts {type:"ping"}, prunes non-Open WebSockets; WebSocket keepAliveInterval=20s also sends protocol-level pings
 
 ### WebSocket Client (Viewers)
 - [x] Settings window: address input, Connect/Disconnect button, status indicator

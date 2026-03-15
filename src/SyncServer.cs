@@ -22,6 +22,7 @@ public sealed class SyncServer : IDisposable
     private CancellationTokenSource? _cts;
     private readonly List<WebSocket> _clients = new();
     private readonly object     _lock = new();
+    private Timer?              _heartbeat;
 
     public bool   IsRunning   => _listener != null;
     public string LastError   { get; private set; } = string.Empty;
@@ -49,6 +50,7 @@ public sealed class SyncServer : IDisposable
             _listener = new TcpListener(IPAddress.Any, port);
             _listener.Start();
             _ = Task.Run(() => AcceptLoop(_cts.Token));
+            _heartbeat = new Timer(_ => Heartbeat(), null, 20_000, 20_000);
             Plugin.Log.Info($"[FFXIV-TV] SyncServer started on port {port}");
             UPnPStatus = "Mapping...";
             PublicIp   = string.Empty;
@@ -64,6 +66,8 @@ public sealed class SyncServer : IDisposable
 
     public void Stop()
     {
+        _heartbeat?.Dispose();
+        _heartbeat = null;
         _cts?.Cancel();
         _cts = null;
 
@@ -136,6 +140,30 @@ public sealed class SyncServer : IDisposable
             try { _ = ws.SendAsync(bytes, WebSocketMessageType.Text, true, CancellationToken.None); }
             catch { /* drop — client will get next message */ }
         }
+    }
+
+    // ── Heartbeat ─────────────────────────────────────────────────────────────
+
+    private void Heartbeat()
+    {
+        if (!IsRunning) return;
+
+        // Send application-level ping so clients can detect stale connections.
+        // (WebSocket keepAliveInterval also sends protocol-level pings every 20s.)
+        Broadcast(new { type = "ping" });
+
+        // Prune clients whose WebSocket state is no longer Open.
+        // These are detected by the keepAliveInterval when the TCP socket goes silent.
+        List<WebSocket>? dead = null;
+        lock (_lock)
+        {
+            foreach (var ws in _clients)
+                if (ws.State != WebSocketState.Open) { dead ??= new List<WebSocket>(); dead.Add(ws); }
+            if (dead != null)
+                foreach (var ws in dead) { _clients.Remove(ws); ws.Dispose(); }
+        }
+        if (dead?.Count > 0)
+            Plugin.Log.Info($"[FFXIV-TV] SyncServer: pruned {dead.Count} disconnected client(s)");
     }
 
     // ── UPnP ──────────────────────────────────────────────────────────────────
