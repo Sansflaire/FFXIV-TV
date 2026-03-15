@@ -67,9 +67,10 @@ so characters and world geometry correctly occlude the screen.
 
 ### Shader Authoring
 - [x] Write vertex shader HLSL (world-space, `row_major float4x4 ViewProj` cbuffer, `mul(pos, ViewProj)`)
-- [x] Write pixel shader HLSL (simple `tex.Sample(samp, uv)`)
+- [x] Write pixel shader HLSL (bilinear inverse UV from SV_POSITION — all TEXCOORD semantics
+      are silently zeroed in this D3D context; SV_POSITION is the only reliable per-pixel data)
 - [x] Compile shaders at runtime via `Vortice.D3DCompiler.Compiler.Compile()`
-- [ ] Verify shader compilation succeeds at runtime (in-game test)
+- [x] Verify shader compilation succeeds at runtime (in-game test)
 
 ### D3D11 Resource Setup
 - [x] Create vertex buffer (4 vertices: position + UV, dynamic)
@@ -89,7 +90,8 @@ so characters and world geometry correctly occlude the screen.
 - [x] Each frame: borrow SRV from Dalamud texture (AddRef/Dispose pattern), bind and draw
 - [x] Full pipeline state save/restore so ImGui is unaffected
 - [x] `dotnet build` succeeds with 0 errors
-- [ ] Verify screen renders with correct depth (character in front occludes screen) — in-game test
+- [x] Verify screen renders with correct depth (character in front occludes screen) — confirmed
+- [x] Verify image displays correctly on quad — confirmed (Round 18)
 - [ ] Verify screen perspective-corrects as camera moves — in-game test
 - [x] Cleanup: release all D3D11 resources on Dispose (Vortice COM objects)
 

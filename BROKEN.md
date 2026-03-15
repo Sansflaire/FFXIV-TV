@@ -361,7 +361,25 @@ Bonus: character's feet visible THROUGH the bottom of the quad — depth testing
 **Fix 18:** Remove R17 diagnostic (`float4(uv.x, uv.y, 0, 1)`) → restore `tex.Sample(samp, uv)`.
 All diagnostic logging and `_diagLogged` field removed. PS comment cleaned up.
 
-Status: **in-flight — build succeeded (0 errors), not yet tested in-game.**
+**Result (Round 18 — confirmed in-game):** ✅ IMAGE RENDERS CORRECTLY on the world-space quad.
+Depth testing confirmed working — character's feet occlude the bottom of the screen.
+
+---
+
+## ✅ Problem 1 RESOLVED — Image now renders correctly
+
+**Root cause chain (final):**
+1. `IDalamudTextureWrap.Handle` is not a raw SRV pointer → fixed by loading texture ourselves
+2. All TEXCOORD semantics (TEXCOORD0, TEXCOORD1) silently zeroed in this D3D context
+3. SV_VertexID always 0 in this context
+4. Fix: PS computes UV via bilinear inverse from SV_POSITION + screen-space corners in cbuffer b1
+5. Sign bug in bilinear_uv linear case: `v = Cv/Bv` → should be `v = -Cv/Bv`
+6. RSGetViewports signature: `RSGetViewports(ref uint, Viewport[])` (not `RSGetViewports(int, Viewport[])`)
+
+## ✅ Problem 2 RESOLVED — Depth testing works
+
+DSV captured at Draw() time, bound in callback via `OMSetRenderTargets(rtv, savedDsv)`.
+Reversed-Z depth state: `DepthFunc=Greater`, `DepthWriteMask=Zero` (read-only).
 
 ---
 
