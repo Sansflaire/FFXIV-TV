@@ -80,6 +80,12 @@ public sealed class Plugin : IDalamudPlugin
         if (lower.StartsWith("play "))
         {
             var path = trimmed.Substring(5).Trim();
+            bool isUrl = path.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
+                         path.StartsWith("https://", StringComparison.OrdinalIgnoreCase);
+            Config.ActiveMode = isUrl ? ContentMode.UrlVideo : ContentMode.LocalVideo;
+            if (isUrl) Config.VideoUrl  = path;
+            else       Config.VideoPath = path;
+            Config.Save();
             _videoPlayer.Play(path);
             return;
         }
@@ -140,17 +146,23 @@ public sealed class Plugin : IDalamudPlugin
             _videoSetupDone = true;
         }
 
+        // Keep yt-dlp path current (cheap property set, user may update via UI at any time).
+        _videoPlayer.YtDlpPath = Config.YtDlpPath;
+
         if (_d3dRenderer.IsAvailable)
         {
-            // Phase 2: D3D injection via ImGui callback (correct RTV/viewport at render time).
-            // D3DRenderer owns its texture — loaded directly from file, not via Dalamud wrap
-            // (Dalamud's ImTextureID handle is not a raw SRV pointer).
-            _d3dRenderer.SetImagePath(Config.ImagePath);
+            // Only load the image texture when in Image mode.
+            _d3dRenderer.SetImagePath(Config.ActiveMode == ContentMode.Image ? Config.ImagePath : string.Empty);
 
-            if (_d3dRenderer.HasTexture)
-                _d3dRenderer.Draw(screen);
-            else
+            // In Image mode: show the ImGui placeholder when no image is loaded yet.
+            // In video modes: ALWAYS call D3DRenderer.Draw() so UploadFrame() runs each tick
+            // and can create the GPU texture on the first decoded frame. Draw() returns early
+            // if no SRV is ready, which is fine — nothing renders until the first frame arrives.
+            // Never fall back to the ImGui placeholder in video mode: it has no depth testing.
+            if (Config.ActiveMode == ContentMode.Image && !_d3dRenderer.HasTexture)
                 _screenRenderer.DrawPlaceholder(Config);
+            else
+                _d3dRenderer.Draw(screen);
         }
         else
         {

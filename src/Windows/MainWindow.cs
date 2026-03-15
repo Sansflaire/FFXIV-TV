@@ -10,20 +10,30 @@ public sealed class MainWindow
     public bool IsVisible { get; set; } = false;
 
     private readonly Configuration _config;
-    private readonly IObjectTable _objectTable;
+    private readonly IObjectTable  _objectTable;
 
-    // Temporary buffer for the image path text input.
-    private string _imagePathBuffer = string.Empty;
-    private bool _imagePathBufferDirty = true;
+    // Content source buffers — kept in sync with config on construction.
+    private string _imagePathBuffer;
+    private bool   _imagePathBufferDirty = false;
+
+    private string _videoPathBuffer;
+    private string _videoUrlBuffer;
+    private string _ytDlpPathBuffer;
 
     // Video player — set after D3D device is available.
     private VideoPlayer? _videoPlayer;
-    private string _videoPathBuffer = string.Empty;
+
+    private static readonly string[] ContentModeNames = { "Image", "Local Video", "URL / Stream" };
 
     public MainWindow(Configuration config, IObjectTable objectTable)
     {
-        _config = config;
-        _objectTable = objectTable;
+        _config       = config;
+        _objectTable  = objectTable;
+
+        _imagePathBuffer  = config.ImagePath;
+        _videoPathBuffer  = config.VideoPath;
+        _videoUrlBuffer   = config.VideoUrl;
+        _ytDlpPathBuffer  = config.YtDlpPath;
     }
 
     public void SetVideoPlayer(VideoPlayer? vp) => _videoPlayer = vp;
@@ -32,7 +42,7 @@ public sealed class MainWindow
     {
         if (!IsVisible) return;
 
-        ImGui.SetNextWindowSize(new Vector2(480, 420), ImGuiCond.FirstUseEver);
+        ImGui.SetNextWindowSize(new Vector2(480, 460), ImGuiCond.FirstUseEver);
         ImGui.SetNextWindowSizeConstraints(new Vector2(360, 300), new Vector2(800, 800));
 
         bool open = IsVisible;
@@ -46,16 +56,14 @@ public sealed class MainWindow
 
         DrawScreenSection();
         ImGui.Spacing();
-        DrawImageSection();
-        ImGui.Spacing();
-        DrawVideoSection();
+        DrawContentSection();
         ImGui.Spacing();
         DrawTintSection();
 
         ImGui.End();
     }
 
-    // ─── Sections ────────────────────────────────────────────────────────────
+    // ─── Screen Transform ────────────────────────────────────────────────────
 
     private void DrawScreenSection()
     {
@@ -65,37 +73,32 @@ public sealed class MainWindow
         var screen = _config.Screen;
         bool changed = false;
 
-        // Visibility toggle
         bool vis = screen.Visible;
         if (ImGui.Checkbox("Visible", ref vis)) { screen.Visible = vis; changed = true; }
 
         ImGui.SameLine();
 
-        // Always draw — don't cull on edge/corner angles
         bool always = _config.AlwaysDraw;
         if (ImGui.Checkbox("Always Draw", ref always)) { _config.AlwaysDraw = always; changed = true; }
         if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("Keep drawing even when corners go behind the camera.\nFixes screen disappearing at steep angles.");
+            ImGui.SetTooltip("Keep drawing even when corners go behind the camera.");
 
         ImGui.SameLine();
 
-        // Phase 1 sandbox toggle
         bool sandbox = _config.UsePhase1Sandbox;
         if (ImGui.Checkbox("Phase 1 Sandbox", ref sandbox)) { _config.UsePhase1Sandbox = sandbox; changed = true; }
         if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("Force Phase 1 rendering (WorldToScreen + ImGui).\nImage works correctly but no depth testing.\nToggle to compare Phase 1 vs Phase 2.");
+            ImGui.SetTooltip("Force Phase 1 rendering (WorldToScreen + ImGui). No depth testing.");
 
         ImGui.SameLine();
 
-        // Black backing
         bool backing = _config.ShowBlackBacking;
         if (ImGui.Checkbox("Black Backing", ref backing)) { _config.ShowBlackBacking = backing; changed = true; }
         if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("Draw a solid black rectangle behind the image.\nDraw order: black → image on top.");
+            ImGui.SetTooltip("Draw a solid black rectangle behind the content.");
 
         ImGui.SameLine();
 
-        // Place at player position
         if (ImGui.SmallButton("Place at Player"))
         {
             var player = _objectTable.LocalPlayer;
@@ -109,7 +112,6 @@ public sealed class MainWindow
 
         ImGui.Separator();
 
-        // Position sliders
         var center = screen.Center;
         if (ImGui.DragFloat3("Position (X/Y/Z)", ref center, 0.05f))
         {
@@ -117,7 +119,6 @@ public sealed class MainWindow
             changed = true;
         }
 
-        // Yaw slider
         float yaw = screen.YawDegrees;
         if (ImGui.SliderFloat("Yaw (degrees)", ref yaw, -180f, 180f))
         {
@@ -125,7 +126,6 @@ public sealed class MainWindow
             changed = true;
         }
 
-        // Size sliders
         float w = screen.Width;
         float h = screen.Height;
 
@@ -140,7 +140,6 @@ public sealed class MainWindow
             changed = true;
         }
 
-        // 16:9 lock button
         ImGui.SameLine();
         if (ImGui.SmallButton("Lock 16:9"))
         {
@@ -151,15 +150,35 @@ public sealed class MainWindow
         if (changed) _config.Save();
     }
 
-    private void DrawImageSection()
+    // ─── Content Source ──────────────────────────────────────────────────────
+
+    private void DrawContentSection()
     {
-        if (!ImGui.CollapsingHeader("Image Source", ImGuiTreeNodeFlags.DefaultOpen))
+        if (!ImGui.CollapsingHeader("Content Source", ImGuiTreeNodeFlags.DefaultOpen))
             return;
 
-        // Sync buffer from config on first draw or after external changes.
+        int mode = (int)_config.ActiveMode;
+        if (ImGui.Combo("Mode###contentmode", ref mode, ContentModeNames, ContentModeNames.Length))
+        {
+            _config.ActiveMode = (ContentMode)mode;
+            _config.Save();
+        }
+
+        ImGui.Separator();
+
+        switch (_config.ActiveMode)
+        {
+            case ContentMode.Image:      DrawImageControls();      break;
+            case ContentMode.LocalVideo: DrawLocalVideoControls(); break;
+            case ContentMode.UrlVideo:   DrawUrlVideoControls();   break;
+        }
+    }
+
+    private void DrawImageControls()
+    {
         if (_imagePathBufferDirty)
         {
-            _imagePathBuffer = _config.ImagePath;
+            _imagePathBuffer     = _config.ImagePath;
             _imagePathBufferDirty = false;
         }
 
@@ -171,47 +190,89 @@ public sealed class MainWindow
             _config.Save();
         }
         ImGui.SameLine();
-        if (ImGui.SmallButton("Apply"))
+        if (ImGui.SmallButton("Apply##img"))
         {
             _config.ImagePath = _imagePathBuffer;
             _config.Save();
         }
-
         ImGui.TextDisabled("(Press Enter or click Apply to load)");
     }
 
-    private void DrawVideoSection()
+    private void DrawLocalVideoControls()
     {
-        if (!ImGui.CollapsingHeader("Video Playback", ImGuiTreeNodeFlags.DefaultOpen))
-            return;
-
-        ImGui.TextDisabled("Video file path (MP4, MKV, etc.):");
+        ImGui.TextDisabled("Video file path (MP4, MKV, AVI, etc.):");
         ImGui.SetNextItemWidth(-1);
         ImGui.InputText("##videopath", ref _videoPathBuffer, 512);
 
         bool hasPlayer = _videoPlayer != null;
         if (!hasPlayer) ImGui.BeginDisabled();
 
-        if (ImGui.Button("Play"))
+        if (ImGui.Button("Play##vl"))
+        {
+            _config.VideoPath = _videoPathBuffer;
+            _config.Save();
             _videoPlayer?.Play(_videoPathBuffer);
+        }
         ImGui.SameLine();
-        if (ImGui.Button("Pause"))
-            _videoPlayer?.TogglePause();
+        if (ImGui.Button("Pause##vl")) _videoPlayer?.TogglePause();
         ImGui.SameLine();
-        if (ImGui.Button("Stop"))
-            _videoPlayer?.Stop();
+        if (ImGui.Button("Stop##vl")) _videoPlayer?.Stop();
 
         if (!hasPlayer) ImGui.EndDisabled();
 
         if (_videoPlayer != null)
         {
-            string status = _videoPlayer.IsPlaying ? "Playing"
-                          : _videoPlayer.IsPaused  ? "Paused"
-                          : "Stopped";
             ImGui.SameLine();
-            ImGui.TextDisabled($"  [{status}]");
+            ImGui.TextDisabled($"  [{_videoPlayer.Status}]");
         }
     }
+
+    private void DrawUrlVideoControls()
+    {
+        ImGui.TextDisabled("Video URL (direct MP4/stream, YouTube, etc.):");
+        ImGui.SetNextItemWidth(-1);
+        ImGui.InputText("##videourl", ref _videoUrlBuffer, 1024);
+
+        bool hasPlayer = _videoPlayer != null;
+        if (!hasPlayer) ImGui.BeginDisabled();
+
+        if (ImGui.Button("Play##vu"))
+        {
+            _config.VideoUrl = _videoUrlBuffer;
+            _config.Save();
+            _videoPlayer?.Play(_videoUrlBuffer);
+        }
+        ImGui.SameLine();
+        if (ImGui.Button("Pause##vu")) _videoPlayer?.TogglePause();
+        ImGui.SameLine();
+        if (ImGui.Button("Stop##vu")) _videoPlayer?.Stop();
+
+        if (!hasPlayer) ImGui.EndDisabled();
+
+        if (_videoPlayer != null)
+        {
+            ImGui.SameLine();
+            ImGui.TextDisabled($"  [{_videoPlayer.Status}]");
+        }
+
+        ImGui.Spacing();
+        ImGui.TextDisabled("yt-dlp path (optional — needed for YouTube):");
+        if (ImGui.InputText("##ytdlppath", ref _ytDlpPathBuffer, 512,
+                            ImGuiInputTextFlags.EnterReturnsTrue))
+        {
+            _config.YtDlpPath = _ytDlpPathBuffer;
+            _config.Save();
+        }
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Apply##ytd"))
+        {
+            _config.YtDlpPath = _ytDlpPathBuffer;
+            _config.Save();
+        }
+        ImGui.TextDisabled("(Leave empty to auto-find yt-dlp.exe in plugin folder)");
+    }
+
+    // ─── Tint / Opacity ──────────────────────────────────────────────────────
 
     private void DrawTintSection()
     {
@@ -229,4 +290,3 @@ public sealed class MainWindow
         }
     }
 }
-

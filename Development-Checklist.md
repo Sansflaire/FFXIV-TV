@@ -140,6 +140,46 @@ Library chosen: **LibVLCSharp** + `VideoLAN.LibVLC.Windows` NuGet (bundles libvl
 
 ---
 
+## Phase 3.5 — URL / Web Video
+
+Goal: Play video from HTTP/HTTPS URLs (direct streams and YouTube) on the in-game screen.
+LibVLC already supports HTTP natively; YouTube requires yt-dlp to extract the direct stream URL.
+
+### VideoPlayer Changes
+- [x] Detect URL input (starts with `http://` or `https://`) vs local file path
+- [x] Direct URL path: skip `File.Exists`, use LibVLC network stream (1920x1080 default)
+- [x] YouTube URL path: run yt-dlp subprocess (`--get-url --format best`) → extract direct stream URL
+- [x] yt-dlp lookup: explicit `YtDlpPath` prop → plugin dir → system `where` fallback
+- [x] Unified `Play(string pathOrUrl)` handles both files and URLs
+- [x] `Status` property: "Stopped" / "Loading..." / "Resolving YouTube URL..." / "Connecting..." / "Playing" / "Paused" / "Error: ..."
+- [x] Graceful error if URL fails to load (log + status text, no crash)
+
+### Configuration
+- [x] Add `ContentMode` enum (`Image`, `LocalVideo`, `UrlVideo`) to `Configuration.cs`
+- [x] Add `ActiveMode`, `VideoPath`, `VideoUrl`, `YtDlpPath` fields to `Configuration.cs`
+
+### UI
+- [x] Content Source section with `Mode` dropdown replaces separate Image / Video sections
+- [x] Image mode: shows image file path + Apply (unchanged behavior)
+- [x] Local Video mode: shows file path input + Play / Pause / Stop + status label
+- [x] URL/Stream mode: shows URL input + Play / Pause / Stop + status label + yt-dlp path field
+
+### Plugin.cs / Commands
+- [x] `/fftv play <url>` auto-switches mode to UrlVideo/LocalVideo and saves config
+- [x] `YtDlpPath` kept in sync from config to VideoPlayer each frame
+- [x] Image path cleared from D3DRenderer when in video mode (avoids stale texture)
+
+### Testing
+- [ ] Direct MP4 URL plays correctly on the world-space screen
+- [ ] YouTube URL resolves via yt-dlp and plays (requires yt-dlp.exe present)
+- [ ] Error shown cleanly if URL is invalid or yt-dlp not found
+- [ ] Local file paths still work unchanged
+- [ ] Image mode still works unchanged
+- [ ] Mode dropdown persists across plugin reload (saved in config)
+- [ ] Plugin reload does not leak yt-dlp subprocess handles
+
+---
+
 ## Phase 4 — Network Sync (Multi-Player)
 
 Goal: Host PC serves a WebSocket server; all connected clients play the same content
