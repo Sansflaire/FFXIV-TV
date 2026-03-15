@@ -63,6 +63,22 @@ public sealed class MainWindow
 
         ImGui.SameLine();
 
+        // Always draw — don't cull on edge/corner angles
+        bool always = _config.AlwaysDraw;
+        if (ImGui.Checkbox("Always Draw", ref always)) { _config.AlwaysDraw = always; changed = true; }
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("Keep drawing even when corners go behind the camera.\nFixes screen disappearing at steep angles.");
+
+        ImGui.SameLine();
+
+        // Black backing
+        bool backing = _config.ShowBlackBacking;
+        if (ImGui.Checkbox("Black Backing", ref backing)) { _config.ShowBlackBacking = backing; changed = true; }
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("Draw a solid black rectangle behind the image.\nDraw order: black → image on top.");
+
+        ImGui.SameLine();
+
         // Place at player position
         if (ImGui.SmallButton("Place at Player"))
         {

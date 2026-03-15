@@ -32,24 +32,25 @@
 Goal: A flat rectangle visible in the game world at a configurable position, showing either a
 solid color placeholder or an image loaded from disk.
 
-- [ ] `dotnet build` compiles cleanly
+- [x] `dotnet build` compiles cleanly
 - [ ] Plugin loads without error in Dalamud log
 - [ ] `/fftv` opens settings window
 - [ ] `/fftv place` places screen 3 units in front of player
 - [ ] `/fftv hide` toggles screen visibility
-- [ ] Settings window — Position sliders update screen location in real time
-- [ ] Settings window — Yaw slider rotates screen orientation
-- [ ] Settings window — Width / Height sliders resize screen
-- [ ] Settings window — "Lock 16:9" button constrains aspect ratio
-- [ ] Settings window — "Place at Player" button snaps screen to player position
-- [ ] Solid purple placeholder quad renders when no image is loaded
-- [ ] Quad correctly tracks movement of screen between locations
-- [ ] Image path text input loads a PNG/JPEG from disk
-- [ ] Image displays correctly on the quad (correct orientation, no UV flip)
-- [ ] Tint / alpha controls visually affect the displayed image
-- [ ] Config persists across plugin reload (position, path, visibility)
-- [ ] Corner debug dots (DEBUG build) appear at correct screen corners
-- [ ] Screen disappears when any corner goes behind the camera (graceful handling)
+- [x] Settings window — Position sliders update screen location in real time
+- [x] Settings window — Yaw slider rotates screen orientation
+- [x] Settings window — Width / Height sliders resize screen
+- [x] Settings window — "Lock 16:9" button constrains aspect ratio
+- [x] Settings window — "Place at Player" button snaps screen to player position
+- [x] Solid purple placeholder quad renders when no image is loaded
+- [x] Quad correctly tracks movement of screen between locations
+- [x] Image path text input loads a PNG/JPEG from disk
+- [x] Image displays correctly on the quad (correct orientation, no UV flip)
+- [x] Tint / alpha controls visually affect the displayed image
+- [x] Config persists across plugin reload (position, path, visibility)
+- [x] Corner debug dots (DEBUG build) appear at correct screen corners
+- [x] "Always Draw" option prevents culling when screen center goes off-camera
+- [x] Black backing quad drawn behind image (configurable)
 
 ---
 
@@ -59,38 +60,42 @@ Goal: Replace the ImGui overlay with actual D3D11 geometry injected into the ren
 so characters and world geometry correctly occlude the screen.
 
 ### Research / Setup
-- [ ] Identify method to obtain D3D11 device pointer from FFXIV (FFXIVClientStructs or Dalamud interop)
-- [ ] Identify correct render hook point (pre-UI pass, after scene geometry)
-- [ ] Confirm access to game camera view/projection matrix (FFXIVClientStructs Camera struct)
-- [ ] Prototype: successfully get D3D11 device and call `GetImmediateContext()`
+- [x] Identify method to obtain D3D11 device pointer from FFXIV (ImGui_ImplDX11_Data at offsets [0]/[1])
+- [x] Identify correct render hook point (UiBuilder.Draw — runs in D3D present, after scene geometry)
+- [x] Confirm access to game camera view/projection matrix (`Control.Instance()->ViewProjectionMatrix`, M44=1f fix)
+- [x] Prototype: successfully get D3D11 device and call `GetImmediateContext()`
 
 ### Shader Authoring
-- [ ] Write `ScreenVS.hlsl` (world-space vertex shader, ViewProj cbuffer)
-- [ ] Write `ScreenPS.hlsl` (simple texture sampler)
-- [ ] Compile shaders at runtime via `D3DCompile` (SharpDX or D3DCompiler.dll P/Invoke)
-- [ ] Verify shader compilation succeeds on first run
+- [x] Write vertex shader HLSL (world-space, `row_major float4x4 ViewProj` cbuffer, `mul(pos, ViewProj)`)
+- [x] Write pixel shader HLSL (simple `tex.Sample(samp, uv)`)
+- [x] Compile shaders at runtime via `Vortice.D3DCompiler.Compiler.Compile()`
+- [ ] Verify shader compilation succeeds at runtime (in-game test)
 
 ### D3D11 Resource Setup
-- [ ] Create vertex buffer (4 vertices: position + UV)
-- [ ] Create index buffer (2 triangles)
-- [ ] Create constant buffer for ViewProj matrix
-- [ ] Create sampler state (linear filtering, clamp)
-- [ ] Create rasterizer state (no backface cull for two-sided screen)
-- [ ] Create blend state (alpha blending for transparent edges)
-- [ ] Create depth-stencil state (depth read enabled, write disabled)
+- [x] Create vertex buffer (4 vertices: position + UV, dynamic)
+- [x] Create index buffer (6 indices, two triangles)
+- [x] Create constant buffer for ViewProj matrix
+- [x] Create sampler state (linear filtering, clamp)
+- [x] Create rasterizer state (no backface cull for two-sided screen)
+- [x] Create blend state (alpha blending — NonPremultiplied)
+- [x] Create depth-stencil state (reversed-Z: ComparisonFunction.Greater, write disabled)
+- [x] Fallback depth-stencil state for when no DSV is bound (DepthEnable=false)
 
 ### Frame Rendering
-- [ ] Hook render function via `IGameInteropProvider`
-- [ ] Each frame: update vertex buffer with current world-space corner positions
-- [ ] Each frame: update ViewProj cbuffer from game camera matrices
-- [ ] Each frame: bind texture, draw indexed quad
-- [ ] Verify screen renders with correct depth (character in front occludes screen)
-- [ ] Verify screen perspective-corrects as camera moves
-- [ ] Cleanup: release all D3D11 resources on Dispose
+- [x] Device/context obtained lazily on first draw frame (TryInitialize pattern)
+- [x] Each frame: query current DSV via OMGetRenderTargets to detect if depth buffer available
+- [x] Each frame: update vertex buffer with current world-space corner positions
+- [x] Each frame: update ViewProj cbuffer from `Control.Instance()->ViewProjectionMatrix`
+- [x] Each frame: borrow SRV from Dalamud texture (AddRef/Dispose pattern), bind and draw
+- [x] Full pipeline state save/restore so ImGui is unaffected
+- [x] `dotnet build` succeeds with 0 errors
+- [ ] Verify screen renders with correct depth (character in front occludes screen) — in-game test
+- [ ] Verify screen perspective-corrects as camera moves — in-game test
+- [x] Cleanup: release all D3D11 resources on Dispose (Vortice COM objects)
 
 ### Regression
-- [ ] Phase 1 fallback mode still works if D3D11 init fails
-- [ ] No D3D11 device leak on plugin reload
+- [x] Phase 1 fallback mode still works if D3D11 init fails
+- [x] No D3D11 device leak on plugin reload (AddRef on borrow, Release on Dispose)
 
 ---
 

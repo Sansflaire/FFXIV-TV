@@ -17,11 +17,25 @@ public sealed class Configuration : IPluginConfiguration
     /// </summary>
     public string ImagePath { get; set; } = string.Empty;
 
-    /// <summary>Tint color applied to the displayed image (RGBA, 0–255 per channel).</summary>
+    /// <summary>Tint color applied to the displayed image (RGBA, 0–1 per channel).</summary>
     public float TintR { get; set; } = 1f;
     public float TintG { get; set; } = 1f;
     public float TintB { get; set; } = 1f;
     public float TintA { get; set; } = 1f;
+
+    /// <summary>
+    /// When true, draw the screen even when corners go behind the camera.
+    /// Fixes the screen "disappearing" when viewed from steep angles.
+    /// Uses the screen center visibility as the only culling check.
+    /// </summary>
+    public bool AlwaysDraw { get; set; } = true;
+
+    /// <summary>
+    /// When true, draw a solid black backing rectangle behind the image/video.
+    /// Ensures no transparency or see-through when the image has alpha.
+    /// Draw order: black backing → image/video on top.
+    /// </summary>
+    public bool ShowBlackBacking { get; set; } = true;
 
     public void Save() => Plugin.PluginInterface.SavePluginConfig(this);
 }

@@ -19,6 +19,12 @@
     <DalamudLibPath>$(APPDATA)\XIVLauncher\addon\Hooks\dev\</DalamudLibPath>
   </PropertyGroup>
 
+  <!-- Phase 2: D3D11 world-space rendering -->
+  <ItemGroup>
+    <PackageReference Include="Vortice.Direct3D11" Version="3.8.2" />
+    <PackageReference Include="Vortice.D3DCompiler"  Version="3.8.2" />
+  </ItemGroup>
+
   <ItemGroup>
     <Reference Include="Dalamud"               HintPath="$(DalamudLibPath)Dalamud.dll"               Private="false" />
     <Reference Include="Dalamud.Common"        HintPath="$(DalamudLibPath)Dalamud.Common.dll"        Private="false" />

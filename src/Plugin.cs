@@ -1,4 +1,5 @@
 using System;
+using System.Numerics;
 using Dalamud.Game.Command;
 using Dalamud.IoC;
 using Dalamud.Plugin;
@@ -22,33 +23,42 @@ public sealed class Plugin : IDalamudPlugin
 
     // ─── Plugin state ────────────────────────────────────────────────────────
     internal Configuration Config { get; }
-    private readonly ScreenRenderer _renderer;
+
+    // Phase 1: ImGui overlay (always available, no depth)
+    private readonly ScreenRenderer _screenRenderer;
+
+    // Phase 2: D3D11 world-space with depth (initialized on first draw frame)
+    private readonly D3DRenderer _d3dRenderer;
+
     private readonly MainWindow _mainWindow;
 
     public Plugin()
     {
         Config = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
 
-        _renderer   = new ScreenRenderer(GameGui, TextureProvider);
-        _mainWindow = new MainWindow(Config, ObjectTable);
+        _screenRenderer = new ScreenRenderer(GameGui, TextureProvider);
+        _d3dRenderer    = new D3DRenderer();
+        _mainWindow     = new MainWindow(Config, ObjectTable);
 
         CommandManager.AddHandler(CmdMain, new CommandInfo(OnCommand)
         {
-            HelpMessage = "Open FFXIV-TV settings. /fftv place — place screen at player. /fftv hide — toggle visibility."
+            HelpMessage = "Open FFXIV-TV settings. /fftv place — place at player. /fftv hide — toggle."
         });
 
-        PluginInterface.UiBuilder.Draw         += OnDraw;
-        PluginInterface.UiBuilder.OpenMainUi   += OnOpenMainUi;
+        PluginInterface.UiBuilder.Draw       += OnDraw;
+        PluginInterface.UiBuilder.OpenMainUi += OnOpenMainUi;
 
         Log.Info("[FFXIV-TV] Loaded.");
     }
 
     public void Dispose()
     {
-        PluginInterface.UiBuilder.Draw         -= OnDraw;
-        PluginInterface.UiBuilder.OpenMainUi   -= OnOpenMainUi;
+        PluginInterface.UiBuilder.Draw       -= OnDraw;
+        PluginInterface.UiBuilder.OpenMainUi -= OnOpenMainUi;
         CommandManager.RemoveHandler(CmdMain);
-        _renderer.Dispose();
+        _d3dRenderer.Dispose();
+        _screenRenderer.Dispose();
+        Config.Save();
         Log.Info("[FFXIV-TV] Unloaded.");
     }
 
@@ -61,18 +71,15 @@ public sealed class Plugin : IDalamudPlugin
             case "":
                 _mainWindow.IsVisible = !_mainWindow.IsVisible;
                 break;
-
             case "place":
                 PlaceAtPlayer();
                 break;
-
             case "hide":
             case "toggle":
                 Config.Screen.Visible = !Config.Screen.Visible;
                 Config.Save();
                 ChatGui.Print($"[FFXIV-TV] Screen {(Config.Screen.Visible ? "shown" : "hidden")}.");
                 break;
-
             default:
                 ChatGui.PrintError($"[FFXIV-TV] Unknown argument '{args}'. Use /fftv, /fftv place, /fftv hide.");
                 break;
@@ -84,7 +91,30 @@ public sealed class Plugin : IDalamudPlugin
     private void OnDraw()
     {
         _mainWindow.Draw();
-        _renderer.Draw(Config);
+
+        var screen = Config.Screen;
+        if (!screen.Visible) return;
+
+        // Try to initialize the D3D11 renderer on the first draw frame
+        // (device isn't available until after Dalamud's ImGui init completes).
+        if (!_d3dRenderer.IsAvailable)
+            _d3dRenderer.TryInitialize();
+
+        if (_d3dRenderer.IsAvailable)
+        {
+            // Phase 2: proper depth-tested world-space geometry.
+            // Get texture from Phase 1 loader (reuse same loading infrastructure).
+            var wrap = _screenRenderer.GetCurrentWrap(Config);
+            if (wrap != null)
+                _d3dRenderer.Draw(screen, wrap.Handle.Handle);
+            else
+                _screenRenderer.DrawPlaceholder(Config); // purple rect placeholder, no depth
+        }
+        else
+        {
+            // Phase 1 fallback: ImGui overlay (no depth testing).
+            _screenRenderer.Draw(Config);
+        }
     }
 
     private void OnOpenMainUi() => _mainWindow.IsVisible = true;
@@ -100,9 +130,8 @@ public sealed class Plugin : IDalamudPlugin
             return;
         }
 
-        // Place the screen 3 units in front of the player.
-        float yawRad = player.Rotation; // Dalamud rotation is in radians
-        Config.Screen.Center = player.Position + new System.Numerics.Vector3(
+        float yawRad = player.Rotation;
+        Config.Screen.Center = player.Position + new Vector3(
             MathF.Sin(yawRad) * 3f,
             1.5f,
             MathF.Cos(yawRad) * 3f
