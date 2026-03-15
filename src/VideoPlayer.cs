@@ -1,9 +1,11 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
+using Newtonsoft.Json.Linq;
 using LibVLCSharp.Shared;
 using Vortice.Direct3D11;
 using Vortice.DXGI;
@@ -319,18 +321,22 @@ public sealed class VideoPlayer : IDisposable
     {
         try
         {
+            string streamUrl = url;
+            Dictionary<string, string>? headers = null;
+
             if (!IsDirectMediaUrl(url))
             {
                 _status = "Resolving URL...";
-                string? resolved = await ResolveWithYtDlpAsync(url);
+                var resolved = await ResolveWithYtDlpAsync(url);
 
                 // Abort if a newer Play() was called while yt-dlp was running.
                 if (_playVersion != version) return;
 
-                if (resolved != null)
+                if (resolved.HasValue)
                 {
                     Plugin.Log.Info($"[FFXIV-TV] VideoPlayer: yt-dlp resolved stream URL");
-                    url = resolved;
+                    streamUrl = resolved.Value.Url;
+                    headers   = resolved.Value.Headers;
                 }
                 else
                 {
@@ -342,7 +348,22 @@ public sealed class VideoPlayer : IDisposable
 
             _status = "Connecting...";
             Plugin.Log.Info($"[FFXIV-TV] VideoPlayer: opening network stream");
-            var media = new Media(_libVlc, new Uri(url));
+            var media = new Media(_libVlc, new Uri(streamUrl));
+
+            // Pass HTTP headers so CDN streams that require Referer/User-Agent/Origin succeed.
+            if (headers != null)
+            {
+                if (headers.TryGetValue("Referer", out var referer) && !string.IsNullOrEmpty(referer))
+                    media.AddOption($":http-referrer={referer}");
+                if (headers.TryGetValue("User-Agent", out var ua) && !string.IsNullOrEmpty(ua))
+                    media.AddOption($":http-user-agent={ua}");
+                if (headers.TryGetValue("Origin", out var origin) && !string.IsNullOrEmpty(origin))
+                    media.AddOption($":http-referrer={origin}"); // LibVLC uses referrer for origin too
+            }
+
+            // Generous network buffer — CDN streams can spike in latency.
+            media.AddOption(":network-caching=5000");
+
             StartPlayback(media, 1920, 1080, version);
         }
         catch (Exception ex)
@@ -378,6 +399,14 @@ public sealed class VideoPlayer : IDisposable
 
     // ── yt-dlp integration ────────────────────────────────────────────────────
 
+    private readonly struct ResolvedStream
+    {
+        public readonly string                      Url;
+        public readonly Dictionary<string, string>? Headers;
+        public ResolvedStream(string url, Dictionary<string, string>? headers)
+        { Url = url; Headers = headers; }
+    }
+
     /// <summary>
     /// Resolves a URL for broadcasting to sync clients.
     /// Direct media URLs are returned as-is; YouTube/etc. are resolved via yt-dlp
@@ -387,22 +416,31 @@ public sealed class VideoPlayer : IDisposable
     public async Task<string> ResolveForBroadcastAsync(string url)
     {
         if (IsDirectMediaUrl(url)) return url;
-        string? resolved = await ResolveWithYtDlpAsync(url);
-        return resolved ?? url;
+        var resolved = await ResolveWithYtDlpAsync(url);
+        return resolved?.Url ?? url;
     }
 
-    private async Task<string?> ResolveWithYtDlpAsync(string url)
+    /// <summary>
+    /// Uses yt-dlp -j (JSON dump) to extract both the stream URL and HTTP headers.
+    /// Headers (Referer, User-Agent, Origin) are required by many CDN streams.
+    /// Returns null if yt-dlp is not found or fails.
+    /// </summary>
+    private async Task<ResolvedStream?> ResolveWithYtDlpAsync(string url)
     {
         string? ytdlp = FindYtDlp();
         if (ytdlp == null)
         {
             Plugin.Log.Warning("[FFXIV-TV] yt-dlp not found. Drop yt-dlp.exe into the plugin folder or set YtDlpPath in settings.");
+            _status = "Error: yt-dlp not found";
             return null;
         }
 
         try
         {
-            var psi = new ProcessStartInfo(ytdlp, $"--get-url --no-playlist --format \"best[ext=mp4]/best\" \"{url}\"")
+            // -j dumps JSON including url + http_headers.
+            // format "best" (no mp4 restriction) allows DASH/HLS manifests —
+            // LibVLC handles these natively and demuxes audio+video internally.
+            var psi = new ProcessStartInfo(ytdlp, $"-j --no-playlist --format \"best\" \"{url}\"")
             {
                 RedirectStandardOutput = true,
                 RedirectStandardError  = true,
@@ -413,11 +451,39 @@ public sealed class VideoPlayer : IDisposable
             using var proc = Process.Start(psi);
             if (proc == null) return null;
 
-            string output = await proc.StandardOutput.ReadToEndAsync();
-            await proc.WaitForExitAsync();
+            // Read both stdout (JSON) and stderr (error messages) concurrently.
+            var stdoutTask = proc.StandardOutput.ReadToEndAsync();
+            var stderrTask = proc.StandardError.ReadToEndAsync();
+            await Task.WhenAll(stdoutTask, proc.WaitForExitAsync());
+            string json   = stdoutTask.Result;
+            string stderr = stderrTask.IsCompleted ? stderrTask.Result : string.Empty;
 
-            string firstLine = output.Trim().Split('\n')[0].Trim();
-            return string.IsNullOrEmpty(firstLine) ? null : firstLine;
+            if (string.IsNullOrWhiteSpace(json))
+            {
+                string errLine = stderr.Trim().Split('\n')[0].Trim();
+                _status = string.IsNullOrEmpty(errLine) ? "Error: yt-dlp returned no output" : $"Error: {errLine}";
+                Plugin.Log.Warning($"[FFXIV-TV] yt-dlp returned no JSON. stderr: {stderr.Trim()}");
+                return null;
+            }
+
+            var obj = JObject.Parse(json);
+            string? streamUrl = obj["url"]?.ToString();
+            if (string.IsNullOrEmpty(streamUrl))
+            {
+                Plugin.Log.Warning("[FFXIV-TV] yt-dlp JSON has no 'url' field.");
+                return null;
+            }
+
+            var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            var httpHeaders = obj["http_headers"];
+            if (httpHeaders != null)
+            {
+                foreach (var prop in httpHeaders.Children<JProperty>())
+                    headers[prop.Name] = prop.Value.ToString();
+            }
+
+            Plugin.Log.Info($"[FFXIV-TV] yt-dlp resolved: {streamUrl[..Math.Min(80, streamUrl.Length)]}...");
+            return new ResolvedStream(streamUrl, headers.Count > 0 ? headers : null);
         }
         catch (Exception ex)
         {
