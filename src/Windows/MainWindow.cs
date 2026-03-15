@@ -16,11 +16,17 @@ public sealed class MainWindow
     private string _imagePathBuffer = string.Empty;
     private bool _imagePathBufferDirty = true;
 
+    // Video player — set after D3D device is available.
+    private VideoPlayer? _videoPlayer;
+    private string _videoPathBuffer = string.Empty;
+
     public MainWindow(Configuration config, IObjectTable objectTable)
     {
         _config = config;
         _objectTable = objectTable;
     }
+
+    public void SetVideoPlayer(VideoPlayer? vp) => _videoPlayer = vp;
 
     public void Draw()
     {
@@ -41,6 +47,8 @@ public sealed class MainWindow
         DrawScreenSection();
         ImGui.Spacing();
         DrawImageSection();
+        ImGui.Spacing();
+        DrawVideoSection();
         ImGui.Spacing();
         DrawTintSection();
 
@@ -170,6 +178,39 @@ public sealed class MainWindow
         }
 
         ImGui.TextDisabled("(Press Enter or click Apply to load)");
+    }
+
+    private void DrawVideoSection()
+    {
+        if (!ImGui.CollapsingHeader("Video Playback", ImGuiTreeNodeFlags.DefaultOpen))
+            return;
+
+        ImGui.TextDisabled("Video file path (MP4, MKV, etc.):");
+        ImGui.SetNextItemWidth(-1);
+        ImGui.InputText("##videopath", ref _videoPathBuffer, 512);
+
+        bool hasPlayer = _videoPlayer != null;
+        if (!hasPlayer) ImGui.BeginDisabled();
+
+        if (ImGui.Button("Play"))
+            _videoPlayer?.Play(_videoPathBuffer);
+        ImGui.SameLine();
+        if (ImGui.Button("Pause"))
+            _videoPlayer?.TogglePause();
+        ImGui.SameLine();
+        if (ImGui.Button("Stop"))
+            _videoPlayer?.Stop();
+
+        if (!hasPlayer) ImGui.EndDisabled();
+
+        if (_videoPlayer != null)
+        {
+            string status = _videoPlayer.IsPlaying ? "Playing"
+                          : _videoPlayer.IsPaused  ? "Paused"
+                          : "Stopped";
+            ImGui.SameLine();
+            ImGui.TextDisabled($"  [{status}]");
+        }
     }
 
     private void DrawTintSection()

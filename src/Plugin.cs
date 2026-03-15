@@ -31,6 +31,10 @@ public sealed class Plugin : IDalamudPlugin
     // Phase 2: D3D11 world-space with depth (initialized on first draw frame)
     private readonly D3DRenderer _d3dRenderer;
 
+    // Phase 3: Video playback via LibVLC
+    private readonly VideoPlayer _videoPlayer;
+    private bool _videoSetupDone;
+
     private readonly MainWindow _mainWindow;
 
     public Plugin()
@@ -39,11 +43,13 @@ public sealed class Plugin : IDalamudPlugin
 
         _screenRenderer = new ScreenRenderer(GameGui, TextureProvider);
         _d3dRenderer    = new D3DRenderer(GameInterop);
+        _videoPlayer    = new VideoPlayer(PluginInterface.AssemblyLocation.DirectoryName!);
         _mainWindow     = new MainWindow(Config, ObjectTable);
+        _mainWindow.SetVideoPlayer(_videoPlayer);
 
         CommandManager.AddHandler(CmdMain, new CommandInfo(OnCommand)
         {
-            HelpMessage = "Open FFXIV-TV settings. /fftv place — place at player. /fftv hide — toggle."
+            HelpMessage = "Open FFXIV-TV settings. /fftv place — place at player. /fftv hide — toggle. /fftv play <path> — play video. /fftv pause — pause/resume. /fftv stop — stop video."
         });
 
         PluginInterface.UiBuilder.Draw       += OnDraw;
@@ -57,6 +63,7 @@ public sealed class Plugin : IDalamudPlugin
         PluginInterface.UiBuilder.Draw       -= OnDraw;
         PluginInterface.UiBuilder.OpenMainUi -= OnOpenMainUi;
         CommandManager.RemoveHandler(CmdMain);
+        _videoPlayer.Dispose();
         _d3dRenderer.Dispose();
         _screenRenderer.Dispose();
         Config.Save();
@@ -67,7 +74,17 @@ public sealed class Plugin : IDalamudPlugin
 
     private void OnCommand(string command, string args)
     {
-        switch (args.Trim().ToLowerInvariant())
+        var trimmed = args.Trim();
+        var lower   = trimmed.ToLowerInvariant();
+
+        if (lower.StartsWith("play "))
+        {
+            var path = trimmed.Substring(5).Trim();
+            _videoPlayer.Play(path);
+            return;
+        }
+
+        switch (lower)
         {
             case "":
                 _mainWindow.IsVisible = !_mainWindow.IsVisible;
@@ -81,8 +98,14 @@ public sealed class Plugin : IDalamudPlugin
                 Config.Save();
                 ChatGui.Print($"[FFXIV-TV] Screen {(Config.Screen.Visible ? "shown" : "hidden")}.");
                 break;
+            case "pause":
+                _videoPlayer.TogglePause();
+                break;
+            case "stop":
+                _videoPlayer.Stop();
+                break;
             default:
-                ChatGui.PrintError($"[FFXIV-TV] Unknown argument '{args}'. Use /fftv, /fftv place, /fftv hide.");
+                ChatGui.PrintError($"[FFXIV-TV] Unknown argument '{args}'. Use /fftv, /fftv place, /fftv hide, /fftv play <path>, /fftv pause, /fftv stop.");
                 break;
         }
     }
@@ -108,6 +131,14 @@ public sealed class Plugin : IDalamudPlugin
         // (device isn't available until after Dalamud's ImGui init completes).
         if (!_d3dRenderer.IsAvailable)
             _d3dRenderer.TryInitialize();
+
+        // Wire VideoPlayer to the D3D device once (first frame after D3D init).
+        if (_d3dRenderer.IsAvailable && !_videoSetupDone && _d3dRenderer.Device != null)
+        {
+            _videoPlayer.SetDevice(_d3dRenderer.Device);
+            _d3dRenderer.SetVideoPlayer(_videoPlayer);
+            _videoSetupDone = true;
+        }
 
         if (_d3dRenderer.IsAvailable)
         {

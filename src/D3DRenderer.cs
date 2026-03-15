@@ -35,6 +35,13 @@ public sealed unsafe class D3DRenderer : IDisposable
     private ID3D11Device?        _device;
     private ID3D11DeviceContext? _context;
 
+    // Expose device so Plugin can pass it to VideoPlayer after init.
+    public ID3D11Device? Device => _device;
+
+    // Optional video player — if set and has a texture, its SRV is used instead of _imageSrv.
+    private VideoPlayer? _videoPlayer;
+    public void SetVideoPlayer(VideoPlayer? vp) { _videoPlayer = vp; }
+
     private ID3D11Buffer?        _vb;
     private ID3D11Buffer?        _cb;         // VS b0: ViewProj matrix
     private ID3D11Buffer?        _cbCorners;  // PS b1: screen-space quad corner positions
@@ -71,7 +78,10 @@ public sealed unsafe class D3DRenderer : IDisposable
 
     private bool _initialized;
     public bool IsAvailable => _initialized;
-    public bool HasTexture  => _imageSrv != null;
+    public bool HasTexture  => _imageSrv != null || (_videoPlayer?.HasTexture == true);
+
+    // Active SRV for the current frame — set in Draw(), used in ExecuteDrawCallback().
+    private ID3D11ShaderResourceView? _activeSrv;
 
     // Set each frame Draw() is called; cleared after the callback fires.
     private bool _drawPending;
@@ -171,7 +181,7 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET {
     {
         if (_initialized) return true;
 
-        var kernelDevice = Device.Instance();
+        var kernelDevice = FFXIVClientStructs.FFXIV.Client.Graphics.Kernel.Device.Instance();
         if (kernelDevice == null)
         {
             Plugin.Log.Debug("[FFXIV-TV] D3DRenderer: Kernel device not ready yet.");
@@ -352,7 +362,15 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET {
     // ── Per-frame draw ────────────────────────────────────────────────────────
     public void Draw(ScreenDefinition screen)
     {
-        if (!_initialized || _context == null || _imageSrv == null) return;
+        // Upload latest decoded video frame + (re)create GPU texture if dimensions changed.
+        if (_videoPlayer != null && _context != null)
+            _videoPlayer.UploadFrame(_context);
+
+        // Prefer video SRV when a video is playing; fall back to static image.
+        _activeSrv = (_videoPlayer != null && _videoPlayer.HasTexture)
+            ? _videoPlayer.FrameSrv
+            : _imageSrv;
+        if (!_initialized || _context == null || _activeSrv == null) return;
 
         var ctrl = Control.Instance();
         if (ctrl == null) return;
@@ -380,7 +398,7 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET {
     // ── ImGui render callback ─────────────────────────────────────────────────
     private void ExecuteDrawCallback(ImDrawList* parentList, ImDrawCmd* cmd)
     {
-        if (!_drawPending || _imageSrv == null || _context == null) return;
+        if (!_drawPending || _activeSrv == null || _context == null) return;
 
         var rtvBuf = new ID3D11RenderTargetView[1];
         _context.OMGetRenderTargets(1, rtvBuf, out var currentDsv);
@@ -406,7 +424,7 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET {
         var saved = SaveState();
         try
         {
-            SetState(_imageSrv, depthState);
+            SetState(_activeSrv, depthState);
             _context.Draw(4, 0);
         }
         finally
@@ -599,6 +617,7 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET {
         _omSetRTHook?.Dispose();  _omSetRTHook  = null;
         _trackedDsv?.Dispose();   _trackedDsv   = null;
         _savedDsv?.Dispose();     _savedDsv     = null;
+        _activeSrv  = null;       // not owned here — owned by VideoPlayer or _imageSrv
         _imageSrv?.Dispose();     _imageSrv     = null;
         _loadedImagePath = string.Empty;
         _sampler?.Dispose();      _sampler      = null;
