@@ -575,14 +575,15 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET {
         _context.Unmap(_gradientTex!, 0);
     }
 
-    // Writes a single BGRA pixel from a hue value. Hue is mapped into the cool color range
-    // [cyan → blue → indigo → violet] (hue wheel 0.50–0.90) so the gradient stays calming.
+    // Writes a single BGRA pixel from a hue value.
+    // Uses the full hue wheel [0, 1) so there is never a hard pop —
+    // the wheel wraps seamlessly (hue 0 and hue 1 are both red).
+    // Low saturation (0.40) keeps all hues soft/pastel even through warm tones.
     private static void WriteHsvPixel(byte* dst, float hue)
     {
-        // Remap [0,1) cycle → cool hue band [0.50, 0.90)
-        hue = (hue - MathF.Floor(hue)) * 0.40f + 0.50f;
+        hue = hue - MathF.Floor(hue); // wrap to [0, 1) — seamless, no pop
 
-        const float s = 0.65f, v = 0.70f;
+        const float s = 0.40f, v = 0.72f;
         float c = v * s;
         float x = c * (1f - MathF.Abs(hue * 6f % 2f - 1f));
         float m = v - c;

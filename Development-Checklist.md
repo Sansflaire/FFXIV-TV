@@ -273,6 +273,7 @@ Goal: Host PC serves a WebSocket server; all connected clients play the same con
 - [x] Stop → show black backing rect instead of nothing (video mode with no texture draws backing)
 - [x] Fix: stop/no-texture black rect MUST use D3D11 pipeline (not ImGui overlay) — ImGui has no depth and covers all UI
 - [x] Fix: Stop shows gradient (not last video frame) — VideoPlayer.HasTexture returns false when VLCState.Stopped
+- [x] Fix: gradient corners pop (not smooth) — was mapping sawtooth into [0.50–0.90] hue band causing hard jump at wrap; now uses full hue wheel (seamless) with low saturation (0.40) for soft pastel tones
 - [x] Idle gradient screensaver: when no video is playing, render a slow animated gradient across the quad; each corner independently cycles through cool hues at a slightly different phase, so corners are always distinct colors; drawn via D3D11 (depth-tested)
 - [ ] Add per-screen gamma/contrast controls (curves, not just multiply)
 - [ ] World light emission from screen rect (area light injected into FFXIV deferred lighting pass — complex, game-version-sensitive)
