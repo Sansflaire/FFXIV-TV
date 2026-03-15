@@ -212,29 +212,44 @@ public sealed class VideoPlayer : IDisposable
         }
     }
 
+    // Extensions that LibVLC can open directly without yt-dlp extraction.
+    private static readonly string[] DirectMediaExtensions =
+        { ".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv", ".m3u8", ".ts", ".wmv", ".ogg" };
+
+    private static bool IsDirectMediaUrl(string url)
+    {
+        try
+        {
+            var path = new Uri(url).AbsolutePath;
+            foreach (var ext in DirectMediaExtensions)
+                if (path.EndsWith(ext, StringComparison.OrdinalIgnoreCase)) return true;
+        }
+        catch { /* malformed URI — let yt-dlp handle it */ }
+        return false;
+    }
+
     private async Task PlayNetworkAsync(string url)
     {
         try
         {
-            bool isYouTube = url.Contains("youtube.com/", StringComparison.OrdinalIgnoreCase) ||
-                             url.Contains("youtu.be/",    StringComparison.OrdinalIgnoreCase);
-
-            if (isYouTube)
+            // Direct media files (mp4, m3u8, etc.) go straight to LibVLC.
+            // Everything else — YouTube, rule34video, Twitch, etc. — goes through yt-dlp.
+            // yt-dlp supports 1000+ sites; if it fails we fall back to LibVLC directly.
+            if (!IsDirectMediaUrl(url))
             {
-                _status = "Resolving YouTube URL...";
+                _status = "Resolving URL...";
                 string? resolved = await ResolveWithYtDlpAsync(url);
-                if (resolved == null)
+                if (resolved != null)
                 {
-                    _status = "yt-dlp not found or failed";
-                    Plugin.Log.Warning("[FFXIV-TV] VideoPlayer: yt-dlp resolution failed.");
-                    return;
+                    Plugin.Log.Info($"[FFXIV-TV] VideoPlayer: yt-dlp resolved stream URL");
+                    url = resolved;
                 }
-                Plugin.Log.Info($"[FFXIV-TV] VideoPlayer: yt-dlp resolved to: {resolved}");
-                url = resolved;
+                else
+                {
+                    Plugin.Log.Warning("[FFXIV-TV] VideoPlayer: yt-dlp failed or not found — trying LibVLC directly.");
+                }
             }
 
-            // For network streams, we can't know dimensions ahead of time without opening the
-            // stream. Use 1920x1080 — LibVLC will scale/decode to this format via SetVideoFormat.
             _status = "Connecting...";
             Plugin.Log.Info($"[FFXIV-TV] VideoPlayer: opening network stream");
             var media = new Media(_libVlc, new Uri(url));
