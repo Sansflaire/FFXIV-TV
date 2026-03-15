@@ -1,8 +1,8 @@
 using System;
 using System.Numerics;
 using System.Runtime.InteropServices;
-using Dalamud.Bindings.ImGui;
 using FFXIVClientStructs.FFXIV.Client.Game.Control;
+using FFXIVClientStructs.FFXIV.Client.Graphics.Kernel;
 using Vortice.D3DCompiler;
 using Vortice.Direct3D;
 using Vortice.Direct3D11;
@@ -72,30 +72,30 @@ float4 main(float2 uv : TEXCOORD) : SV_TARGET { return tex.Sample(samp, uv); }";
     {
         if (_initialized) return true;
 
-        // ImGui_ImplDX11_Data layout (stable since ImGui 1.80):
-        //   offset 0 = ID3D11Device*
-        //   offset 8 = ID3D11DeviceContext*
-        var io = ImGui.GetIO();
-        void* brd = io.BackendRendererUserData;
-        if (brd == null)
+        // Get D3D11 device and immediate context from FFXIV's own kernel device.
+        // FFXIVClientStructs.FFXIV.Client.Graphics.Kernel.Device:
+        //   [FieldOffset(920232)] void* D3D11Forwarder   — ID3D11Device*
+        //   [FieldOffset(920240)] void* D3D11DeviceContext — ID3D11DeviceContext*
+        var kernelDevice = Device.Instance();
+        if (kernelDevice == null)
         {
-            Plugin.Log.Debug("[FFXIV-TV] D3DRenderer: ImGui DX11 backend data not ready yet.");
+            Plugin.Log.Debug("[FFXIV-TV] D3DRenderer: Kernel device not ready yet.");
             return false;
         }
 
-        nint* bd = (nint*)brd;
-        if (bd[0] == 0 || bd[1] == 0)
+        nint devicePtr  = (nint)kernelDevice->D3D11Forwarder;
+        nint contextPtr = (nint)kernelDevice->D3D11DeviceContext;
+
+        if (devicePtr == 0 || contextPtr == 0)
         {
-            Plugin.Log.Warning("[FFXIV-TV] D3DRenderer: null device or context in backend data.");
+            Plugin.Log.Warning("[FFXIV-TV] D3DRenderer: null D3D11 device or context pointer.");
             return false;
         }
 
-        // Vortice constructor does NOT AddRef — but the Get* call that fills the backend
-        // data already AddRef'd, so these pointers are valid borrowed references.
-        // We AddRef here so our Dispose (Release) is safe.
-        _device  = new ID3D11Device(bd[0]);
+        // Vortice constructor does NOT AddRef — AddRef so our Dispose (Release) is safe.
+        _device  = new ID3D11Device(devicePtr);
         _device.AddRef();
-        _context = new ID3D11DeviceContext(bd[1]);
+        _context = new ID3D11DeviceContext(contextPtr);
         _context.AddRef();
 
         try
