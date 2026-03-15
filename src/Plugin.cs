@@ -199,10 +199,12 @@ public sealed class Plugin : IDalamudPlugin
             else
             {
                 _d3dRenderer.Draw(screen);
-                // When video is stopped/no texture, D3DRenderer.Draw() skips the quad draw but
-                // we still want the black backing rect to show.
+                // When video is stopped/no texture: draw a solid black quad via D3D11
+                // (depth-tested) so it never covers native FFXIV UI or characters.
+                // MUST NOT use ScreenRenderer.DrawBlackBacking — that path uses ImGui
+                // which has no depth testing and renders over everything.
                 if (Config.ActiveMode != ContentMode.Image && !_d3dRenderer.HasTexture && Config.ShowBlackBacking)
-                    _screenRenderer.DrawBlackBacking(Config);
+                    _d3dRenderer.DrawBlack(screen);
             }
         }
         else

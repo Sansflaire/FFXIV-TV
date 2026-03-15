@@ -80,7 +80,9 @@ public sealed class VideoPlayer : IDisposable
 
     // ── Public API ────────────────────────────────────────────────────────────
     public ID3D11ShaderResourceView? FrameSrv => _srv;
-    public bool HasTexture => _srv != null;
+    // False when stopped — even if the GPU texture still exists from the last frame.
+    // This causes D3DRenderer to skip the video quad and show the idle gradient instead.
+    public bool HasTexture => _srv != null && _player.State != VLCState.Stopped;
     public bool IsPlaying  => _player.IsPlaying;
     public bool IsPaused   => _player.State == VLCState.Paused;
 

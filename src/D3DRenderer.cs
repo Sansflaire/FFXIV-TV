@@ -82,6 +82,22 @@ public sealed unsafe class D3DRenderer : IDisposable
     private bool _injectedThisTransition = false; // guard: inject once per 3D→2D transition
     private volatile bool _cachedDrawReady = false; // set by Draw(); consumed by hook on render thread
 
+    // 1×1 black RGBA texture — safety fallback if gradient texture fails to init.
+    private static readonly byte[] _blackPixelData = { 0, 0, 0, 255 }; // BGRA opaque black
+    private ID3D11ShaderResourceView? _blackSrv;
+
+    // 2×2 dynamic texture for the idle gradient screensaver.
+    // Each pixel = one quad corner (TL, TR, BL, BR). Bilinear sampling blends them smoothly.
+    // Updated every DrawBlack() call with slowly-animated cool hues (cyan → violet range).
+    private ID3D11Texture2D?          _gradientTex;
+    private ID3D11ShaderResourceView? _gradientSrv;
+    private float                     _gradientTime = 0f;
+
+    // Fixed phase offsets keep the four corners permanently spaced on the hue wheel
+    // (0°, 90°, 180°, 270° in cycle space) so they are never the same color simultaneously.
+    private static readonly float[] _gradientPhaseOffsets = { 0.0f, 0.25f, 0.5f, 0.75f };
+    private const float GradientSpeed = 0.018f; // one full hue cycle per ~55 s — calm and slow
+
     // Own texture loaded from the image file.
     private ID3D11ShaderResourceView? _imageSrv;
     private string                    _loadedImagePath = string.Empty;
@@ -377,6 +393,41 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET {
             0f, 16, ComparisonFunction.Never,
             new Color4(0f), 0f, float.MaxValue);
         _sampler = _device.CreateSamplerState(samplerDesc);
+
+        // 1×1 black texture — safety fallback if gradient texture fails to init.
+        fixed (byte* p = _blackPixelData)
+        {
+            var blackTexDesc = new Texture2DDescription
+            {
+                Width             = 1,
+                Height            = 1,
+                MipLevels         = 1,
+                ArraySize         = 1,
+                Format            = Format.B8G8R8A8_UNorm,
+                SampleDescription = new SampleDescription(1, 0),
+                Usage             = ResourceUsage.Immutable,
+                BindFlags         = BindFlags.ShaderResource,
+            };
+            var subData = new SubresourceData { DataPointer = (nint)p, RowPitch = 4 };
+            using var blackTex = _device.CreateTexture2D(blackTexDesc, new[] { subData });
+            _blackSrv = _device.CreateShaderResourceView(blackTex);
+        }
+
+        // 2×2 dynamic texture for the idle gradient screensaver.
+        var gradDesc = new Texture2DDescription
+        {
+            Width             = 2,
+            Height            = 2,
+            MipLevels         = 1,
+            ArraySize         = 1,
+            Format            = Format.B8G8R8A8_UNorm,
+            SampleDescription = new SampleDescription(1, 0),
+            Usage             = ResourceUsage.Dynamic,
+            BindFlags         = BindFlags.ShaderResource,
+            CPUAccessFlags    = CpuAccessFlags.Write,
+        };
+        _gradientTex = _device.CreateTexture2D(gradDesc);
+        _gradientSrv = _device.CreateShaderResourceView(_gradientTex);
     }
 
     // ── Texture management ────────────────────────────────────────────────────
@@ -471,6 +522,84 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET {
         // (e.g. no 3D→2D transition detected this frame). Draws on top of UI — not ideal
         // but better than nothing.
         ImGui.GetBackgroundDrawList().AddCallback(_renderCallback, null);
+    }
+
+    // Draws the idle gradient screensaver quad using the D3D11 pipeline (depth-tested).
+    // Used when video is stopped and ShowBlackBacking is on. Must NEVER use ImGui overlay.
+    // The 2×2 gradient texture is updated each call; bilinear sampling creates a smooth
+    // four-corner color blend across the whole quad.
+    public void DrawBlack(ScreenDefinition screen)
+    {
+        if (!_initialized || _context == null) return;
+        var srv = _gradientSrv ?? _blackSrv;
+        if (srv == null) return;
+
+        var ctrl = Control.Instance();
+        if (ctrl == null) return;
+
+        Matrix4x4 viewProj = ctrl->ViewProjectionMatrix;
+        var (wTL, wTR, wBR, wBL) = screen.GetWorldCorners();
+        _wTL = wTL; _wTR = wTR; _wBL = wBL; _wBR = wBR;
+        _storedViewProj = viewProj;
+
+        UpdateVB(wTL, wTR, wBL, wBR);
+        UpdateCB(viewProj);
+        UpdateGradientTexture();
+
+        _activeSrv       = srv;
+        _cachedDrawReady = true;
+        _drawPending     = true;
+
+        ImGui.GetBackgroundDrawList().AddCallback(_renderCallback, null);
+    }
+
+    // Advances the gradient animation and writes the four corner colors into the 2×2 texture.
+    // Each corner cycles through cool hues (cyan → blue → indigo → violet) at a fixed phase offset,
+    // ensuring corners are always distinct and no single color ever repeats across all four corners.
+    private void UpdateGradientTexture()
+    {
+        if (_gradientTex == null || _context == null) return;
+
+        _gradientTime += 1f / 60f; // advance at assumed ~60 fps; fine for a visual effect
+
+        _context.Map(_gradientTex!, 0, MapMode.WriteDiscard, Vortice.Direct3D11.MapFlags.None, out var mapped);
+        byte* r0 = (byte*)mapped.DataPointer;
+        byte* r1 = r0 + mapped.RowPitch;
+
+        float t = _gradientTime * GradientSpeed;
+        WriteHsvPixel(r0 + 0, t + _gradientPhaseOffsets[0]); // TL
+        WriteHsvPixel(r0 + 4, t + _gradientPhaseOffsets[1]); // TR
+        WriteHsvPixel(r1 + 0, t + _gradientPhaseOffsets[2]); // BL
+        WriteHsvPixel(r1 + 4, t + _gradientPhaseOffsets[3]); // BR
+
+        _context.Unmap(_gradientTex!, 0);
+    }
+
+    // Writes a single BGRA pixel from a hue value. Hue is mapped into the cool color range
+    // [cyan → blue → indigo → violet] (hue wheel 0.50–0.90) so the gradient stays calming.
+    private static void WriteHsvPixel(byte* dst, float hue)
+    {
+        // Remap [0,1) cycle → cool hue band [0.50, 0.90)
+        hue = (hue - MathF.Floor(hue)) * 0.40f + 0.50f;
+
+        const float s = 0.65f, v = 0.70f;
+        float c = v * s;
+        float x = c * (1f - MathF.Abs(hue * 6f % 2f - 1f));
+        float m = v - c;
+        float r, g, b;
+        switch ((int)(hue * 6f) % 6)
+        {
+            case 0:  r = c; g = x; b = 0; break;
+            case 1:  r = x; g = c; b = 0; break;
+            case 2:  r = 0; g = c; b = x; break;
+            case 3:  r = 0; g = x; b = c; break;
+            case 4:  r = x; g = 0; b = c; break;
+            default: r = c; g = 0; b = x; break;
+        }
+        dst[0] = (byte)((b + m) * 255f); // B
+        dst[1] = (byte)((g + m) * 255f); // G
+        dst[2] = (byte)((r + m) * 255f); // R
+        dst[3] = 255;                     // A
     }
 
     // ── ImGui render callback (fallback only) ────────────────────────────────
@@ -701,6 +830,9 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET {
         _omSetRTHook?.Dispose();  _omSetRTHook  = null;
         _trackedDsv?.Dispose();   _trackedDsv   = null;
         _activeSrv  = null;       // not owned here — owned by VideoPlayer or _imageSrv
+        _gradientSrv?.Dispose();  _gradientSrv  = null;
+        _gradientTex?.Dispose();  _gradientTex  = null;
+        _blackSrv?.Dispose();     _blackSrv     = null;
         _imageSrv?.Dispose();     _imageSrv     = null;
         _loadedImagePath = string.Empty;
         _sampler?.Dispose();      _sampler      = null;

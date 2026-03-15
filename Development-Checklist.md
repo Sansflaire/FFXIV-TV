@@ -180,6 +180,35 @@ LibVLC already supports HTTP natively; YouTube requires yt-dlp to extract the di
 
 ---
 
+## Phase 3.6 — Video Playlist
+
+Goal: Play a list of videos in order, automatically advancing when each one ends, then loop the list.
+
+### Data Model
+- [ ] Add `Playlist` class or `List<string> PlaylistItems` to `Configuration.cs`
+- [ ] Add `PlaylistIndex` (current position) and `PlaylistLoop` (bool) to `Configuration.cs`
+- [ ] Persist playlist across plugin reload
+
+### VideoPlayer / SyncCoordinator
+- [ ] `VideoPlayer`: on `EndReached`, check if playlist has a next item; advance index and play next
+- [ ] `VideoPlayer`: on last item end and `PlaylistLoop = true`, wrap index to 0 and play first
+- [ ] `SyncCoordinator`: broadcast `playlistNext` message to clients when host advances
+
+### UI
+- [ ] Playlist panel in MainWindow: ordered list of file paths / URLs (add/remove/reorder)
+- [ ] "Add" button opens file path input; "Add URL" for network streams
+- [ ] Remove selected item button; drag-to-reorder items
+- [ ] "Loop playlist" toggle checkbox
+- [ ] Current item highlighted; index shown (e.g. "2 / 5")
+- [ ] `/fftv playlist add <path>` command appends an item
+- [ ] `/fftv playlist clear` command empties the list
+
+### Network Sync
+- [ ] Host broadcasts playlist state (items + index + loop flag) to clients on connect
+- [ ] Clients advance playlist in sync with host (via `playlistNext` message, not local EndReached)
+
+---
+
 ## Phase 4 — Network Sync (Multi-Player)
 
 Goal: Host PC serves a WebSocket server; all connected clients play the same content simultaneously.
@@ -242,6 +271,9 @@ Goal: Host PC serves a WebSocket server; all connected clients play the same con
 - [x] Revert UNorm_SRgb texture change (caused double-gamma darkening — FFXIV RT is linear UNorm)
 - [x] Add per-screen brightness multiplier (PS shader cbuffer b2, slider 0.0–4.0, default 1.0)
 - [x] Stop → show black backing rect instead of nothing (video mode with no texture draws backing)
+- [x] Fix: stop/no-texture black rect MUST use D3D11 pipeline (not ImGui overlay) — ImGui has no depth and covers all UI
+- [x] Fix: Stop shows gradient (not last video frame) — VideoPlayer.HasTexture returns false when VLCState.Stopped
+- [x] Idle gradient screensaver: when no video is playing, render a slow animated gradient across the quad; each corner independently cycles through cool hues at a slightly different phase, so corners are always distinct colors; drawn via D3D11 (depth-tested)
 - [ ] Add per-screen gamma/contrast controls (curves, not just multiply)
 - [ ] World light emission from screen rect (area light injected into FFXIV deferred lighting pass — complex, game-version-sensitive)
 
