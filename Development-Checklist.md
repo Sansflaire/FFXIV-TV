@@ -90,7 +90,7 @@ so characters and world geometry correctly occlude the screen.
 - [x] Each frame: borrow SRV from Dalamud texture (AddRef/Dispose pattern), bind and draw
 - [x] Full pipeline state save/restore so ImGui is unaffected
 - [x] `dotnet build` succeeds with 0 errors
-- [x] Verify screen renders with correct depth (character in front occludes screen) — confirmed
+- [x] Verify screen renders with correct depth (character in front occludes screen)
 - [x] Verify image displays correctly on quad — confirmed (Round 18)
 - [ ] Verify screen perspective-corrects as camera moves — in-game test
 - [x] Cleanup: release all D3D11 resources on Dispose (Vortice COM objects)

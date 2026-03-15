@@ -18,6 +18,7 @@ public sealed class Plugin : IDalamudPlugin
     [PluginService] internal static ITextureProvider        TextureProvider { get; private set; } = null!;
     [PluginService] internal static IObjectTable            ObjectTable     { get; private set; } = null!;
     [PluginService] internal static IChatGui                ChatGui         { get; private set; } = null!;
+    [PluginService] internal static IGameInteropProvider    GameInterop     { get; private set; } = null!;
 
     private const string CmdMain = "/fftv";
 
@@ -37,7 +38,7 @@ public sealed class Plugin : IDalamudPlugin
         Config = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
 
         _screenRenderer = new ScreenRenderer(GameGui, TextureProvider);
-        _d3dRenderer    = new D3DRenderer();
+        _d3dRenderer    = new D3DRenderer(GameInterop);
         _mainWindow     = new MainWindow(Config, ObjectTable);
 
         CommandManager.AddHandler(CmdMain, new CommandInfo(OnCommand)
@@ -114,7 +115,6 @@ public sealed class Plugin : IDalamudPlugin
             // D3DRenderer owns its texture — loaded directly from file, not via Dalamud wrap
             // (Dalamud's ImTextureID handle is not a raw SRV pointer).
             _d3dRenderer.SetImagePath(Config.ImagePath);
-            _screenRenderer.DrawBlackBacking(Config);
 
             if (_d3dRenderer.HasTexture)
                 _d3dRenderer.Draw(screen);

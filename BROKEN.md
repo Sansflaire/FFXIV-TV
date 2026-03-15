@@ -376,10 +376,108 @@ Depth testing confirmed working — character's feet occlude the bottom of the s
 5. Sign bug in bilinear_uv linear case: `v = Cv/Bv` → should be `v = -Cv/Bv`
 6. RSGetViewports signature: `RSGetViewports(ref uint, Viewport[])` (not `RSGetViewports(int, Viewport[])`)
 
-## ✅ Problem 2 RESOLVED — Depth testing works
+---
 
-DSV captured at Draw() time, bound in callback via `OMSetRenderTargets(rtv, savedDsv)`.
-Reversed-Z depth state: `DepthFunc=Greater`, `DepthWriteMask=Zero` (read-only).
+## Problem 2: Screen draws over all world geometry (no depth testing) — STILL OPEN
+
+### Symptom
+The D3D quad renders on top of walls, bulletin boards, and all game geometry.
+Characters should occlude the screen when in front of it; world geometry should also occlude it.
+
+### Root Cause
+`_savedDsv` (captured in `Draw()` via `OMGetRenderTargets`) is almost certainly null.
+By the time `UiBuilder.Draw` fires, the game has already transitioned past its 3D scene pass
+and unbound the depth buffer for the UI pass. So the saved DSV is null → we fall back to
+`_dsNoDepth` → no depth testing.
+
+### What Was Tried
+- Round 1: Save DSV in `Draw()` at UiBuilder.Draw time via `OMGetRenderTargets`.
+  **Doesn't work** — confirmed via R19 diagnostic: `savedDsv=null currentDsv=null`.
+  FFXIV unbinds the depth buffer before UiBuilder.Draw fires.
+
+### Fix Applied (Round 19)
+Hook `ID3D11DeviceContext::OMSetRenderTargets` (vtable index 33) via
+`IGameInteropProvider.HookFromAddress`. The detour fires on every OMSetRenderTargets call.
+If the call is on our context and has a non-null DSV, save it as `_trackedDsv` (AddRef).
+ExecuteDrawCallback uses `_trackedDsv` as the effective DSV for depth testing.
+
+This captures FFXIV's scene depth buffer while it's being bound during scene rendering,
+before the UI pass unbinds it.
+
+**Result (Round 19 — confirmed in-game):** Still draws over all geometry. Hook installed
+successfully ("OMSetRenderTargets hook installed." in log), but no evidence _trackedDsv
+was ever captured — no diagnostic log from inside the detour.
+
+### Round 20 — Diagnostic: confirm hook fires and DSV captured
+
+**Result (Round 20 — confirmed via log):**
+```
+05:02:42.969 — callback frame=1: trackedDsv=null effectiveDsv=null  (first frame, DSV not yet captured)
+05:02:42.977 — _trackedDsv captured: 0x299AEA53BE0  (8ms AFTER first callback)
+```
+The callback fires on frame 1 before the hook has ever seen a DSV. After frame 1,
+`_trackedDsv` IS set. But because the one-shot log already fired, we can't confirm
+whether frames 2+ see `effectiveDsv=non-null`. The screen still draws over everything.
+
+**Root cause (partial):** Timing — first frame has no DSV. Subsequent frames have `_trackedDsv`
+non-null, but depth testing still doesn't work. Unknown whether issue is:
+- `_trackedDsv` null on frames 2+ (unexpected reset)
+- DSV/RTV format or dimension mismatch (D3D11 silently ignores DSV)
+- Correct DSV bound but depth test logic wrong
+
+### Round 21 — Diagnostic: per-frame logging of effectiveDsv state
+
+**Result (Round 21 — confirmed via log):**
+```
+frame=67680 trackedDsv=non-null effectiveDsv=non-null usingDepth=True
+frame=67860 trackedDsv=non-null effectiveDsv=non-null usingDepth=True
+... (same every 180 frames, thousands of frames)
+```
+`effectiveDsv=non-null` and `usingDepth=True` every frame in steady state. The DSV IS
+being passed to `OMSetRenderTargets` and `_dsReverseZ` IS being used. Yet screen still
+draws over all world geometry.
+
+**Root cause hypothesis:** The captured DSV is from a **shadow/depth-only pass**, not the
+main scene. Shadow passes call `OMSetRenderTargets(numViews=0, null, dsv)` — no RTV, just
+depth. Our hook saves the last non-null DSV regardless of whether an RTV is bound.
+When we bind a shadow-map DSV (e.g., 2048×2048) alongside ImGui's backbuffer RTV (2560×1440),
+D3D11 either silently ignores the DSV (dimension mismatch) or uses shadow depth values
+(completely wrong Z range), so depth test never rejects our fragments.
+
+### Round 22 — Filter: only capture DSVs bound with a real RTV (main scene pass)
+
+**Result (Round 22 — confirmed in-game):** ✅ DEPTH TESTING NOW WORKS (partially).
+- Character BEHIND screen is correctly hidden by the screen ✓
+- Character IN FRONT of screen correctly passes through ✓
+- BUT: character in front appears as a **solid black silhouette** ✗
+
+**Root cause of black silhouette:** `Plugin.cs` called `_screenRenderer.DrawBlackBacking(Config)`
+before `_d3dRenderer.Draw()`. That ImGui call draws a solid black quad over the entire screen
+area with NO depth testing. When D3D runs, depth fails for character pixels → they stay black
+from the backing, never showing the character's actual color.
+
+**Fix R22b:** Removed `_screenRenderer.DrawBlackBacking(Config)` from the Phase 2 D3D path
+in `Plugin.cs`. The D3D draw handles the screen itself; no ImGui backing needed.
+
+**Result (Round 22b — confirmed in-game):** ✅ FULLY WORKING.
+Character in front occludes screen with correct colors. World geometry occludes screen
+correctly. Screen correctly occludes characters and geometry behind it.
+
+---
+
+## ✅ Problem 2 RESOLVED — Depth testing fully working
+
+**Root cause chain (final):**
+1. `UiBuilder.Draw` fires AFTER FFXIV unbinds its depth buffer → `OMGetRenderTargets` at
+   draw time always returns null DSV
+2. Fix: hook `ID3D11DeviceContext::OMSetRenderTargets` (vtable index 33) to track DSV
+   during scene rendering
+3. Initial hook captured DSVs from shadow/depth-only passes (numViews=0, no RTV) →
+   wrong texture dimensions → depth test silently failed
+4. Fix: filter hook to only capture when `numViews > 0 && ppRTVs[0] != 0` (main scene pass)
+5. `DrawBlackBacking` (ImGui, no depth) drew solid black over screen area → characters in
+   front appeared as black silhouettes (D3D depth test failed those pixels, left them black)
+6. Fix: removed `DrawBlackBacking` from Phase 2 path
 
 ---
 

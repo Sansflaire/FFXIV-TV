@@ -3,6 +3,8 @@ using System.IO;
 using System.Numerics;
 using System.Runtime.InteropServices;
 using Dalamud.Bindings.ImGui;
+using Dalamud.Hooking;
+using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.Game.Control;
 using FFXIVClientStructs.FFXIV.Client.Graphics.Kernel;
 using Vortice.D3DCompiler;
@@ -45,6 +47,21 @@ public sealed unsafe class D3DRenderer : IDisposable
     private ID3D11DepthStencilState? _dsReverseZ;
     private ID3D11SamplerState?      _sampler;
 
+    // DSV tracking via OMSetRenderTargets vtable hook.
+    // FFXIV unbinds its depth buffer before UiBuilder.Draw fires, so we can't capture it
+    // from Draw(). Instead, we hook OMSetRenderTargets on the immediate context's vtable
+    // and save the last non-null DSV that FFXIV binds during scene rendering.
+    // OMSetRenderTargets is vtable index 33 in ID3D11DeviceContext.
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate void OMSetRenderTargetsDelegate(
+        nint pContext, uint numViews, nint* ppRTVs, nint pDSV);
+
+    private Hook<OMSetRenderTargetsDelegate>?  _omSetRTHook;
+    private ID3D11DepthStencilView?            _trackedDsv;  // last non-null DSV seen on our context
+    private nint                               _contextPtr;  // raw pointer to our context, for hook filtering
+    private bool _dsvLoggedOnce;       // one-shot: log when _trackedDsv first set + DSV dimensions
+    private int  _cbkFrameCount;       // counts callback invocations for periodic logging
+
     // Saved at Draw() time (before ImGui swaps render targets).
     private ID3D11DepthStencilView? _savedDsv;
 
@@ -62,6 +79,7 @@ public sealed unsafe class D3DRenderer : IDisposable
     // World corners and ViewProj stored in Draw(), used in the callback to compute screen corners.
     private Vector3  _wTL, _wTR, _wBL, _wBR;
     private Matrix4x4 _storedViewProj;
+
 
 
     private readonly ImDrawCallback _renderCallback;
@@ -139,9 +157,12 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET {
     return tex.Sample(samp, uv);
 }";
 
+    private readonly IGameInteropProvider _interop;
+
     // ── Constructor ───────────────────────────────────────────────────────────
-    public D3DRenderer()
+    public D3DRenderer(IGameInteropProvider interop)
     {
+        _interop        = interop;
         _renderCallback = new ImDrawCallback(ExecuteDrawCallback);
     }
 
@@ -166,13 +187,15 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET {
 
         _device = new ID3D11Device(devicePtr);
         _device.AddRef();
-        _context = _device.ImmediateContext;
+        _context    = _device.ImmediateContext;
+        _contextPtr = _context.NativePointer;
 
         Plugin.Log.Info($"[FFXIV-TV] D3DRenderer: device=0x{devicePtr:X}");
 
         try
         {
             CreateResources();
+            InstallOMSetRTHook();
             _initialized = true;
             Plugin.Log.Info("[FFXIV-TV] D3DRenderer initialized — Phase 2 active.");
             return true;
@@ -182,6 +205,41 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET {
             Plugin.Log.Error($"[FFXIV-TV] D3DRenderer init failed: {ex.Message}");
             DisposeResources();
             return false;
+        }
+    }
+
+    private void InstallOMSetRTHook()
+    {
+        // Hook ID3D11DeviceContext::OMSetRenderTargets (vtable index 33).
+        // We use this to track the last non-null DSV that FFXIV binds during scene rendering,
+        // since FFXIV unbinds its depth buffer before UiBuilder.Draw fires.
+        // vtable[33] = OMSetRenderTargets function pointer (D3D11 spec).
+        nint* vtable = *(nint**)_contextPtr;
+        nint omSetRTAddr = vtable[33];
+        _omSetRTHook = _interop.HookFromAddress<OMSetRenderTargetsDelegate>(
+            omSetRTAddr, OMSetRenderTargetsDetour);
+        _omSetRTHook.Enable();
+        Plugin.Log.Info("[FFXIV-TV] OMSetRenderTargets hook installed.");
+    }
+
+    private void OMSetRenderTargetsDetour(nint pCtx, uint numViews, nint* ppRTVs, nint pDSV)
+    {
+        _omSetRTHook!.Original(pCtx, numViews, ppRTVs, pDSV);
+
+        // Only track DSVs bound alongside at least one RTV on our context.
+        // Shadow/depth-only passes call OMSetRenderTargets(0, null, dsv) — numViews=0, no RTV.
+        // The main scene pass calls OMSetRenderTargets(1, &mainRTV, sceneDSV).
+        // We want the main scene DSV, so filter to numViews > 0 with a real RTV.
+        if (pCtx == _contextPtr && pDSV != 0 && numViews > 0 && ppRTVs != null && ppRTVs[0] != 0)
+        {
+            _trackedDsv?.Dispose();
+            _trackedDsv = new ID3D11DepthStencilView(pDSV);
+            _trackedDsv.AddRef();
+            if (!_dsvLoggedOnce)
+            {
+                _dsvLoggedOnce = true;
+                Plugin.Log.Info($"[FFXIV-TV R22] main-scene DSV captured: 0x{pDSV:X} (numViews={numViews} rtv0=0x{ppRTVs[0]:X})");
+            }
         }
     }
 
@@ -328,8 +386,15 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET {
         _context.OMGetRenderTargets(1, rtvBuf, out var currentDsv);
         var rtv = rtvBuf[0];
 
-        var effectiveDsv = _savedDsv ?? currentDsv;
+        // Use the DSV tracked via OMSetRenderTargets hook (FFXIV's scene depth buffer).
+        // _savedDsv and currentDsv are both null at callback time — FFXIV unbinds depth
+        // before UiBuilder.Draw fires and ImGui's SetupRenderState also sets DSV=null.
+        var effectiveDsv = _trackedDsv ?? _savedDsv ?? currentDsv;
         var depthState   = effectiveDsv != null ? _dsReverseZ! : _dsNoDepth!;
+
+        _cbkFrameCount++;
+        if (_cbkFrameCount <= 3 || _cbkFrameCount % 180 == 0)
+            Plugin.Log.Info($"[FFXIV-TV R22] frame={_cbkFrameCount} trackedDsv={(_trackedDsv != null ? "non-null" : "null")} effectiveDsv={( effectiveDsv != null ? "non-null" : "null")} usingDepth={effectiveDsv != null}");;
 
         if (rtv != null)
             _context.OMSetRenderTargets(new[] { rtv }, effectiveDsv);
@@ -530,6 +595,9 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET {
 
     private void DisposeResources()
     {
+        _omSetRTHook?.Disable();
+        _omSetRTHook?.Dispose();  _omSetRTHook  = null;
+        _trackedDsv?.Dispose();   _trackedDsv   = null;
         _savedDsv?.Dispose();     _savedDsv     = null;
         _imageSrv?.Dispose();     _imageSrv     = null;
         _loadedImagePath = string.Empty;
