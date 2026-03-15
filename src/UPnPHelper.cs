@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
@@ -28,65 +29,76 @@ public static class UPnPHelper
     /// <summary>
     /// Sends SSDP M-SEARCH multicast and returns the first usable IGD gateway found,
     /// or null if no UPnP-capable router is reachable within the timeout.
+    ///
+    /// All search targets are blasted out at once (each twice for UDP reliability)
+    /// then we collect every unique LOCATION in a single 4-second window.
+    /// This is faster and catches routers that only respond to ssdp:all or IGD:2.
     /// </summary>
     public static async Task<GatewayInfo?> DiscoverAsync(CancellationToken ct = default)
     {
         const string multicastAddr = "239.255.255.250";
         const int    multicastPort = 1900;
 
-        // Try both the IGD device type and the WANIPConnection service type directly —
-        // some routers only respond to one or the other.
+        // Cast a wide net: include IGD:2, WANIPConnection:2, WANPPPConnection (PPPoE),
+        // and ssdp:all as a catch-all for routers that ignore specific service types.
         string[] searchTargets = {
             "urn:schemas-upnp-org:device:InternetGatewayDevice:1",
+            "urn:schemas-upnp-org:device:InternetGatewayDevice:2",
             "urn:schemas-upnp-org:service:WANIPConnection:1",
+            "urn:schemas-upnp-org:service:WANIPConnection:2",
+            "urn:schemas-upnp-org:service:WANPPPConnection:1",
+            "ssdp:all",
         };
 
-        foreach (var st in searchTargets)
+        var endpoint     = new IPEndPoint(IPAddress.Parse(multicastAddr), multicastPort);
+        var seenLocations = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        try
         {
-            if (ct.IsCancellationRequested) return null;
+            using var udp = new UdpClient();
+            udp.Client.ReceiveTimeout = 4500;
 
-            string request =
-                "M-SEARCH * HTTP/1.1\r\n"                        +
-                $"HOST: {multicastAddr}:{multicastPort}\r\n"     +
-                "MAN: \"ssdp:discover\"\r\n"                     +
-                "MX: 3\r\n"                                      +
-                $"ST: {st}\r\n\r\n";
-
-            byte[] data     = Encoding.UTF8.GetBytes(request);
-            var    endpoint = new IPEndPoint(IPAddress.Parse(multicastAddr), multicastPort);
-
-            try
+            // Blast all search targets (sent twice each for UDP packet-loss resilience).
+            foreach (var st in searchTargets)
             {
-                using var udp = new UdpClient();
-                udp.Client.ReceiveTimeout = 4000;
+                if (ct.IsCancellationRequested) return null;
+                byte[] data = Encoding.UTF8.GetBytes(
+                    "M-SEARCH * HTTP/1.1\r\n"                        +
+                    $"HOST: {multicastAddr}:{multicastPort}\r\n"     +
+                    "MAN: \"ssdp:discover\"\r\n"                     +
+                    "MX: 3\r\n"                                      +
+                    $"ST: {st}\r\n\r\n");
                 udp.Send(data, data.Length, endpoint);
-
-                var deadline = DateTime.UtcNow.AddSeconds(3.5);
-                while (DateTime.UtcNow < deadline)
-                {
-                    var    from = new IPEndPoint(IPAddress.Any, 0);
-                    byte[] resp = udp.Receive(ref from);
-                    string text = Encoding.UTF8.GetString(resp);
-
-                    string? location = null;
-                    foreach (var line in text.Split('\n'))
-                    {
-                        if (line.StartsWith("LOCATION:", StringComparison.OrdinalIgnoreCase))
-                        {
-                            location = line.Substring(9).Trim().TrimEnd('\r');
-                            break;
-                        }
-                    }
-
-                    if (location == null) continue;
-                    var gateway = await ParseDescriptionAsync(location, ct);
-                    if (gateway != null) return gateway;
-                }
+                udp.Send(data, data.Length, endpoint);
             }
-            catch (SocketException) { /* timeout — try next search target */ }
-            catch (OperationCanceledException) { return null; }
-            catch { }
+
+            // Collect all LOCATION responses in one 4-second window.
+            var deadline = DateTime.UtcNow.AddSeconds(4);
+            while (DateTime.UtcNow < deadline)
+            {
+                var    from = new IPEndPoint(IPAddress.Any, 0);
+                byte[] resp;
+                try { resp = udp.Receive(ref from); }
+                catch (SocketException) { break; }
+
+                string text     = Encoding.UTF8.GetString(resp);
+                string? location = null;
+                foreach (var line in text.Split('\n'))
+                {
+                    if (line.StartsWith("LOCATION:", StringComparison.OrdinalIgnoreCase))
+                    {
+                        location = line.Substring(9).Trim().TrimEnd('\r');
+                        break;
+                    }
+                }
+
+                if (location == null || !seenLocations.Add(location)) continue;
+                var gateway = await ParseDescriptionAsync(location, ct);
+                if (gateway != null) return gateway;
+            }
         }
+        catch (OperationCanceledException) { return null; }
+        catch { }
 
         return null;
     }

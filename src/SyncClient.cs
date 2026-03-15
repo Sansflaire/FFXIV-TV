@@ -94,7 +94,10 @@ public sealed class SyncClient : IDisposable
         }
 
         IsConnected = false;
-        Status = "Disconnected";
+        // Only write "Disconnected" if this loop is the one that was explicitly stopped,
+        // not if Connect() cancelled us in order to start a new loop.
+        if (!_running)
+            Status = "Disconnected";
     }
 
     private async Task ReceiveLoop(ClientWebSocket ws, CancellationToken ct)
