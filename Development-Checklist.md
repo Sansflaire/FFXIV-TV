@@ -252,7 +252,7 @@ Goal: Host PC serves a WebSocket server; all connected clients play the same con
 ## Phase 5 — UI/UX Overhaul
 
 - [ ] Remove Phase 1 Sandbox checkbox and all UsePhase1Sandbox code
-- [ ] Tint/opacity: add to D3D11 pixel shader (cbuffer b2) so it works for image AND video
+- [x] Tint/opacity: add to D3D11 pixel shader (cbuffer b2) so it works for image AND video
 - [ ] Add tab bar to main window: "Player" tab + "Network" tab
 - [ ] Add gear button (⚙) → settings pop-out window containing: Always Draw, Black Backing, tint, yt-dlp path
 - [ ] yt-dlp settings: show host-only warning note in settings window

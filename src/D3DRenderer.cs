@@ -49,6 +49,9 @@ public sealed unsafe class D3DRenderer : IDisposable
 
     /// <summary>Brightness multiplier applied to every pixel. 1.0 = original. Set each Draw() call.</summary>
     public float Brightness { get; set; } = 1.0f;
+
+    /// <summary>RGBA tint multiplier. (1,1,1,1) = no change. A &lt; 1 makes screen transparent.</summary>
+    public Vector4 Tint { get; set; } = Vector4.One;
     private ID3D11VertexShader?  _vs;
     private ID3D11PixelShader?   _ps;
     private ID3D11InputLayout?   _inputLayout;
@@ -141,8 +144,9 @@ public sealed unsafe class D3DRenderer : IDisposable
     [StructLayout(LayoutKind.Sequential)]
     private struct CbBrightness
     {
-        public float Brightness;
-        public float _pad0, _pad1, _pad2; // 16-byte alignment
+        public float   Brightness;
+        public float   _pad0, _pad1, _pad2; // 16-byte alignment before Tint
+        public Vector4 Tint;                 // rgba multiplier, default (1,1,1,1)
     }
 
     // ── HLSL ─────────────────────────────────────────────────────────────────
@@ -159,10 +163,10 @@ float4 main(VSIn v) : SV_POSITION {
     // SV_POSITION is a rasterizer system value and is always correctly populated.
     // Non-perspective-correct (screen-space bilinear). Acceptable for near-head-on viewing.
     // Corner positions (screen pixels) passed via cbuffer b1, updated each callback from ViewProj.
-    // Brightness multiplier passed via cbuffer b2 (default 1.0).
+    // Brightness + tint (rgba multiplier) passed via cbuffer b2. Both default to neutral (1,1,1,1).
     private const string PS_SRC = @"
 cbuffer CbCorners    : register(b1) { float4 TL, TR, BL, BR; };
-cbuffer CbBrightness : register(b2) { float Brightness; float3 _pad; };
+cbuffer CbBrightness : register(b2) { float Brightness; float3 _pad; float4 Tint; };
 Texture2D    tex  : register(t0);
 SamplerState samp : register(s0);
 
@@ -200,7 +204,7 @@ float2 bilinear_uv(float2 p, float2 p00, float2 p10, float2 p01, float2 p11)
 float4 main(float4 pos : SV_POSITION) : SV_TARGET {
     float2 uv    = bilinear_uv(pos.xy, TL.xy, TR.xy, BL.xy, BR.xy);
     float4 color = tex.Sample(samp, uv);
-    return float4(color.rgb * Brightness, color.a);
+    return float4(color.rgb * Brightness * Tint.rgb, color.a * Tint.a);
 }";
 
     private readonly IGameInteropProvider _interop;
@@ -690,7 +694,7 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET {
     private void UpdateCbBrightness()
     {
         var mapped = _context!.Map(_cbBrightness!, MapMode.WriteDiscard);
-        mapped.AsSpan<CbBrightness>(1)[0] = new CbBrightness { Brightness = Brightness };
+        mapped.AsSpan<CbBrightness>(1)[0] = new CbBrightness { Brightness = Brightness, Tint = Tint };
         _context.Unmap(_cbBrightness!);
     }
 

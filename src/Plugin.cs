@@ -218,6 +218,7 @@ public sealed class Plugin : IDalamudPlugin
         if (_d3dRenderer.IsAvailable)
         {
             _d3dRenderer.Brightness = Config.Brightness;
+            _d3dRenderer.Tint       = new Vector4(Config.TintR, Config.TintG, Config.TintB, Config.TintA);
 
             // Only load the image texture when in Image mode.
             _d3dRenderer.SetImagePath(Config.ActiveMode == ContentMode.Image ? Config.ImagePath : string.Empty);
