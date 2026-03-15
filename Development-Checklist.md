@@ -182,57 +182,132 @@ LibVLC already supports HTTP natively; YouTube requires yt-dlp to extract the di
 
 ## Phase 4 — Network Sync (Multi-Player)
 
-Goal: Host PC serves a WebSocket server; all connected clients play the same content
-simultaneously. No video is relayed — only control messages.
+Goal: Host PC serves a WebSocket server; all connected clients play the same content simultaneously.
 
 ### WebSocket Server (Host)
-- [ ] Research: System.Net.WebSockets vs third-party library (e.g., WebSocketSharp)
-- [ ] Implement lightweight WebSocket server on configurable port
-- [ ] Settings window: "Host Mode" toggle, port input, connection count display
-- [ ] Server broadcasts JSON control messages: `{ "type": "play", "url": "...", "ts": 0.0 }`
-- [ ] Server broadcasts: `{ "type": "pause" }`, `{ "type": "stop" }`, `{ "type": "seek", "ts": N }`
+- [x] Research: chose System.Net.WebSockets + TcpListener (no urlacl/admin required)
+- [x] Implement lightweight WebSocket server on configurable port
+- [x] Settings window: Host/Client role dropdown, port input, connection count display
+- [x] Server broadcasts JSON control messages: play, pause, resume, stop, seek
+- [x] Screen config broadcast: cx, cy, cz, yaw, width, height synced to clients on connect + change
 - [ ] Heartbeat / ping to detect disconnected clients
 
 ### WebSocket Client (Viewers)
-- [ ] Settings window: "Join Mode" toggle, host IP:port input, connection status indicator
-- [ ] Client connects to host on button press
-- [ ] On `play` message: load URL/file and begin playback at specified timestamp
-- [ ] On `pause` / `seek` / `stop`: execute immediately
-- [ ] Auto-reconnect on disconnect with backoff
+- [x] Settings window: address input, Connect/Disconnect button, status indicator
+- [x] Client connects to host on button press
+- [x] On `play` / `pause` / `resume` / `stop` / `seek`: execute immediately
+- [x] On `screen`: update screen position/yaw/size from host
+- [x] Auto-reconnect on disconnect with exponential backoff
 
-### URL / Stream Support
-- [ ] Support YouTube URLs via yt-dlp subprocess (extract direct stream URL)
-- [ ] Support direct .mp4 / .webm URLs (HTTP range requests or HLS)
-- [ ] Support local file paths (host and clients must have same path — or file server)
-- [ ] Error handling: gracefully show error text on screen if URL fails to load
+### Host-side URL resolution
+- [x] Host resolves YouTube URLs via yt-dlp before broadcasting (clients receive direct CDN URL)
+- [x] Direct .mp4/.webm URLs broadcast as-is
+
+### UPnP
+- [x] SSDP discovery of IGD gateway
+- [x] AddPortMapping / DeletePortMapping via SOAP
+- [x] GetPublicIpAsync (ipify.org) shown in UI for clients to connect to
+- [x] UPnP status shown in Host UI (green check when mapped)
+
+### Volume / Mute
+- [x] Volume slider (0–100), local only — not synced
+- [x] Mute/Unmute button, local only — not synced
+- [x] Volume and mute state persisted in config and restored on reload
 
 ### Testing
-- [ ] Two clients on same machine see synchronized video (< 500ms drift)
-- [ ] Latency compensation: server includes its current timestamp in messages, client seeks to match
+- [ ] Two remote clients see synchronized video (< 500ms drift)
 - [ ] Plugin unload cleanly stops server / disconnects client
 
 ---
 
-## Phase 5 — Polish & QoL
+## Phase 5 — UI/UX Overhaul
 
-- [ ] Screen can be locked (prevents accidental move via sliders)
-- [ ] Multiple screens support (list of ScreenDefinitions in config)
-- [ ] Screen name labels (show name above screen as floating text)
-- [ ] Opacity fade based on player distance from screen
-- [ ] `/fftv list` lists all placed screens by name
-- [ ] `/fftv remove <name>` removes a screen
-- [ ] Settings window: screen list tab + per-screen editing
-- [ ] Import/export screen layout as JSON
+- [ ] Remove Phase 1 Sandbox checkbox and all UsePhase1Sandbox code
+- [ ] Tint/opacity: add to D3D11 pixel shader (cbuffer b2) so it works for image AND video
+- [ ] Add tab bar to main window: "Player" tab + "Network" tab
+- [ ] Add gear button (⚙) → settings pop-out window containing: Always Draw, Black Backing, tint, yt-dlp path
+- [ ] yt-dlp settings: show host-only warning note in settings window
+- [ ] yt-dlp: auto-include in GitHub Actions build (download latest from GitHub releases)
+- [ ] yt-dlp: startup check — compare bundled vs latest release, log if outdated
+- [ ] Client controls: HIDE (not grey out) screen position/yaw/size/mode controls when host has locked them
+  (currently uses BeginDisabled; change to conditional render — `if (!isClient)` blocks)
+
+---
+
+## Phase 6 — Rendering Quality Fixes
+
+- [x] Fix video color accuracy: switch dynamic texture format to B8G8R8A8_UNorm_SRgb;
+  image texture also switched to UNorm_SRgb
+- [x] Fix UI occlusion: inject draw at 3D→2D pipeline transition via OMSetRenderTargets hook;
+  ImGui callback kept as fallback if transition not detected
+- [x] Improve sampler quality: anisotropic filtering (16x) for screens at steep angles
+
+---
+
+## Phase 7 — Multiple Screens
+
+- [ ] Refactor config: replace single `ScreenDefinition Screen` with `List<ScreenConfig> Screens`
+- [ ] ScreenConfig struct: id (Guid), label, ScreenDefinition, ContentMode, ImagePath, VideoPath, VideoUrl, TintRGBA
+- [ ] D3DRenderer: draw all visible screens per frame
+- [ ] VideoPlayer pool: one VideoPlayer per screen in video mode
+- [ ] MainWindow: screen list with add/remove/select, per-screen editing panel
+- [ ] Network sync: all screen messages include screen ID
+- [ ] `/fftv add` — create new screen; `/fftv remove <id>` — remove
+
+---
+
+## Phase 8 — Screen Capture / Streaming
+
+- [ ] Research capture API: DXGI Desktop Duplication vs Windows.Graphics.Capture
+- [ ] Add "Screen Capture" ContentMode
+- [ ] Implement DXGI Desktop Duplication for full-screen or window capture
+- [ ] Region selector UI (drag overlay or pixel coordinate inputs)
+- [ ] Captured frames → BGRA pipeline → D3D11 dynamic texture (same as video)
+- [ ] Host streams capture to clients: design relay approach (local HLS/RTMP vs raw frame relay)
+
+---
+
+## Phase 9 — Client Management (Nicknames, Permissions, Blacklist)
+
+- [ ] Nickname field in settings; auto-fill from FFXIV character name if blank; cannot be blank
+- [ ] First-time flow: hide all tabs until nickname is accepted ("Accept" button)
+- [ ] Client sends nickname to host on connect; host and other clients receive it
+- [ ] Host UI: "Connected Clients" list showing nicknames + IP
+- [ ] Blacklist: host can ban client by nickname/IP; rejected on next connection attempt
+- [ ] Permissions per client: host can grant/revoke control over screen position, playback, URL
+- [ ] Permission changes broadcast to all clients
+- [ ] Client hides (not greys) controls they don't have permission for
+- [ ] Share room / co-host: multiple clients can have full host permissions
+
+---
+
+## Phase 10 — Audio Streaming
+
+- [ ] Add "Audio" ContentMode: local audio file + online audio URL
+- [ ] Audio-only playback via LibVLC (no texture, just audio decode)
+- [ ] Sync audio play/pause/seek to clients (same protocol as video)
+- [ ] Volume/mute controls apply to audio mode
+- [ ] Host-to-client audio relay design (direct URL share vs stream relay)
+
+---
+
+## Phase 11 — In-game Right-click Integration
+
+- [ ] Research Dalamud ContextMenu API for adding options on player right-click
+- [ ] Detect if target player is running FFXIV-TV (via IPC advertisement or chat flag)
+- [ ] Add right-click option "Connect to FFXIV-TV Host" on detected players
+- [ ] Add right-click option "Invite to FFXIV-TV Lobby" when in host mode
+- [ ] Invitation notification: target receives in-game prompt with accept/decline
 
 ---
 
 ## Known Limitations & Notes
 
-- **Phase 1 has no depth testing** — the screen always renders on top of characters.
-  Phase 2 fixes this with D3D11 injection.
+- **Game native 2D UI (chat, map, hotbar) currently renders BEHIND the video screen.**
+  Phase 6 fixes this by moving draw injection to the 3D→2D render pipeline transition.
+- **Tint/opacity does nothing in Phase 2 mode** — the D3D shader does not apply it yet.
+  Phase 5 adds tint to the pixel shader.
 - **WorldToScreen clips at camera plane** — if any corner goes behind the camera,
   the entire screen stops rendering. Phase 2 handles proper frustum clipping.
-- **Multi-player requires all viewers to run the plugin** — there is no way to show
-  the screen to vanilla players. This is by design.
-- **Video decode on the game thread must be bounded** — use a background thread for
-  decode and only upload the latest frame on the render tick.
+- **Multi-player requires all viewers to run the plugin** — vanilla players cannot see screens.
+- **Screen capture relay to clients not yet designed** — Phase 8 needs architecture decision.

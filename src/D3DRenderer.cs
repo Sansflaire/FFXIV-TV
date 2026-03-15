@@ -59,6 +59,10 @@ public sealed unsafe class D3DRenderer : IDisposable
     // from Draw(). Instead, we hook OMSetRenderTargets on the immediate context's vtable
     // and save the last non-null DSV that FFXIV binds during scene rendering.
     // OMSetRenderTargets is vtable index 33 in ID3D11DeviceContext.
+    //
+    // UI occlusion fix: we also detect the 3D→2D transition (DSV goes from bound to null)
+    // and inject our draw there — after 3D scene (depth-tested) but BEFORE native 2D UI.
+    // Parameters are cached from the previous frame (1-frame lag; imperceptible for still screens).
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
     private delegate void OMSetRenderTargetsDelegate(
         nint pContext, uint numViews, nint* ppRTVs, nint pDSV);
@@ -69,8 +73,10 @@ public sealed unsafe class D3DRenderer : IDisposable
     private bool _dsvLoggedOnce;       // one-shot: log when _trackedDsv first set + DSV dimensions
     private int  _cbkFrameCount;       // counts callback invocations for periodic logging
 
-    // Saved at Draw() time (before ImGui swaps render targets).
-    private ID3D11DepthStencilView? _savedDsv;
+    // 3D→2D transition injection state.
+    private bool _prevCallHadDsv   = false;   // was the previous OMSetRenderTargets call DSV-bound?
+    private bool _injectedThisTransition = false; // guard: inject once per 3D→2D transition
+    private volatile bool _cachedDrawReady = false; // set by Draw(); consumed by hook on render thread
 
     // Own texture loaded from the image file.
     private ID3D11ShaderResourceView? _imageSrv;
@@ -234,23 +240,69 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET {
 
     private void OMSetRenderTargetsDetour(nint pCtx, uint numViews, nint* ppRTVs, nint pDSV)
     {
-        _omSetRTHook!.Original(pCtx, numViews, ppRTVs, pDSV);
-
-        // Only track DSVs bound alongside at least one RTV on our context.
-        // Shadow/depth-only passes call OMSetRenderTargets(0, null, dsv) — numViews=0, no RTV.
-        // The main scene pass calls OMSetRenderTargets(1, &mainRTV, sceneDSV).
-        // We want the main scene DSV, so filter to numViews > 0 with a real RTV.
-        if (pCtx == _contextPtr && pDSV != 0 && numViews > 0 && ppRTVs != null && ppRTVs[0] != 0)
+        if (pCtx == _contextPtr)
         {
-            _trackedDsv?.Dispose();
-            _trackedDsv = new ID3D11DepthStencilView(pDSV);
-            _trackedDsv.AddRef();
-            if (!_dsvLoggedOnce)
+            bool thisCallHasDsv = pDSV != 0 && numViews > 0 && ppRTVs != null && ppRTVs[0] != 0;
+
+            // Track the main scene DSV (3D pass: numViews>0, RTV bound, DSV bound).
+            if (thisCallHasDsv)
             {
-                _dsvLoggedOnce = true;
-                Plugin.Log.Info($"[FFXIV-TV R22] main-scene DSV captured: 0x{pDSV:X} (numViews={numViews} rtv0=0x{ppRTVs[0]:X})");
+                _trackedDsv?.Dispose();
+                _trackedDsv = new ID3D11DepthStencilView(pDSV);
+                _trackedDsv.AddRef();
+                _injectedThisTransition = false; // reset for the next transition
+                if (!_dsvLoggedOnce)
+                {
+                    _dsvLoggedOnce = true;
+                    Plugin.Log.Info($"[FFXIV-TV] main-scene DSV captured: 0x{pDSV:X}");
+                }
             }
+
+            // Detect 3D→2D transition: previous call had DSV, this one doesn't (UI pass starting).
+            // Inject our world-space draw HERE — after 3D scene but before FFXIV's native 2D UI.
+            bool isUiPass = !thisCallHasDsv && numViews > 0 && ppRTVs != null && ppRTVs[0] != 0;
+            if (_prevCallHadDsv && isUiPass && !_injectedThisTransition && _cachedDrawReady && _activeSrv != null)
+            {
+                _injectedThisTransition = true;
+                _cachedDrawReady = false;
+                try { ExecuteInlineDraw(new ID3D11RenderTargetView(ppRTVs[0])); }
+                catch (Exception ex) { Plugin.Log.Warning($"[FFXIV-TV] inline draw failed: {ex.Message}"); }
+            }
+
+            _prevCallHadDsv = thisCallHasDsv;
         }
+
+        _omSetRTHook!.Original(pCtx, numViews, ppRTVs, pDSV);
+    }
+
+    // Executes our draw directly on the render thread at the 3D→2D pipeline transition.
+    // At this point we're between FFXIV render calls — the 3D scene RTV is still the last one used.
+    // We temporarily bind it + the tracked depth buffer, draw, then restore.
+    private void ExecuteInlineDraw(ID3D11RenderTargetView rtv)
+    {
+        if (_context == null || _activeSrv == null) return;
+
+        var depthState = _trackedDsv != null ? _dsReverseZ! : _dsNoDepth!;
+
+        UpdateCbCorners();
+
+        var saved = SaveState();
+        try
+        {
+            _context.OMSetRenderTargets(new[] { rtv }, _trackedDsv);
+            SetState(_activeSrv, depthState);
+            _context.Draw(4, 0);
+        }
+        finally
+        {
+            RestoreState(saved);
+            rtv.Dispose();
+            _drawPending = false;
+        }
+
+        _cbkFrameCount++;
+        if (_cbkFrameCount <= 3 || _cbkFrameCount % 300 == 0)
+            Plugin.Log.Info($"[FFXIV-TV] inline draw frame={_cbkFrameCount} dsv={(_trackedDsv != null ? "yes" : "no")}");
     }
 
     private void CreateResources()
@@ -302,7 +354,14 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET {
             StencilEnable  = false,
         });
 
-        _sampler = _device.CreateSamplerState(SamplerDescription.LinearClamp);
+        var samplerDesc = new SamplerDescription(
+            Filter.Anisotropic,
+            TextureAddressMode.Clamp,
+            TextureAddressMode.Clamp,
+            TextureAddressMode.Clamp,
+            0f, 16, ComparisonFunction.Never,
+            new Color4(0f), 0f, float.MaxValue);
+        _sampler = _device.CreateSamplerState(samplerDesc);
     }
 
     // ── Texture management ────────────────────────────────────────────────────
@@ -339,7 +398,7 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET {
                     Height            = (uint)h,
                     MipLevels         = 1,
                     ArraySize         = 1,
-                    Format            = Format.B8G8R8A8_UNorm,
+                    Format            = Format.B8G8R8A8_UNorm_SRgb,
                     SampleDescription = new SampleDescription(1, 0),
                     Usage             = ResourceUsage.Immutable,
                     BindFlags         = BindFlags.ShaderResource,
@@ -359,7 +418,12 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET {
         }
     }
 
-    // ── Per-frame draw ────────────────────────────────────────────────────────
+    // ── Per-frame draw (called from UiBuilder.Draw on the main/ImGui thread) ──
+    // Uploads new video frame and caches draw parameters for the render thread to consume.
+    // The actual D3D draw is injected by the OMSetRenderTargets hook at the 3D→2D transition
+    // (one frame later) so the screen renders BEHIND native FFXIV 2D UI (chat, map, hotbar).
+    // Fallback: if the hook injection didn't fire (transition not detected), queue an ImGui
+    // callback so the screen still draws — just on top of UI instead of behind it.
     public void Draw(ScreenDefinition screen)
     {
         // Upload latest decoded video frame + (re)create GPU texture if dimensions changed.
@@ -377,50 +441,44 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET {
 
         Matrix4x4 viewProj = ctrl->ViewProjectionMatrix;
 
-        _savedDsv?.Dispose();
-        _savedDsv = null;
-        var rtvCapture = new ID3D11RenderTargetView[1];
-        _context.OMGetRenderTargets(1, rtvCapture, out _savedDsv);
-        rtvCapture[0]?.Dispose();
-
         var (wTL, wTR, wBR, wBL) = screen.GetWorldCorners();
-        // Store corners and ViewProj for use in callback (to compute screen-space positions).
         _wTL = wTL; _wTR = wTR; _wBL = wBL; _wBR = wBR;
         _storedViewProj = viewProj;
 
         UpdateVB(wTL, wTR, wBL, wBR);
         UpdateCB(viewProj);
 
-        _drawPending = true;
+        // Signal the OMSetRenderTargets hook that it should inject on the next 3D→2D transition.
+        _cachedDrawReady = true;
+        _drawPending     = true;
+
+        // Fallback ImGui callback: fires if the hook transition injection doesn't happen
+        // (e.g. no 3D→2D transition detected this frame). Draws on top of UI — not ideal
+        // but better than nothing.
         ImGui.GetBackgroundDrawList().AddCallback(_renderCallback, null);
     }
 
-    // ── ImGui render callback ─────────────────────────────────────────────────
+    // ── ImGui render callback (fallback only) ────────────────────────────────
+    // Fires during ImGui rendering (after native UI). Used if the inline hook injection
+    // already consumed _cachedDrawReady this frame. If _drawPending is still set here,
+    // the inline injection did NOT fire and we draw now as a fallback (on top of UI).
     private void ExecuteDrawCallback(ImDrawList* parentList, ImDrawCmd* cmd)
     {
         if (!_drawPending || _activeSrv == null || _context == null) return;
+        _drawPending     = false;
+        _cachedDrawReady = false;
+
+        // At this point we're in ImGui rendering. Use the tracked DSV for depth.
+        var depthState = _trackedDsv != null ? _dsReverseZ! : _dsNoDepth!;
 
         var rtvBuf = new ID3D11RenderTargetView[1];
         _context.OMGetRenderTargets(1, rtvBuf, out var currentDsv);
         var rtv = rtvBuf[0];
 
-        // Use the DSV tracked via OMSetRenderTargets hook (FFXIV's scene depth buffer).
-        // _savedDsv and currentDsv are both null at callback time — FFXIV unbinds depth
-        // before UiBuilder.Draw fires and ImGui's SetupRenderState also sets DSV=null.
-        var effectiveDsv = _trackedDsv ?? _savedDsv ?? currentDsv;
-        var depthState   = effectiveDsv != null ? _dsReverseZ! : _dsNoDepth!;
-
-        _cbkFrameCount++;
-        if (_cbkFrameCount <= 3 || _cbkFrameCount % 180 == 0)
-            Plugin.Log.Info($"[FFXIV-TV R22] frame={_cbkFrameCount} trackedDsv={(_trackedDsv != null ? "non-null" : "null")} effectiveDsv={( effectiveDsv != null ? "non-null" : "null")} usingDepth={effectiveDsv != null}");;
-
         if (rtv != null)
-            _context.OMSetRenderTargets(new[] { rtv }, effectiveDsv);
+            _context.OMSetRenderTargets(new[] { rtv }, _trackedDsv);
 
-        // Compute screen-space corner positions from world corners + ViewProj + current viewport.
-        // Used by PS to compute UV via bilinear inverse (all interpolated semantics are broken).
         UpdateCbCorners();
-
         var saved = SaveState();
         try
         {
@@ -432,10 +490,8 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET {
             RestoreState(saved);
             if (rtv != null)
                 _context.OMSetRenderTargets(new[] { rtv }, null);
-
             rtv?.Dispose();
             currentDsv?.Dispose();
-            _drawPending = false;
         }
     }
 
@@ -616,7 +672,6 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET {
         _omSetRTHook?.Disable();
         _omSetRTHook?.Dispose();  _omSetRTHook  = null;
         _trackedDsv?.Dispose();   _trackedDsv   = null;
-        _savedDsv?.Dispose();     _savedDsv     = null;
         _activeSrv  = null;       // not owned here — owned by VideoPlayer or _imageSrv
         _imageSrv?.Dispose();     _imageSrv     = null;
         _loadedImagePath = string.Empty;
