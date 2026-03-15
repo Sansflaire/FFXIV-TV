@@ -102,13 +102,15 @@ public sealed class Plugin : IDalamudPlugin
 
         if (_d3dRenderer.IsAvailable)
         {
-            // Phase 2: proper depth-tested world-space geometry.
-            // Get texture from Phase 1 loader (reuse same loading infrastructure).
+            // Phase 2: D3D injection via ImGui callback (correct RTV/viewport at render time).
+            // Always draw black backing via ImGui first (no depth needed for a solid rect).
+            _screenRenderer.DrawBlackBacking(Config);
+
             var wrap = _screenRenderer.GetCurrentWrap(Config);
             if (wrap != null)
                 _d3dRenderer.Draw(screen, wrap.Handle.Handle);
             else
-                _screenRenderer.DrawPlaceholder(Config); // purple rect placeholder, no depth
+                _screenRenderer.DrawPlaceholder(Config);
         }
         else
         {

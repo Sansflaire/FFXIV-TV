@@ -1,6 +1,7 @@
 using System;
 using System.Numerics;
 using System.Runtime.InteropServices;
+using Dalamud.Bindings.ImGui;
 using FFXIVClientStructs.FFXIV.Client.Game.Control;
 using FFXIVClientStructs.FFXIV.Client.Graphics.Kernel;
 using Vortice.D3DCompiler;
@@ -12,36 +13,41 @@ using Vortice.Mathematics;
 namespace FFXIVTv;
 
 /// <summary>
-/// Phase 2 renderer: D3D11 world-space quad with depth testing.
+/// Phase 2 renderer: D3D11 world-space quad injected into ImGui's render pipeline.
 ///
-/// Draws a textured quad in world space using the game's D3D11 device.
-/// The game's reversed-Z depth buffer is used so characters occlude the screen correctly.
+/// During UiBuilder.Draw we update the vertex/constant buffers and register an
+/// ImGui draw callback on the background draw list.  The callback fires inside
+/// ImGui_ImplDX11_RenderDrawData, at which point the correct RTV and viewport
+/// are already bound by the ImGui DX11 backend — so our DrawIndexed call lands
+/// on the real presentation surface.
 ///
 /// Reversed-Z note: FFXIV uses near=1.0, far=0.0.
-/// Depth comparison is GREATER: pass if our pixel depth > stored (closer to camera wins).
-///
-/// Reference: PunishXIV/Splatoon — VbmCamera.cs + ViewMatrix.M44 fix.
+/// Depth comparison is GREATER: pass if our pixel depth > stored (closer wins).
 /// </summary>
 public sealed unsafe class D3DRenderer : IDisposable
 {
-    // Borrowed from ImGui DX11 backend — AddRef on wrap, Release on Dispose is correct.
     private ID3D11Device?        _device;
     private ID3D11DeviceContext? _context;
 
-    private ID3D11Buffer?        _vb;           // 4 verts, dynamic
-    private ID3D11Buffer?        _ib;           // 6 indices, static
-    private ID3D11Buffer?        _cb;           // ViewProj cbuffer
+    private ID3D11Buffer?        _vb;
+    private ID3D11Buffer?        _ib;
+    private ID3D11Buffer?        _cb;
     private ID3D11VertexShader?  _vs;
     private ID3D11PixelShader?   _ps;
     private ID3D11InputLayout?   _inputLayout;
     private ID3D11BlendState?        _blendState;
     private ID3D11RasterizerState?   _rasterizer;
-    private ID3D11DepthStencilState? _dsWithDepth;
     private ID3D11DepthStencilState? _dsNoDepth;
     private ID3D11SamplerState?      _sampler;
 
     private bool _initialized;
     public bool IsAvailable => _initialized;
+
+    // Pending texture handle — set in Draw(), consumed in the ImGui callback.
+    private ulong _pendingTextureHandle;
+
+    // Managed delegate kept alive for the lifetime of this renderer.
+    private readonly ImDrawCallback _renderCallback;
 
     // ── Vertex layout ─────────────────────────────────────────────────────────
     [StructLayout(LayoutKind.Sequential)]
@@ -50,7 +56,7 @@ public sealed unsafe class D3DRenderer : IDisposable
     [StructLayout(LayoutKind.Sequential)]
     private struct CbPerFrame { public Matrix4x4 ViewProj; }
 
-    // ── HLSL — row_major matches System.Numerics.Matrix4x4 (Splatoon-confirmed) ─
+    // ── HLSL ─────────────────────────────────────────────────────────────────
     private const string VS_SRC = @"
 cbuffer CbPerFrame : register(b0) { row_major float4x4 ViewProj; };
 struct VSIn  { float3 pos : POSITION; float2 uv : TEXCOORD; };
@@ -67,15 +73,17 @@ Texture2D    tex  : register(t0);
 SamplerState samp : register(s0);
 float4 main(float2 uv : TEXCOORD) : SV_TARGET { return tex.Sample(samp, uv); }";
 
+    // ── Constructor ───────────────────────────────────────────────────────────
+    public D3DRenderer()
+    {
+        _renderCallback = new ImDrawCallback(ExecuteDrawCallback);
+    }
+
     // ── Init ──────────────────────────────────────────────────────────────────
     public bool TryInitialize()
     {
         if (_initialized) return true;
 
-        // Get D3D11 device and immediate context from FFXIV's own kernel device.
-        // FFXIVClientStructs.FFXIV.Client.Graphics.Kernel.Device:
-        //   [FieldOffset(920232)] void* D3D11Forwarder   — ID3D11Device*
-        //   [FieldOffset(920240)] void* D3D11DeviceContext — ID3D11DeviceContext*
         var kernelDevice = Device.Instance();
         if (kernelDevice == null)
         {
@@ -83,31 +91,24 @@ float4 main(float2 uv : TEXCOORD) : SV_TARGET { return tex.Sample(samp, uv); }";
             return false;
         }
 
-        nint devicePtr  = (nint)kernelDevice->D3D11Forwarder;
-        nint contextPtr = (nint)kernelDevice->D3D11DeviceContext;
-
-        if (devicePtr == 0 || contextPtr == 0)
+        nint devicePtr = (nint)kernelDevice->D3D11Forwarder;
+        if (devicePtr == 0)
         {
-            Plugin.Log.Warning("[FFXIV-TV] D3DRenderer: null D3D11 device or context pointer.");
+            Plugin.Log.Warning("[FFXIV-TV] D3DRenderer: null D3D11 device pointer.");
             return false;
         }
 
-        // Vortice constructor does NOT AddRef — AddRef so our Dispose (Release) is safe.
         _device = new ID3D11Device(devicePtr);
         _device.AddRef();
-
-        // Use ImmediateContext so we're on the same context as ImGui/presentation,
-        // not a deferred or pass-specific context that might be discarded.
-        // ImmediateContext property caches and returns the immediate context (AddRefs internally).
         _context = _device.ImmediateContext;
 
-        Plugin.Log.Info($"[FFXIV-TV] D3DRenderer: device=0x{devicePtr:X}, context=0x{_context.NativePointer:X}");
+        Plugin.Log.Info($"[FFXIV-TV] D3DRenderer: device=0x{devicePtr:X}");
 
         try
         {
             CreateResources();
             _initialized = true;
-            Plugin.Log.Info("[FFXIV-TV] D3DRenderer initialized — Phase 2 depth mode active.");
+            Plugin.Log.Info("[FFXIV-TV] D3DRenderer initialized — Phase 2 active.");
             return true;
         }
         catch (Exception ex)
@@ -120,21 +121,17 @@ float4 main(float2 uv : TEXCOORD) : SV_TARGET { return tex.Sample(samp, uv); }";
 
     private void CreateResources()
     {
-        // Vertex buffer: 4 verts, written each frame.
         _vb = _device!.CreateBuffer(
             (uint)(sizeof(ScreenVertex) * 4),
             BindFlags.VertexBuffer,
             ResourceUsage.Dynamic,
             CpuAccessFlags.Write);
 
-        // Index buffer: TL→TR→BR, TL→BR→BL (static).
         uint[] indices = { 0, 1, 2, 0, 2, 3 };
         _ib = _device.CreateBuffer<uint>(indices, BindFlags.IndexBuffer);
 
-        // Constant buffer (ViewProj, 64 bytes). CreateConstantBuffer<T> aligns and sets Dynamic+Write.
         _cb = _device.CreateConstantBuffer<CbPerFrame>();
 
-        // Compile shaders at runtime.
         ReadOnlyMemory<byte> vsBlob = Compiler.Compile(VS_SRC, "main", "screen_vs", "vs_5_0");
         ReadOnlyMemory<byte> psBlob = Compiler.Compile(PS_SRC, "main", "screen_ps", "ps_5_0");
 
@@ -148,10 +145,8 @@ float4 main(float2 uv : TEXCOORD) : SV_TARGET { return tex.Sample(samp, uv); }";
         };
         _inputLayout = _device.CreateInputLayout(layout, vsBlob.Span);
 
-        // Blend: standard non-premultiplied alpha.
         _blendState = _device.CreateBlendState(BlendDescription.NonPremultiplied);
 
-        // Rasterizer: no culling (two-sided).
         _rasterizer = _device.CreateRasterizerState(new RasterizerDescription
         {
             CullMode        = CullMode.None,
@@ -159,16 +154,7 @@ float4 main(float2 uv : TEXCOORD) : SV_TARGET { return tex.Sample(samp, uv); }";
             DepthClipEnable = true,
         });
 
-        // Depth — reversed-Z: near=1, far=0.  GREATER = closer to camera wins.
-        _dsWithDepth = _device.CreateDepthStencilState(new DepthStencilDescription
-        {
-            DepthEnable    = true,
-            DepthWriteMask = DepthWriteMask.Zero,         // read-only, don't pollute scene depth
-            DepthFunc      = ComparisonFunction.Greater,  // reversed-Z
-            StencilEnable  = false,
-        });
-
-        // Fallback when no depth buffer is available at Present time.
+        // No depth testing — ImGui backend doesn't bind a DSV.
         _dsNoDepth = _device.CreateDepthStencilState(new DepthStencilDescription
         {
             DepthEnable   = false,
@@ -180,28 +166,16 @@ float4 main(float2 uv : TEXCOORD) : SV_TARGET { return tex.Sample(samp, uv); }";
 
     // ── Per-frame draw ────────────────────────────────────────────────────────
     /// <summary>
-    /// Draws the screen in world space with D3D11 depth testing.
-    /// textureHandle is IDalamudTextureWrap.Handle.Handle (ulong, = ID3D11ShaderResourceView*).
+    /// Called from UiBuilder.Draw.  Updates GPU buffers and registers an ImGui
+    /// callback that will execute the actual DrawIndexed at submission time.
     /// </summary>
-    private int _drawLogCountdown = 60; // log first 60 frames then stop
-
     public void Draw(ScreenDefinition screen, ulong textureHandle)
     {
         if (!_initialized || _context == null) return;
-        if (textureHandle == 0)
-        {
-            if (_drawLogCountdown > 0) { _drawLogCountdown--; Plugin.Log.Warning("[FFXIV-TV] Draw: textureHandle is 0, skipping."); }
-            return;
-        }
+        if (textureHandle == 0) return;
 
-        // ViewProj — same source as IGameGui.WorldToScreen.
-        // M44 is uninitialized in game memory (Splatoon-confirmed bug) — always set to 1.
         var ctrl = Control.Instance();
-        if (ctrl == null)
-        {
-            if (_drawLogCountdown > 0) { _drawLogCountdown--; Plugin.Log.Warning("[FFXIV-TV] Draw: Control.Instance() is null, skipping."); }
-            return;
-        }
+        if (ctrl == null) return;
 
         Matrix4x4 viewProj = ctrl->ViewProjectionMatrix;
         viewProj.M44 = 1f;
@@ -210,51 +184,28 @@ float4 main(float2 uv : TEXCOORD) : SV_TARGET { return tex.Sample(samp, uv); }";
         UpdateVB(wTL, wTR, wBR, wBL);
         UpdateCB(viewProj);
 
-        // Check if the game's depth buffer is still bound at Present time.
-        var rtvArray = new ID3D11RenderTargetView[1];
-        _context.OMGetRenderTargets(1, rtvArray, out ID3D11DepthStencilView? dsv);
-        bool hasDepth = dsv != null;
+        _pendingTextureHandle = textureHandle;
 
-        // No RTV is bound at UiBuilder.Draw time — game has finished its passes.
-        // Get the backbuffer RTV from the DXGI swapchain so we can bind it ourselves.
-        var kernelDevice = Device.Instance();
-        if (kernelDevice == null || kernelDevice->SwapChain == null) return;
-        nint swapChainPtr = (nint)kernelDevice->SwapChain->DXGISwapChain;
-        if (swapChainPtr == 0) return;
+        // Register callback on background draw list.
+        // It fires inside ImGui_ImplDX11_RenderDrawData with correct RTV + viewport.
+        ImGui.GetBackgroundDrawList().AddCallback(_renderCallback, null);
+    }
 
-        ID3D11RenderTargetView? backbufferRtv = null;
+    // ── ImGui render callback ─────────────────────────────────────────────────
+    private void ExecuteDrawCallback(ImDrawList* parentList, ImDrawCmd* cmd)
+    {
+        if (_pendingTextureHandle == 0 || _context == null) return;
+
+        var saved = SaveState();
         try
         {
-            var dxgiSwapChain = new IDXGISwapChain(swapChainPtr);
-            using var backbuffer = dxgiSwapChain.GetBuffer<ID3D11Texture2D>(0);
-            backbufferRtv = _device!.CreateRenderTargetView(backbuffer);
-        }
-        catch (Exception ex)
-        {
-            Plugin.Log.Error($"[FFXIV-TV] Failed to get backbuffer RTV: {ex.Message}");
-            return;
-        }
-
-        if (_drawLogCountdown > 0)
-        {
-            _drawLogCountdown--;
-            Plugin.Log.Info($"[FFXIV-TV] Draw: srv=0x{textureHandle:X} hasDepth={hasDepth} rtv={backbufferRtv != null}");
-        }
-
-        SavedState saved = SaveState();
-        try
-        {
-            // Bind backbuffer as RT (no depth — we're drawing UI-style over the final frame).
-            _context!.OMSetRenderTargets(backbufferRtv);
-            SetState((nint)(long)textureHandle, _dsNoDepth!);
+            SetState((nint)(long)_pendingTextureHandle, _dsNoDepth!);
             _context.DrawIndexed(6, 0, 0);
         }
         finally
         {
             RestoreState(saved);
-            backbufferRtv?.Dispose();
-            dsv?.Dispose();
-            foreach (var rtv in rtvArray) rtv?.Dispose();
+            _pendingTextureHandle = 0;
         }
     }
 
@@ -287,12 +238,10 @@ float4 main(float2 uv : TEXCOORD) : SV_TARGET { return tex.Sample(samp, uv); }";
         _context.VSSetConstantBuffer(0, _cb!);
 
         _context.PSSetShader(_ps!);
-        // SRV is borrowed from Dalamud's texture system.
-        // AddRef so our Dispose doesn't destroy it.
         var srv = new ID3D11ShaderResourceView(srvPtr);
         srv.AddRef();
         _context.PSSetShaderResource(0, srv);
-        srv.Dispose(); // releases our extra AddRef; Dalamud still holds original ref
+        srv.Dispose();
         _context.PSSetSampler(0, _sampler!);
 
         _context.RSSetState(_rasterizer!);
@@ -300,9 +249,7 @@ float4 main(float2 uv : TEXCOORD) : SV_TARGET { return tex.Sample(samp, uv); }";
         _context.OMSetDepthStencilState(depthState, 0);
     }
 
-    // ── Minimal state save / restore ─────────────────────────────────────────
-    // Saves only the pipeline stages we actually modify so we don't break ImGui.
-
+    // ── State save / restore ──────────────────────────────────────────────────
     private struct SavedState
     {
         public ID3D11InputLayout?         InputLayout;
@@ -362,7 +309,7 @@ float4 main(float2 uv : TEXCOORD) : SV_TARGET { return tex.Sample(samp, uv); }";
     public void Dispose()
     {
         DisposeResources();
-        _context = null; // owned by _device.ImmediateContext cache; released by device.Dispose()
+        _context = null;
         _device?.Dispose();
         _device      = null;
         _initialized = false;
@@ -372,7 +319,6 @@ float4 main(float2 uv : TEXCOORD) : SV_TARGET { return tex.Sample(samp, uv); }";
     {
         _sampler?.Dispose();      _sampler      = null;
         _dsNoDepth?.Dispose();    _dsNoDepth    = null;
-        _dsWithDepth?.Dispose();  _dsWithDepth  = null;
         _rasterizer?.Dispose();   _rasterizer   = null;
         _blendState?.Dispose();   _blendState   = null;
         _inputLayout?.Dispose();  _inputLayout  = null;

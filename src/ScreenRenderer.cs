@@ -90,6 +90,19 @@ public sealed class ScreenRenderer : IDisposable
     }
 
     /// <summary>
+    /// Draws only the black backing quad via ImGui (used in Phase 2 mode).
+    /// </summary>
+    public void DrawBlackBacking(Configuration config)
+    {
+        if (!config.ShowBlackBacking) return;
+        var screen = config.Screen;
+        if (!screen.Visible) return;
+        if (!ProjectCorners(screen, config.AlwaysDraw,
+                out var sTL, out var sTR, out var sBR, out var sBL)) return;
+        ImGui.GetBackgroundDrawList().AddQuadFilled(sTL, sTR, sBR, sBL, BLACK);
+    }
+
+    /// <summary>
     /// Draws the purple placeholder quad when D3DRenderer is active but no texture is loaded.
     /// </summary>
     public void DrawPlaceholder(Configuration config)
