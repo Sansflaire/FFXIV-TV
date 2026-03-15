@@ -253,6 +253,12 @@ float4 main(float2 uv : TEXCOORD) : SV_TARGET { return tex.Sample(samp, uv); }";
     private struct SavedState
     {
         public ID3D11InputLayout?         InputLayout;
+        public ID3D11Buffer?              VB;
+        public uint                       VBStride;
+        public uint                       VBOffset;
+        public ID3D11Buffer?              IB;
+        public Format                     IBFormat;
+        public uint                       IBOffset;
         public ID3D11VertexShader?        VS;
         public ID3D11PixelShader?         PS;
         public ID3D11Buffer?              VSCb;
@@ -270,6 +276,17 @@ float4 main(float2 uv : TEXCOORD) : SV_TARGET { return tex.Sample(samp, uv); }";
         var s = new SavedState();
         s.Topology    = _context!.IAGetPrimitiveTopology();
         s.InputLayout = _context.IAGetInputLayout();
+
+        var vbs      = new ID3D11Buffer[1];
+        var strides  = new uint[1];
+        var offsets  = new uint[1];
+        _context.IAGetVertexBuffers(0, 1, vbs, strides, offsets);
+        s.VB       = vbs[0];
+        s.VBStride = strides[0];
+        s.VBOffset = offsets[0];
+
+        _context.IAGetIndexBuffer(out s.IB, out s.IBFormat, out s.IBOffset);
+
         s.VS          = _context.VSGetShader();
         var vsCbs     = new ID3D11Buffer[1]; _context.VSGetConstantBuffers(0, vsCbs); s.VSCb = vsCbs[0];
         s.PS          = _context.PSGetShader();
@@ -285,16 +302,20 @@ float4 main(float2 uv : TEXCOORD) : SV_TARGET { return tex.Sample(samp, uv); }";
     {
         _context!.IASetPrimitiveTopology(s.Topology);
         _context.IASetInputLayout(s.InputLayout);
+        _context.IASetVertexBuffer(0, s.VB, s.VBStride, s.VBOffset);
+        _context.IASetIndexBuffer(s.IB, s.IBFormat, s.IBOffset);
         _context.VSSetShader(s.VS);
         _context.VSSetConstantBuffer(0, s.VSCb);
         _context.PSSetShader(s.PS);
-        _context.PSSetShaderResource(0, s.PSSrv);
+        if (s.PSSrv != null) _context.PSSetShaderResource(0, s.PSSrv);
         _context.PSSetSampler(0, s.PSSampler);
         _context.RSSetState(s.RS);
         _context.OMSetBlendState(s.Blend);
         _context.OMSetDepthStencilState(s.DSS, s.StencilRef);
 
         s.InputLayout?.Dispose();
+        s.VB?.Dispose();
+        s.IB?.Dispose();
         s.VS?.Dispose();
         s.VSCb?.Dispose();
         s.PS?.Dispose();
