@@ -469,7 +469,7 @@ public sealed class VideoPlayer : IDisposable
             Height            = (uint)h,
             MipLevels         = 1,
             ArraySize         = 1,
-            Format            = Format.B8G8R8A8_UNorm_SRgb,
+            Format            = Format.B8G8R8A8_UNorm,
             SampleDescription = new SampleDescription(1, 0),
             Usage             = ResourceUsage.Dynamic,
             BindFlags         = BindFlags.ShaderResource,

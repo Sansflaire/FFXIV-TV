@@ -200,10 +200,21 @@ public sealed class MainWindow
             case ContentMode.UrlVideo:   DrawUrlVideoControls();   break;
         }
 
+        ImGui.Spacing();
+        ImGui.Separator();
+        float brightness = _config.Brightness;
+        ImGui.SetNextItemWidth(200);
+        if (ImGui.SliderFloat("Brightness##bright", ref brightness, 0f, 4f, "%.2f"))
+        {
+            _config.Brightness = brightness;
+            _config.Save();
+        }
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("1.0 = original. Increase if video appears dark.");
+
         if (_config.ActiveMode != ContentMode.Image)
         {
             ImGui.Spacing();
-            ImGui.Separator();
 
             bool muted = _config.Muted;
             if (muted)

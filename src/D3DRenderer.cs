@@ -43,8 +43,12 @@ public sealed unsafe class D3DRenderer : IDisposable
     public void SetVideoPlayer(VideoPlayer? vp) { _videoPlayer = vp; }
 
     private ID3D11Buffer?        _vb;
-    private ID3D11Buffer?        _cb;         // VS b0: ViewProj matrix
-    private ID3D11Buffer?        _cbCorners;  // PS b1: screen-space quad corner positions
+    private ID3D11Buffer?        _cb;             // VS b0: ViewProj matrix
+    private ID3D11Buffer?        _cbCorners;      // PS b1: screen-space quad corner positions
+    private ID3D11Buffer?        _cbBrightness;   // PS b2: brightness multiplier
+
+    /// <summary>Brightness multiplier applied to every pixel. 1.0 = original. Set each Draw() call.</summary>
+    public float Brightness { get; set; } = 1.0f;
     private ID3D11VertexShader?  _vs;
     private ID3D11PixelShader?   _ps;
     private ID3D11InputLayout?   _inputLayout;
@@ -118,6 +122,13 @@ public sealed unsafe class D3DRenderer : IDisposable
         public Vector4 TL, TR, BL, BR;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct CbBrightness
+    {
+        public float Brightness;
+        public float _pad0, _pad1, _pad2; // 16-byte alignment
+    }
+
     // ── HLSL ─────────────────────────────────────────────────────────────────
     // VS: transforms world positions to clip space. No TEXCOORD output —
     // PS computes UV from SV_POSITION instead (all interpolated semantics are broken).
@@ -132,8 +143,10 @@ float4 main(VSIn v) : SV_POSITION {
     // SV_POSITION is a rasterizer system value and is always correctly populated.
     // Non-perspective-correct (screen-space bilinear). Acceptable for near-head-on viewing.
     // Corner positions (screen pixels) passed via cbuffer b1, updated each callback from ViewProj.
+    // Brightness multiplier passed via cbuffer b2 (default 1.0).
     private const string PS_SRC = @"
-cbuffer CbCorners : register(b1) { float4 TL, TR, BL, BR; };
+cbuffer CbCorners    : register(b1) { float4 TL, TR, BL, BR; };
+cbuffer CbBrightness : register(b2) { float Brightness; float3 _pad; };
 Texture2D    tex  : register(t0);
 SamplerState samp : register(s0);
 
@@ -169,8 +182,9 @@ float2 bilinear_uv(float2 p, float2 p00, float2 p10, float2 p01, float2 p11)
 }
 
 float4 main(float4 pos : SV_POSITION) : SV_TARGET {
-    float2 uv = bilinear_uv(pos.xy, TL.xy, TR.xy, BL.xy, BR.xy);
-    return tex.Sample(samp, uv);
+    float2 uv    = bilinear_uv(pos.xy, TL.xy, TR.xy, BL.xy, BR.xy);
+    float4 color = tex.Sample(samp, uv);
+    return float4(color.rgb * Brightness, color.a);
 }";
 
     private readonly IGameInteropProvider _interop;
@@ -313,8 +327,9 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET {
             ResourceUsage.Dynamic,
             CpuAccessFlags.Write);
 
-        _cb        = _device.CreateConstantBuffer<CbPerFrame>();
-        _cbCorners = _device.CreateConstantBuffer<CbCorners>();
+        _cb           = _device.CreateConstantBuffer<CbPerFrame>();
+        _cbCorners    = _device.CreateConstantBuffer<CbCorners>();
+        _cbBrightness = _device.CreateConstantBuffer<CbBrightness>();
 
         ReadOnlyMemory<byte> vsBlob = Compiler.Compile(VS_SRC, "main", "screen_vs", "vs_5_0");
         ReadOnlyMemory<byte> psBlob = Compiler.Compile(PS_SRC, "main", "screen_ps", "ps_5_0");
@@ -398,7 +413,7 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET {
                     Height            = (uint)h,
                     MipLevels         = 1,
                     ArraySize         = 1,
-                    Format            = Format.B8G8R8A8_UNorm_SRgb,
+                    Format            = Format.B8G8R8A8_UNorm,
                     SampleDescription = new SampleDescription(1, 0),
                     Usage             = ResourceUsage.Immutable,
                     BindFlags         = BindFlags.ShaderResource,
@@ -542,6 +557,13 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET {
         _context.Unmap(_cb!);
     }
 
+    private void UpdateCbBrightness()
+    {
+        var mapped = _context!.Map(_cbBrightness!, MapMode.WriteDiscard);
+        mapped.AsSpan<CbBrightness>(1)[0] = new CbBrightness { Brightness = Brightness };
+        _context.Unmap(_cbBrightness!);
+    }
+
     private void SetState(ID3D11ShaderResourceView srv, ID3D11DepthStencilState depthState)
     {
         _context!.IASetVertexBuffer(0, _vb!, (uint)sizeof(ScreenVertex));
@@ -554,8 +576,10 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET {
         _context.DSSetShader(null);
         _context.VSSetConstantBuffer(0, _cb!);
 
+        UpdateCbBrightness();
         _context.PSSetShader(_ps!);
         _context.PSSetConstantBuffer(1, _cbCorners!);
+        _context.PSSetConstantBuffer(2, _cbBrightness!);
         _context.PSSetShaderResource(0, srv);
         _context.PSSetSampler(0, _sampler!);
 
@@ -580,7 +604,8 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET {
         public ID3D11DomainShader?        DS;
         public ID3D11PixelShader?         PS;
         public ID3D11Buffer?              VSCb;
-        public ID3D11Buffer?              PSCb1;  // PS constant buffer slot 1 (we bind _cbCorners here)
+        public ID3D11Buffer?              PSCb1;  // PS constant buffer slot 1 (_cbCorners)
+        public ID3D11Buffer?              PSCb2;  // PS constant buffer slot 2 (_cbBrightness)
         public ID3D11ShaderResourceView?  PSSrv;
         public ID3D11SamplerState?        PSSampler;
         public ID3D11RasterizerState?     RS;
@@ -613,6 +638,7 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET {
         var vsCbs = new ID3D11Buffer[1]; _context.VSGetConstantBuffers(0, vsCbs); s.VSCb = vsCbs[0];
         s.PS = _context.PSGetShader();
         var psCbs1 = new ID3D11Buffer[1]; _context.PSGetConstantBuffers(1, psCbs1); s.PSCb1 = psCbs1[0];
+        var psCbs2 = new ID3D11Buffer[1]; _context.PSGetConstantBuffers(2, psCbs2); s.PSCb2 = psCbs2[0];
         var srvs     = new ID3D11ShaderResourceView[1]; _context.PSGetShaderResources(0, srvs); s.PSSrv     = srvs[0];
         var samplers = new ID3D11SamplerState[1];        _context.PSGetSamplers(0, samplers);   s.PSSampler = samplers[0];
         s.RS    = _context.RSGetState();
@@ -634,6 +660,7 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET {
         _context.VSSetConstantBuffer(0, s.VSCb);
         _context.PSSetShader(s.PS);
         _context.PSSetConstantBuffer(1, s.PSCb1);
+        _context.PSSetConstantBuffer(2, s.PSCb2);
         if (s.PSSrv != null) _context.PSSetShaderResource(0, s.PSSrv);
         _context.PSSetSampler(0, s.PSSampler);
         _context.RSSetState(s.RS);
@@ -649,6 +676,7 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET {
         s.DS?.Dispose();
         s.VSCb?.Dispose();
         s.PSCb1?.Dispose();
+        s.PSCb2?.Dispose();
         s.PS?.Dispose();
         s.PSSrv?.Dispose();
         s.PSSampler?.Dispose();
@@ -683,6 +711,7 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET {
         _inputLayout?.Dispose();  _inputLayout  = null;
         _ps?.Dispose();           _ps           = null;
         _vs?.Dispose();           _vs           = null;
+        _cbBrightness?.Dispose(); _cbBrightness = null;
         _cbCorners?.Dispose();    _cbCorners    = null;
         _cb?.Dispose();           _cb           = null;
         _vb?.Dispose();           _vb           = null;

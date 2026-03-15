@@ -183,18 +183,27 @@ public sealed class Plugin : IDalamudPlugin
 
         if (_d3dRenderer.IsAvailable)
         {
+            _d3dRenderer.Brightness = Config.Brightness;
+
             // Only load the image texture when in Image mode.
             _d3dRenderer.SetImagePath(Config.ActiveMode == ContentMode.Image ? Config.ImagePath : string.Empty);
 
-            // In Image mode: show the ImGui placeholder when no image is loaded yet.
-            // In video modes: ALWAYS call D3DRenderer.Draw() so UploadFrame() runs each tick
-            // and can create the GPU texture on the first decoded frame. Draw() returns early
-            // if no SRV is ready, which is fine — nothing renders until the first frame arrives.
-            // Never fall back to the ImGui placeholder in video mode: it has no depth testing.
+            // Always call D3DRenderer.Draw() in video modes so UploadFrame() runs and
+            // the GPU texture is created on the first decoded frame.
+            // In Image mode with no texture: show placeholder.
+            // In video modes with no active texture (stopped/not started): show black backing only.
             if (Config.ActiveMode == ContentMode.Image && !_d3dRenderer.HasTexture)
+            {
                 _screenRenderer.DrawPlaceholder(Config);
+            }
             else
+            {
                 _d3dRenderer.Draw(screen);
+                // When video is stopped/no texture, D3DRenderer.Draw() skips the quad draw but
+                // we still want the black backing rect to show.
+                if (Config.ActiveMode != ContentMode.Image && !_d3dRenderer.HasTexture && Config.ShowBlackBacking)
+                    _screenRenderer.DrawBlackBacking(Config);
+            }
         }
         else
         {

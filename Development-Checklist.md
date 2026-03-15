@@ -236,11 +236,14 @@ Goal: Host PC serves a WebSocket server; all connected clients play the same con
 
 ## Phase 6 — Rendering Quality Fixes
 
-- [x] Fix video color accuracy: switch dynamic texture format to B8G8R8A8_UNorm_SRgb;
-  image texture also switched to UNorm_SRgb
 - [x] Fix UI occlusion: inject draw at 3D→2D pipeline transition via OMSetRenderTargets hook;
   ImGui callback kept as fallback if transition not detected
 - [x] Improve sampler quality: anisotropic filtering (16x) for screens at steep angles
+- [x] Revert UNorm_SRgb texture change (caused double-gamma darkening — FFXIV RT is linear UNorm)
+- [x] Add per-screen brightness multiplier (PS shader cbuffer b2, slider 0.0–4.0, default 1.0)
+- [x] Stop → show black backing rect instead of nothing (video mode with no texture draws backing)
+- [ ] Add per-screen gamma/contrast controls (curves, not just multiply)
+- [ ] World light emission from screen rect (area light injected into FFXIV deferred lighting pass — complex, game-version-sensitive)
 
 ---
 
