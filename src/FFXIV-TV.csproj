@@ -37,10 +37,15 @@
     <Reference Include="Serilog"               HintPath="$(DalamudLibPath)Serilog.dll"               Private="false" />
   </ItemGroup>
 
-  <!-- Auto-copy DLL to devPlugins after build -->
+  <!-- Auto-copy plugin DLL + NuGet dependencies to devPlugins after build -->
   <Target Name="CopyToDevPlugins" AfterTargets="Build">
     <Copy
       SourceFiles="$(TargetPath)"
+      DestinationFolder="$(APPDATA)\XIVLauncher\devPlugins\FFXIV-TV\"
+      OverwriteReadOnlyFiles="true"
+    />
+    <Copy
+      SourceFiles="@(ReferenceCopyLocalPaths)"
       DestinationFolder="$(APPDATA)\XIVLauncher\devPlugins\FFXIV-TV\"
       OverwriteReadOnlyFiles="true"
     />
