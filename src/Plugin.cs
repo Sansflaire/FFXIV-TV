@@ -52,6 +52,8 @@ public sealed class Plugin : IDalamudPlugin
             HelpMessage = "Open FFXIV-TV settings. /fftv place — place at player. /fftv hide — toggle. /fftv play <path> — play video. /fftv pause — pause/resume. /fftv stop — stop video."
         });
 
+        PluginInterface.UiBuilder.DisableUserUiHide = true;
+
         PluginInterface.UiBuilder.Draw       += OnDraw;
         PluginInterface.UiBuilder.OpenMainUi += OnOpenMainUi;
 
@@ -120,7 +122,10 @@ public sealed class Plugin : IDalamudPlugin
 
     private void OnDraw()
     {
-        _mainWindow.Draw();
+        // Settings window respects the user's UI hide (Scroll Lock).
+        // The world-space screen always renders because DisableUserUiHide = true.
+        if (PluginInterface.UiBuilder.ShouldModifyUi)
+            _mainWindow.Draw();
 
         var screen = Config.Screen;
         if (!screen.Visible) return;
