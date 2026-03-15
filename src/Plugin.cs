@@ -51,6 +51,8 @@ public sealed class Plugin : IDalamudPlugin
         _mainWindow     = new MainWindow(Config, ObjectTable);
         _mainWindow.SetSync(_sync);
 
+        _sync.Volume = Config.Volume;
+
         _sync.Client.OnScreenConfig += (cx, cy, cz, yaw, w, h) =>
         {
             Config.Screen.Center     = new System.Numerics.Vector3(cx, cy, cz);

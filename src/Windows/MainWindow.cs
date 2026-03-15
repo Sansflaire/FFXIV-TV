@@ -199,6 +199,20 @@ public sealed class MainWindow
             case ContentMode.LocalVideo: DrawLocalVideoControls(); break;
             case ContentMode.UrlVideo:   DrawUrlVideoControls();   break;
         }
+
+        if (_config.ActiveMode != ContentMode.Image)
+        {
+            ImGui.Spacing();
+            ImGui.Separator();
+            int vol = _config.Volume;
+            ImGui.SetNextItemWidth(200);
+            if (ImGui.SliderInt("Volume##vol", ref vol, 0, 100))
+            {
+                _config.Volume = vol;
+                _sync?.Volume  = vol;
+                _config.Save();
+            }
+        }
     }
 
     private void DrawImageControls()

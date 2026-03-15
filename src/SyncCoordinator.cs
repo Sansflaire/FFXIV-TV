@@ -22,6 +22,7 @@ public sealed class SyncCoordinator : IDisposable
     public NetworkMode Mode { get; set; } = NetworkMode.Off;
 
     // ── Pass-through VideoPlayer properties ───────────────────────────────────
+    public int    Volume       { get => _vp.Volume; set => _vp.Volume = value; }
     public string VideoStatus  => _vp.Status;
     public bool   IsPlaying    => _vp.IsPlaying;
     public bool   IsPaused     => _vp.IsPaused;

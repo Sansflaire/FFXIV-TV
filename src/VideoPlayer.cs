@@ -96,6 +96,13 @@ public sealed class VideoPlayer : IDisposable
     /// <summary>Seek to a position in the media (0 = start, 1 = end).</summary>
     public void Seek(float position) => _player.Position = Math.Clamp(position, 0f, 1f);
 
+    /// <summary>Playback volume 0–100. Applied immediately to the LibVLC player.</summary>
+    public int Volume
+    {
+        get => _player.Volume;
+        set => _player.Volume = Math.Clamp(value, 0, 100);
+    }
+
     // ── A-B loop ──────────────────────────────────────────────────────────────
     private float _loopA       = 0f;
     private float _loopB       = 1f;

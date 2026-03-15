@@ -84,5 +84,8 @@ public sealed class Configuration : IPluginConfiguration
     /// <summary>Whether the sync server should be running. Persisted so it survives plugin reloads.</summary>
     public bool SyncServerRunning { get; set; } = false;
 
+    /// <summary>Playback volume 0–100. Local only — not synced to clients.</summary>
+    public int Volume { get; set; } = 100;
+
     public void Save() => Plugin.PluginInterface.SavePluginConfig(this);
 }
