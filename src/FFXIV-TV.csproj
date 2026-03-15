@@ -21,8 +21,9 @@
 
   <!-- Phase 2: D3D11 world-space rendering -->
   <ItemGroup>
-    <PackageReference Include="Vortice.Direct3D11" Version="3.8.2" />
-    <PackageReference Include="Vortice.D3DCompiler"  Version="3.8.2" />
+    <PackageReference Include="Vortice.Direct3D11"    Version="3.8.2" />
+    <PackageReference Include="Vortice.D3DCompiler"   Version="3.8.2" />
+    <PackageReference Include="System.Drawing.Common" Version="9.0.3" />
   </ItemGroup>
 
   <ItemGroup>

@@ -71,6 +71,14 @@ public sealed class MainWindow
 
         ImGui.SameLine();
 
+        // Phase 1 sandbox toggle
+        bool sandbox = _config.UsePhase1Sandbox;
+        if (ImGui.Checkbox("Phase 1 Sandbox", ref sandbox)) { _config.UsePhase1Sandbox = sandbox; changed = true; }
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("Force Phase 1 rendering (WorldToScreen + ImGui).\nImage works correctly but no depth testing.\nToggle to compare Phase 1 vs Phase 2.");
+
+        ImGui.SameLine();
+
         // Black backing
         bool backing = _config.ShowBlackBacking;
         if (ImGui.Checkbox("Black Backing", ref backing)) { _config.ShowBlackBacking = backing; changed = true; }

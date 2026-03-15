@@ -31,6 +31,13 @@ public sealed class Configuration : IPluginConfiguration
     public bool AlwaysDraw { get; set; } = true;
 
     /// <summary>
+    /// When true, forces Phase 1 rendering (WorldToScreen + ImGui AddImageQuad).
+    /// Image displays correctly but no depth testing — characters always render in front.
+    /// Use this as a sandbox to compare Phase 1 vs Phase 2 output.
+    /// </summary>
+    public bool UsePhase1Sandbox { get; set; } = false;
+
+    /// <summary>
     /// When true, draw a solid black backing rectangle behind the image/video.
     /// Ensures no transparency or see-through when the image has alpha.
     /// Draw order: black backing → image/video on top.

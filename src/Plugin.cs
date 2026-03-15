@@ -95,6 +95,14 @@ public sealed class Plugin : IDalamudPlugin
         var screen = Config.Screen;
         if (!screen.Visible) return;
 
+        // Phase 1 sandbox: force the original WorldToScreen + ImGui path.
+        // Useful for comparing Phase 1 image quality vs Phase 2.
+        if (Config.UsePhase1Sandbox)
+        {
+            _screenRenderer.Draw(Config);
+            return;
+        }
+
         // Try to initialize the D3D11 renderer on the first draw frame
         // (device isn't available until after Dalamud's ImGui init completes).
         if (!_d3dRenderer.IsAvailable)
@@ -103,12 +111,13 @@ public sealed class Plugin : IDalamudPlugin
         if (_d3dRenderer.IsAvailable)
         {
             // Phase 2: D3D injection via ImGui callback (correct RTV/viewport at render time).
-            // Always draw black backing via ImGui first (no depth needed for a solid rect).
+            // D3DRenderer owns its texture — loaded directly from file, not via Dalamud wrap
+            // (Dalamud's ImTextureID handle is not a raw SRV pointer).
+            _d3dRenderer.SetImagePath(Config.ImagePath);
             _screenRenderer.DrawBlackBacking(Config);
 
-            var wrap = _screenRenderer.GetCurrentWrap(Config);
-            if (wrap != null)
-                _d3dRenderer.Draw(screen, wrap.Handle.Handle);
+            if (_d3dRenderer.HasTexture)
+                _d3dRenderer.Draw(screen);
             else
                 _screenRenderer.DrawPlaceholder(Config);
         }
