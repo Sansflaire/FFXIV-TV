@@ -70,6 +70,18 @@ public sealed class VideoPlayer : IDisposable
     public bool IsPlaying  => _player.IsPlaying;
     public bool IsPaused   => _player.State == VLCState.Paused;
 
+    /// <summary>Playback position as a fraction 0–1. Returns 0 when stopped.</summary>
+    public float Position => (IsPlaying || IsPaused) ? Math.Clamp(_player.Position, 0f, 1f) : 0f;
+
+    /// <summary>Current playback time in milliseconds. -1 when unknown.</summary>
+    public long TimeMs => _player.Time;
+
+    /// <summary>Total duration in milliseconds. -1 for live streams or unknown.</summary>
+    public long LengthMs => _player.Length;
+
+    /// <summary>Seek to a position in the media (0 = start, 1 = end).</summary>
+    public void Seek(float position) => _player.Position = Math.Clamp(position, 0f, 1f);
+
     // ── Constructor ───────────────────────────────────────────────────────────
     /// <param name="pluginDir">Directory containing libvlc.dll (= devPlugins/FFXIV-TV/).</param>
     public VideoPlayer(string pluginDir)

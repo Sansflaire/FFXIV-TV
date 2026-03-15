@@ -225,6 +225,8 @@ public sealed class MainWindow
             ImGui.SameLine();
             ImGui.TextDisabled($"  [{_videoPlayer.Status}]");
         }
+
+        DrawScrubBar();
     }
 
     private void DrawUrlVideoControls()
@@ -255,6 +257,8 @@ public sealed class MainWindow
             ImGui.TextDisabled($"  [{_videoPlayer.Status}]");
         }
 
+        DrawScrubBar();
+
         ImGui.Spacing();
         ImGui.TextDisabled("yt-dlp path (optional — needed for YouTube):");
         if (ImGui.InputText("##ytdlppath", ref _ytDlpPathBuffer, 512,
@@ -270,6 +274,42 @@ public sealed class MainWindow
             _config.Save();
         }
         ImGui.TextDisabled("(Leave empty to auto-find yt-dlp.exe in plugin folder)");
+    }
+
+    private void DrawScrubBar()
+    {
+        if (_videoPlayer == null) return;
+        if (!_videoPlayer.IsPlaying && !_videoPlayer.IsPaused) return;
+
+        long timeMs   = _videoPlayer.TimeMs;
+        long lengthMs = _videoPlayer.LengthMs;
+
+        // Time label — suppress for live streams (length unknown or <= 0)
+        bool hasLength = lengthMs > 0;
+        string timeLabel = hasLength
+            ? $"{FormatTime(timeMs)} / {FormatTime(lengthMs)}"
+            : FormatTime(timeMs);
+        ImGui.TextDisabled(timeLabel);
+
+        float pos = _videoPlayer.Position;
+
+        if (!hasLength) ImGui.BeginDisabled();
+        ImGui.SetNextItemWidth(-1);
+        if (ImGui.SliderFloat("##scrub", ref pos, 0f, 1f, ""))
+            _videoPlayer.Seek(pos);
+        if (!hasLength) ImGui.EndDisabled();
+
+        if (!hasLength && ImGui.IsItemHovered())
+            ImGui.SetTooltip("Seeking not available for live streams.");
+    }
+
+    private static string FormatTime(long ms)
+    {
+        if (ms <= 0) return "0:00";
+        var ts = System.TimeSpan.FromMilliseconds(ms);
+        return ts.TotalHours >= 1
+            ? $"{(int)ts.TotalHours}:{ts.Minutes:D2}:{ts.Seconds:D2}"
+            : $"{ts.Minutes}:{ts.Seconds:D2}";
     }
 
     // ─── Tint / Opacity ──────────────────────────────────────────────────────
