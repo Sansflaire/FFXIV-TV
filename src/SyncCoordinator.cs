@@ -23,6 +23,7 @@ public sealed class SyncCoordinator : IDisposable
 
     // ── Pass-through VideoPlayer properties ───────────────────────────────────
     public int    Volume       { get => _vp.Volume; set => _vp.Volume = value; }
+    public bool   Muted        { get => _vp.Muted;  set => _vp.Muted  = value; }
     public string VideoStatus  => _vp.Status;
     public bool   IsPlaying    => _vp.IsPlaying;
     public bool   IsPaused     => _vp.IsPaused;

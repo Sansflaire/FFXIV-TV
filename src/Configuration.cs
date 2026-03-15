@@ -87,5 +87,8 @@ public sealed class Configuration : IPluginConfiguration
     /// <summary>Playback volume 0–100. Local only — not synced to clients.</summary>
     public int Volume { get; set; } = 100;
 
+    /// <summary>When true, audio is muted. Local only — not synced to clients.</summary>
+    public bool Muted { get; set; } = false;
+
     public void Save() => Plugin.PluginInterface.SavePluginConfig(this);
 }

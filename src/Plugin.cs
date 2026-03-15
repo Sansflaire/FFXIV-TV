@@ -52,6 +52,7 @@ public sealed class Plugin : IDalamudPlugin
         _mainWindow.SetSync(_sync);
 
         _sync.Volume = Config.Volume;
+        _sync.Muted  = Config.Muted;
 
         _sync.Client.OnScreenConfig += (cx, cy, cz, yaw, w, h) =>
         {

@@ -204,14 +204,29 @@ public sealed class MainWindow
         {
             ImGui.Spacing();
             ImGui.Separator();
-            int vol = _config.Volume;
+
+            bool muted = _config.Muted;
+            if (muted)
+                ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.7f, 0.2f, 0.2f, 1f));
+            if (ImGui.Button(muted ? "Unmute##mute" : "  Mute  ##mute"))
+            {
+                _config.Muted = !muted;
+                if (_sync != null) _sync.Muted = !muted;
+                _config.Save();
+            }
+            if (muted) ImGui.PopStyleColor();
+
+            ImGui.SameLine();
+            if (muted) ImGui.BeginDisabled();
             ImGui.SetNextItemWidth(200);
+            int vol = _config.Volume;
             if (ImGui.SliderInt("Volume##vol", ref vol, 0, 100))
             {
                 _config.Volume = vol;
-                _sync?.Volume  = vol;
+                if (_sync != null) _sync.Volume = vol;
                 _config.Save();
             }
+            if (muted) ImGui.EndDisabled();
         }
     }
 

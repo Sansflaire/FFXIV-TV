@@ -103,6 +103,13 @@ public sealed class VideoPlayer : IDisposable
         set => _player.Volume = Math.Clamp(value, 0, 100);
     }
 
+    /// <summary>Mute/unmute audio without affecting the stored volume level.</summary>
+    public bool Muted
+    {
+        get => _player.Mute;
+        set => _player.Mute = value;
+    }
+
     // ── A-B loop ──────────────────────────────────────────────────────────────
     private float _loopA       = 0f;
     private float _loopB       = 1f;
