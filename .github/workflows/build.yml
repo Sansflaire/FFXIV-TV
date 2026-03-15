@@ -22,7 +22,7 @@ jobs:
       - name: Download Dalamud
         shell: pwsh
         run: |
-          Invoke-WebRequest "https://github.com/goatcorp/dalamud-distrib/releases/latest/download/latest.zip" -OutFile dalamud.zip
+          Invoke-WebRequest "https://raw.githubusercontent.com/goatcorp/dalamud-distrib/main/latest.zip" -OutFile dalamud.zip
           Expand-Archive dalamud.zip -DestinationPath dalamud
 
       - name: Restore
