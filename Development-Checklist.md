@@ -104,26 +104,38 @@ so characters and world geometry correctly occlude the screen.
 ## Phase 3 — Video Playback (Local File)
 
 Goal: Play a video file on the screen with basic playback controls.
+Library chosen: **LibVLCSharp** + `VideoLAN.LibVLC.Windows` NuGet (bundles libvlc DLLs).
 
 ### Video Decode Library
-- [ ] Research decode options: LibVLCSharp vs Windows Media Foundation vs FFmpeg.AutoGen
-- [ ] Choose library and add NuGet reference to csproj
-- [ ] Prototype: decode a single frame from an .mp4 file to a byte array
+- [x] Research decode options: LibVLCSharp vs Windows Media Foundation vs FFmpeg.AutoGen
+- [x] Choose library: LibVLCSharp (VideoLAN.LibVLC.Windows bundles DLLs, clean BGRA callback API)
+- [ ] Add NuGet references to csproj: `LibVLCSharp` + `VideoLAN.LibVLC.Windows`
+- [ ] `dotnet build` succeeds with LibVLCSharp referenced
+- [ ] Prototype: open a video file with LibVLC, receive at least one BGRA frame via callback
 
 ### Dynamic Texture Pipeline
-- [ ] Create D3D11 staging texture (CPU writable, BGRA32 format, video resolution)
-- [ ] Create D3D11 shader resource texture (GPU readable)
-- [ ] Each frame: lock staging texture, copy decoded frame pixels, unlock, CopyResource to GPU tex
-- [ ] Verify first video frame appears on screen
+- [ ] Create `VideoPlayer` class: owns LibVLC instance, media player, frame double-buffer
+- [ ] Frame callback: lock back-buffer, memcpy BGRA pixels, mark frame dirty (thread-safe)
+- [ ] Create D3D11 staging texture (CPU-writable, B8G8R8A8_UNorm, video resolution)
+- [ ] Create D3D11 GPU texture (ShaderResource, same format/size)
+- [ ] Render thread: if frame dirty, Map staging → memcpy → Unmap → CopyResource to GPU tex
+- [ ] D3DRenderer: accept optional `VideoPlayer` SRV; prefer it over static image SRV
+- [ ] Verify first video frame appears on the world-space screen
 
-### Playback
-- [ ] `/fftv play <path>` command starts video
-- [ ] `/fftv pause` toggles pause
-- [ ] `/fftv stop` stops and clears screen
-- [ ] Settings window: video file path input + Play/Pause/Stop buttons
-- [ ] Video loops when it reaches the end
-- [ ] Correct frame timing (decode at video FPS, not game FPS)
-- [ ] Audio playback (optional — via system audio, separate from texture pipeline)
+### Playback Controls
+- [ ] `/fftv play <path>` command starts video (stops any current video first)
+- [ ] `/fftv pause` toggles pause/resume
+- [ ] `/fftv stop` stops playback and reverts to static image (or placeholder)
+- [ ] Settings window: video file path input + Play / Pause / Stop buttons
+- [ ] Video loops when it reaches the end (`EndReached` event → `Play()` from back)
+- [ ] Correct frame timing (LibVLC delivers frames at video FPS via callback, not game FPS)
+- [ ] Audio playback works via system audio (LibVLC handles this automatically)
+
+### Cleanup / Regression
+- [ ] `VideoPlayer.Dispose()` stops playback and releases LibVLC resources cleanly
+- [ ] Plugin reload (disable/enable) does not leak LibVLC instances or D3D11 textures
+- [ ] Phase 1 fallback (ImGui overlay) still works when D3D11 unavailable
+- [ ] Static image path still works when no video is loaded
 
 ---
 
