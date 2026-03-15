@@ -51,6 +51,16 @@ public sealed class Plugin : IDalamudPlugin
         _mainWindow     = new MainWindow(Config, ObjectTable);
         _mainWindow.SetSync(_sync);
 
+        _sync.Client.OnScreenConfig += (cx, cy, cz, yaw, w, h) =>
+        {
+            Config.Screen.Center     = new System.Numerics.Vector3(cx, cy, cz);
+            Config.Screen.YawDegrees = yaw;
+            Config.Screen.Width      = w;
+            Config.Screen.Height     = h;
+            Config.Screen.Visible    = true;
+            Config.Save();
+        };
+
         CommandManager.AddHandler(CmdMain, new CommandInfo(OnCommand)
         {
             HelpMessage = "Open FFXIV-TV settings. /fftv place — place at player. /fftv hide — toggle. /fftv play <path> — play video. /fftv pause — pause/resume. /fftv stop — stop video."
@@ -157,8 +167,16 @@ public sealed class Plugin : IDalamudPlugin
         }
 
         // Keep sync mode and yt-dlp path current each frame.
-        _sync.Mode        = Config.SyncMode;
-        _sync.YtDlpPath   = Config.YtDlpPath;
+        _sync.Mode      = Config.SyncMode;
+        _sync.YtDlpPath = Config.YtDlpPath;
+
+        // Auto-start/stop server based on persisted config (survives plugin reloads).
+        if (Config.SyncMode == NetworkMode.Host && Config.SyncServerRunning
+            && !_sync.Server.IsRunning && string.IsNullOrEmpty(_sync.Server.LastError))
+            _sync.Server.Start(Config.SyncPort);
+        else if ((!Config.SyncServerRunning || Config.SyncMode != NetworkMode.Host)
+            && _sync.Server.IsRunning)
+            _sync.Server.Stop();
 
         if (_d3dRenderer.IsAvailable)
         {

@@ -81,5 +81,8 @@ public sealed class Configuration : IPluginConfiguration
     /// <summary>IP:port string the sync client connects to when in Client mode (e.g. "192.168.1.5:9834").</summary>
     public string SyncHostAddress { get; set; } = string.Empty;
 
+    /// <summary>Whether the sync server should be running. Persisted so it survives plugin reloads.</summary>
+    public bool SyncServerRunning { get; set; } = false;
+
     public void Save() => Plugin.PluginInterface.SavePluginConfig(this);
 }

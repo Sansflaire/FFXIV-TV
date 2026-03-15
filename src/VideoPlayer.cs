@@ -352,6 +352,19 @@ public sealed class VideoPlayer : IDisposable
 
     // ── yt-dlp integration ────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Resolves a URL for broadcasting to sync clients.
+    /// Direct media URLs are returned as-is; YouTube/etc. are resolved via yt-dlp
+    /// so clients receive a plain stream URL and don't need yt-dlp themselves.
+    /// Returns the original URL if resolution fails.
+    /// </summary>
+    public async Task<string> ResolveForBroadcastAsync(string url)
+    {
+        if (IsDirectMediaUrl(url)) return url;
+        string? resolved = await ResolveWithYtDlpAsync(url);
+        return resolved ?? url;
+    }
+
     private async Task<string?> ResolveWithYtDlpAsync(string url)
     {
         string? ytdlp = FindYtDlp();

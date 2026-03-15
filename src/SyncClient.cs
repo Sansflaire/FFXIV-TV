@@ -22,11 +22,12 @@ public sealed class SyncClient : IDisposable
     public string Status      { get; private set; } = "Disconnected";
 
     // ── Events (fired on background thread) ──────────────────────────────────
-    public event Action<string, float>? OnPlay;    // url, position
-    public event Action?                OnPause;
-    public event Action?                OnResume;
-    public event Action?                OnStop;
-    public event Action<float>?         OnSeek;    // position 0–1
+    public event Action<string, float>?                        OnPlay;         // url, position
+    public event Action?                                       OnPause;
+    public event Action?                                       OnResume;
+    public event Action?                                       OnStop;
+    public event Action<float>?                                OnSeek;         // position 0–1
+    public event Action<float, float, float, float, float, float>? OnScreenConfig; // cx,cy,cz,yaw,w,h
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -77,13 +78,17 @@ public sealed class SyncClient : IDisposable
             catch (Exception ex)
             {
                 IsConnected = false;
+                // Show the actual failure reason so the user can diagnose it
+                // (connection refused = wrong IP/port or firewall; timeout = firewall dropping)
+                Status = $"Failed: {ex.Message}";
                 Plugin.Log.Warning($"[FFXIV-TV] SyncClient: {ex.Message}");
             }
 
             if (!_running) break;
 
             IsConnected = false;
-            Status = "Reconnecting...";
+            int delaySec = delayMs / 1000;
+            Status = $"Reconnecting in {delaySec}s...";
             try { await Task.Delay(delayMs, ct); } catch (OperationCanceledException) { break; }
             delayMs = Math.Min(delayMs * 2, 30_000);
         }
@@ -119,6 +124,15 @@ public sealed class SyncClient : IDisposable
                     case "resume": OnResume?.Invoke();                                    break;
                     case "stop":   OnStop?.Invoke();                                      break;
                     case "seek":   OnSeek?.Invoke(msg["position"]?.Value<float>() ?? 0f); break;
+                    case "screen":
+                        OnScreenConfig?.Invoke(
+                            msg["cx"]?.Value<float>() ?? 0f,
+                            msg["cy"]?.Value<float>() ?? 0f,
+                            msg["cz"]?.Value<float>() ?? 0f,
+                            msg["yaw"]?.Value<float>() ?? 0f,
+                            msg["width"]?.Value<float>()  ?? 4f,
+                            msg["height"]?.Value<float>() ?? 2.25f);
+                        break;
                 }
             }
             catch (Exception ex)

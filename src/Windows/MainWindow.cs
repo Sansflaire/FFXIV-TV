@@ -27,6 +27,10 @@ public sealed class MainWindow
     // Sync coordinator — set after D3D device is available.
     private SyncCoordinator? _sync;
 
+    // Cached local IP — expensive to query every frame via NetworkInterface.
+    private string? _cachedLocalIp;
+    private int     _syncPortAtLastIpQuery = -1;
+
     private static readonly string[] ContentModeNames  = { "Image", "Local Video", "URL / Stream" };
     private static readonly string[] NetworkModeNames  = { "Off", "Host", "Client" };
 
@@ -156,7 +160,12 @@ public sealed class MainWindow
             changed = true;
         }
 
-        if (changed) _config.Save();
+        if (changed)
+        {
+            _config.Save();
+            if (_sync?.Mode == NetworkMode.Host && _sync.Server.IsRunning)
+                _sync.Server.BroadcastScreenConfig(screen);
+        }
     }
 
     // ─── Content Source ──────────────────────────────────────────────────────
@@ -422,14 +431,14 @@ public sealed class MainWindow
         if (server.IsRunning)
         {
             ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.6f, 0.15f, 0.15f, 1f));
-            if (ImGui.Button("Stop Server")) server.Stop();
+            if (ImGui.Button("Stop Server")) { server.Stop(); _config.SyncServerRunning = false; _config.Save(); }
             ImGui.PopStyleColor();
             ImGui.SameLine();
             ImGui.TextDisabled($"Running — {server.ClientCount} client(s) connected");
         }
         else
         {
-            if (ImGui.Button("Start Server")) server.Start(_config.SyncPort);
+            if (ImGui.Button("Start Server")) { _config.SyncServerRunning = true; _config.Save(); server.Start(_config.SyncPort); }
             if (!string.IsNullOrEmpty(server.LastError))
             {
                 ImGui.SameLine();
@@ -448,8 +457,39 @@ public sealed class MainWindow
                 "Only URLs can be shared. Switch to URL mode to sync playback.");
         }
 
+        // UPnP status
         ImGui.Spacing();
-        ImGui.TextDisabled("Tell clients to connect to: <your IP>:" + _config.SyncPort);
+        if (!string.IsNullOrEmpty(server.UPnPStatus))
+        {
+            bool mapped = server.UPnPStatus.EndsWith("✓");
+            if (mapped)
+                ImGui.TextColored(new Vector4(0.3f, 0.9f, 0.3f, 1f), server.UPnPStatus);
+            else
+                ImGui.TextDisabled(server.UPnPStatus);
+        }
+
+        // "Tell clients to connect to" — prefer public IP when UPnP gave us one
+        ImGui.Spacing();
+        string displayIp;
+        if (!string.IsNullOrEmpty(server.PublicIp))
+        {
+            displayIp = server.PublicIp;
+        }
+        else
+        {
+            if (_cachedLocalIp == null || _syncPortAtLastIpQuery != _config.SyncPort)
+            {
+                _cachedLocalIp         = UPnPHelper.GetLocalIp() ?? "?.?.?.?";
+                _syncPortAtLastIpQuery = _config.SyncPort;
+            }
+            displayIp = _cachedLocalIp;
+        }
+        string connectStr = $"{displayIp}:{_config.SyncPort}";
+        ImGui.TextDisabled($"Tell clients to connect to:  {connectStr}");
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("Click to copy");
+        if (ImGui.IsItemClicked())
+            ImGui.SetClipboardText(connectStr);
     }
 
     private void DrawClientControls()
@@ -483,7 +523,10 @@ public sealed class MainWindow
                 client.Connect(_syncAddressBuffer);
             }
             ImGui.SameLine();
-            ImGui.TextDisabled(client.Status);
+            // Red for errors/failures, grey for connecting/reconnecting
+            bool isFailed = client.Status.StartsWith("Failed:");
+            if (isFailed) ImGui.TextColored(new Vector4(1f, 0.4f, 0.4f, 1f), client.Status);
+            else          ImGui.TextDisabled(client.Status);
         }
 
         ImGui.Spacing();

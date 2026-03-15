@@ -78,7 +78,15 @@ public sealed class SyncCoordinator : IDisposable
         _vp.Play(pathOrUrl);
 
         if (Mode == NetworkMode.Host && IsUrl(pathOrUrl))
-            Server.BroadcastPlay(pathOrUrl, 0f);
+        {
+            // Resolve via yt-dlp on the host before broadcasting so clients receive
+            // a direct stream URL and don't need yt-dlp themselves.
+            _ = Task.Run(async () =>
+            {
+                string broadcastUrl = await _vp.ResolveForBroadcastAsync(pathOrUrl);
+                Server.BroadcastPlay(broadcastUrl, 0f);
+            });
+        }
     }
 
     public void TogglePause()

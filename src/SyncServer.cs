@@ -27,6 +27,16 @@ public sealed class SyncServer : IDisposable
     public string LastError   { get; private set; } = string.Empty;
     public int    ClientCount { get { lock (_lock) return _clients.Count; } }
 
+    // UPnP state — updated on background thread, read by UI thread.
+    public string UPnPStatus { get; private set; } = string.Empty;
+    public string PublicIp   { get; private set; } = string.Empty;
+
+    // Latest screen config JSON — sent to each new client on connect.
+    private string? _latestScreenJson;
+
+    private UPnPHelper.GatewayInfo? _upnpGateway;
+    private int                     _upnpMappedPort = -1;
+
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     public void Start(int port)
@@ -40,6 +50,9 @@ public sealed class SyncServer : IDisposable
             _listener.Start();
             _ = Task.Run(() => AcceptLoop(_cts.Token));
             Plugin.Log.Info($"[FFXIV-TV] SyncServer started on port {port}");
+            UPnPStatus = "Mapping...";
+            PublicIp   = string.Empty;
+            _ = Task.Run(() => SetupUPnPAsync(port));
         }
         catch (Exception ex)
         {
@@ -56,6 +69,21 @@ public sealed class SyncServer : IDisposable
 
         try { _listener?.Stop(); } catch { }
         _listener = null;
+
+        if (_upnpGateway != null && _upnpMappedPort >= 0)
+        {
+            var gw   = _upnpGateway;
+            var port = _upnpMappedPort;
+            _ = Task.Run(async () =>
+            {
+                await UPnPHelper.DeletePortMappingAsync(gw, port);
+                Plugin.Log.Info($"[FFXIV-TV] UPnP: removed port mapping for {port}");
+            });
+            _upnpGateway    = null;
+            _upnpMappedPort = -1;
+        }
+        UPnPStatus = string.Empty;
+        PublicIp   = string.Empty;
 
         lock (_lock)
         {
@@ -79,6 +107,21 @@ public sealed class SyncServer : IDisposable
     public void BroadcastSeek(float position) =>
         Broadcast(new { type = "seek", position });
 
+    public void BroadcastScreenConfig(ScreenDefinition screen)
+    {
+        var msg = new {
+            type   = "screen",
+            cx     = screen.Center.X,
+            cy     = screen.Center.Y,
+            cz     = screen.Center.Z,
+            yaw    = screen.YawDegrees,
+            width  = screen.Width,
+            height = screen.Height,
+        };
+        _latestScreenJson = JsonConvert.SerializeObject(msg);
+        Broadcast(msg);
+    }
+
     private void Broadcast(object msg)
     {
         var bytes = Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(msg));
@@ -92,6 +135,59 @@ public sealed class SyncServer : IDisposable
             // (InvalidOperationException thrown synchronously if a send is in-flight).
             try { _ = ws.SendAsync(bytes, WebSocketMessageType.Text, true, CancellationToken.None); }
             catch { /* drop — client will get next message */ }
+        }
+    }
+
+    // ── UPnP ──────────────────────────────────────────────────────────────────
+
+    private async Task SetupUPnPAsync(int port)
+    {
+        try
+        {
+            // Fetch public IP and discover gateway in parallel.
+            var publicIpTask  = UPnPHelper.GetPublicIpAsync();
+            var gatewayTask   = UPnPHelper.DiscoverAsync();
+
+            await Task.WhenAll(publicIpTask, gatewayTask);
+
+            string? publicIp = publicIpTask.Result;
+            var     gateway  = gatewayTask.Result;
+
+            if (publicIp != null)
+                PublicIp = publicIp;
+
+            if (gateway == null)
+            {
+                UPnPStatus = "No UPnP router found — forward TCP manually";
+                Plugin.Log.Warning($"[FFXIV-TV] UPnP: no gateway found");
+                return;
+            }
+
+            string? localIp = UPnPHelper.GetLocalIp();
+            if (localIp == null)
+            {
+                UPnPStatus = "Could not determine local IP — forward TCP manually";
+                return;
+            }
+
+            bool ok = await UPnPHelper.AddPortMappingAsync(gateway, port, port, localIp);
+            if (ok)
+            {
+                _upnpGateway    = gateway;
+                _upnpMappedPort = port;
+                UPnPStatus      = $"UPnP mapped TCP {port} ✓";
+                Plugin.Log.Info($"[FFXIV-TV] UPnP: mapped TCP {port} → {localIp}:{port}");
+            }
+            else
+            {
+                UPnPStatus = "UPnP mapping failed — forward TCP manually";
+                Plugin.Log.Warning($"[FFXIV-TV] UPnP: AddPortMapping returned failure");
+            }
+        }
+        catch (Exception ex)
+        {
+            UPnPStatus = "UPnP error — forward TCP manually";
+            Plugin.Log.Warning($"[FFXIV-TV] UPnP: {ex.Message}");
         }
     }
 
@@ -119,11 +215,24 @@ public sealed class SyncServer : IDisposable
         WebSocket? ws = null;
         try
         {
+            Plugin.Log.Info($"[FFXIV-TV] SyncServer: TCP accepted from {tcp.Client.RemoteEndPoint}, starting handshake...");
             ws = await HandshakeAsync(tcp.GetStream());
-            if (ws == null) { tcp.Dispose(); return; }
+            if (ws == null)
+            {
+                Plugin.Log.Warning("[FFXIV-TV] SyncServer: WebSocket handshake returned null — client sent bad HTTP request?");
+                tcp.Dispose();
+                return;
+            }
 
             lock (_lock) _clients.Add(ws);
             Plugin.Log.Info($"[FFXIV-TV] Sync client connected: {tcp.Client.RemoteEndPoint}");
+
+            // Send current screen config immediately so the client doesn't need to place manually.
+            if (_latestScreenJson != null)
+            {
+                var initBytes = Encoding.UTF8.GetBytes(_latestScreenJson);
+                await ws.SendAsync(initBytes, WebSocketMessageType.Text, true, CancellationToken.None);
+            }
 
             // Keep-alive receive loop — reads and discards; breaks on Close or disconnect.
             var buf = new byte[256];
@@ -139,7 +248,7 @@ public sealed class SyncServer : IDisposable
             }
         }
         catch (OperationCanceledException) { }
-        catch (Exception ex) { Plugin.Log.Debug($"[FFXIV-TV] Sync client error: {ex.Message}"); }
+        catch (Exception ex) { Plugin.Log.Warning($"[FFXIV-TV] SyncServer client error: {ex.GetType().Name}: {ex.Message}"); }
         finally
         {
             if (ws != null)
