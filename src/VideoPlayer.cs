@@ -138,6 +138,14 @@ public sealed class VideoPlayer : IDisposable
     /// </summary>
     public void Play(string pathOrUrl)
     {
+        // If paused, resume rather than restart.
+        if (IsPaused)
+        {
+            _player.Play();
+            _status = "Playing";
+            return;
+        }
+
         // Increment version BEFORE Stop() so any in-flight async task sees the new
         // version and aborts before calling StartPlayback().
         int version = Interlocked.Increment(ref _playVersion);
