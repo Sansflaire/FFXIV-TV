@@ -86,7 +86,7 @@ public sealed class MainWindow
         if (!ImGui.CollapsingHeader("Screen Transform", ImGuiTreeNodeFlags.DefaultOpen))
             return;
 
-        bool isClient = _config.SyncMode == NetworkMode.Client;
+        bool isClient = _config.SyncMode == NetworkMode.Client && (_sync?.Client.IsConnected ?? false);
         if (isClient)
         {
             ImGui.TextDisabled("Screen position is controlled by the host.");

@@ -258,6 +258,7 @@ Goal: Host PC serves a WebSocket server; all connected clients play the same con
 - [ ] yt-dlp settings: show host-only warning note in settings window
 - [ ] yt-dlp: auto-include in GitHub Actions build (download latest from GitHub releases)
 - [ ] yt-dlp: startup check — compare bundled vs latest release, log if outdated
+- [x] Client: only disable Screen Transform controls when actually connected to a host — not just because SyncMode == Client (fixes: client can't adjust rect while disconnected)
 - [ ] Client controls: HIDE (not grey out) screen position/yaw/size/mode controls when host has locked them
   (currently uses BeginDisabled; change to conditional render — `if (!isClient)` blocks)
 
