@@ -215,21 +215,44 @@ float4 main(float2 uv : TEXCOORD) : SV_TARGET { return tex.Sample(samp, uv); }";
         _context.OMGetRenderTargets(1, rtvArray, out ID3D11DepthStencilView? dsv);
         bool hasDepth = dsv != null;
 
+        // No RTV is bound at UiBuilder.Draw time — game has finished its passes.
+        // Get the backbuffer RTV from the DXGI swapchain so we can bind it ourselves.
+        var kernelDevice = Device.Instance();
+        if (kernelDevice == null || kernelDevice->SwapChain == null) return;
+        nint swapChainPtr = (nint)kernelDevice->SwapChain->DXGISwapChain;
+        if (swapChainPtr == 0) return;
+
+        ID3D11RenderTargetView? backbufferRtv = null;
+        try
+        {
+            var dxgiSwapChain = new IDXGISwapChain(swapChainPtr);
+            using var backbuffer = dxgiSwapChain.GetBuffer<ID3D11Texture2D>(0);
+            backbufferRtv = _device!.CreateRenderTargetView(backbuffer);
+        }
+        catch (Exception ex)
+        {
+            Plugin.Log.Error($"[FFXIV-TV] Failed to get backbuffer RTV: {ex.Message}");
+            return;
+        }
+
         if (_drawLogCountdown > 0)
         {
             _drawLogCountdown--;
-            Plugin.Log.Info($"[FFXIV-TV] Draw: srv=0x{textureHandle:X} hasDepth={hasDepth} rtv={rtvArray[0] != null}");
+            Plugin.Log.Info($"[FFXIV-TV] Draw: srv=0x{textureHandle:X} hasDepth={hasDepth} rtv={backbufferRtv != null}");
         }
 
         SavedState saved = SaveState();
         try
         {
-            SetState((nint)(long)textureHandle, hasDepth ? _dsWithDepth! : _dsNoDepth!);
+            // Bind backbuffer as RT (no depth — we're drawing UI-style over the final frame).
+            _context!.OMSetRenderTargets(backbufferRtv);
+            SetState((nint)(long)textureHandle, _dsNoDepth!);
             _context.DrawIndexed(6, 0, 0);
         }
         finally
         {
             RestoreState(saved);
+            backbufferRtv?.Dispose();
             dsv?.Dispose();
             foreach (var rtv in rtvArray) rtv?.Dispose();
         }
