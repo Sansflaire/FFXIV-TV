@@ -2,6 +2,7 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Threading;
 using System.Threading.Tasks;
 using LibVLCSharp.Shared;
 using Vortice.Direct3D11;
@@ -18,6 +19,15 @@ namespace FFXIVTv;
 ///   LibVLC decode thread → LockCallback provides pinned pixel buffer → UnlockCallback signals done
 ///                        → DisplayCallback marks _frameDirty = true
 ///   Render thread        → UploadFrame: if dirty and not being written, Map/memcpy/Unmap dynamic tex
+///   Background tasks     → PlayFileAsync / PlayNetworkAsync; abort if _playVersion changed
+///
+/// Race condition guards:
+///   _playVersion  — incremented on every Play() call. Async tasks capture it at start and
+///                   abort before touching shared state if the version has since changed.
+///                   Prevents stale tasks from calling StartPlayback() after a newer Play().
+///   _vlcWriting   — set true by LockCallback, false by UnlockCallback. Stop() spin-waits
+///                   until false after _player.Stop() rather than forcing it, so UploadFrame
+///                   never reads a buffer that LibVLC is still writing to.
 /// </summary>
 public sealed class VideoPlayer : IDisposable
 {
@@ -34,6 +44,11 @@ public sealed class VideoPlayer : IDisposable
 
     private volatile bool _frameDirty;
     private volatile bool _vlcWriting;
+
+    // ── Play versioning (stale-task guard) ────────────────────────────────────
+    // Incremented atomically on every Play() call. Async tasks capture the version
+    // at the point they are launched and abort before StartPlayback() if it changed.
+    private volatile int _playVersion = 0;
 
     // ── D3D11 resources ───────────────────────────────────────────────────────
     private ID3D11Device?             _device;
@@ -56,7 +71,6 @@ public sealed class VideoPlayer : IDisposable
 
     /// <summary>
     /// Optional path to yt-dlp.exe. If empty, auto-discovers from plugin dir then system PATH.
-    /// Update this from Plugin before each Play() call (or just keep it current each frame).
     /// </summary>
     public string YtDlpPath { get; set; } = string.Empty;
 
@@ -82,6 +96,20 @@ public sealed class VideoPlayer : IDisposable
     /// <summary>Seek to a position in the media (0 = start, 1 = end).</summary>
     public void Seek(float position) => _player.Position = Math.Clamp(position, 0f, 1f);
 
+    // ── A-B loop ──────────────────────────────────────────────────────────────
+    private float _loopA       = 0f;
+    private float _loopB       = 1f;
+    private bool  _abLoopActive = false;
+
+    public float LoopA        => _loopA;
+    public float LoopB        => _loopB;
+    public bool  AbLoopActive => _abLoopActive;
+
+    public void SetLoopA()     => _loopA = _player.Position;
+    public void SetLoopB()     => _loopB = _player.Position;
+    public void ToggleAbLoop() => _abLoopActive = !_abLoopActive;
+    public void ClearAbLoop()  { _loopA = 0f; _loopB = 1f; _abLoopActive = false; }
+
     // ── Constructor ───────────────────────────────────────────────────────────
     /// <param name="pluginDir">Directory containing libvlc.dll (= devPlugins/FFXIV-TV/).</param>
     public VideoPlayer(string pluginDir)
@@ -106,10 +134,13 @@ public sealed class VideoPlayer : IDisposable
 
     /// <summary>
     /// Plays a local file path OR an HTTP/HTTPS URL (including YouTube).
-    /// YouTube URLs require yt-dlp to be discoverable (plugin dir or YtDlpPath).
+    /// Cancels any in-flight Play() task before starting the new one.
     /// </summary>
     public void Play(string pathOrUrl)
     {
+        // Increment version BEFORE Stop() so any in-flight async task sees the new
+        // version and aborts before calling StartPlayback().
+        int version = Interlocked.Increment(ref _playVersion);
         Stop();
         _status = "Loading...";
 
@@ -117,9 +148,9 @@ public sealed class VideoPlayer : IDisposable
                      pathOrUrl.StartsWith("https://", StringComparison.OrdinalIgnoreCase);
 
         if (isUrl)
-            Task.Run(() => PlayNetworkAsync(pathOrUrl));
+            Task.Run(() => PlayNetworkAsync(pathOrUrl, version));
         else
-            Task.Run(() => PlayFileAsync(pathOrUrl));
+            Task.Run(() => PlayFileAsync(pathOrUrl, version));
     }
 
     public void TogglePause()
@@ -139,19 +170,26 @@ public sealed class VideoPlayer : IDisposable
     public void Stop()
     {
         _player.Stop();
+
+        // _player.Stop() is synchronous and waits for LibVLC to finish its decode loop,
+        // but the current LockCallback invocation may still be in-flight on the decode
+        // thread. Spin-wait until _vlcWriting clears so we never free the pinned pixel
+        // buffer while LibVLC holds a pointer to it.
+        var sw = Stopwatch.StartNew();
+        while (_vlcWriting && sw.ElapsedMilliseconds < 500)
+            Thread.SpinWait(100);
+
+        // Do NOT forcefully set _vlcWriting = false here — it is owned by the LibVLC
+        // callbacks. After Stop() + spin-wait it is already false.
+
         _media?.Dispose();
         _media      = null;
         _frameDirty = false;
-        _vlcWriting = false;
         _status     = "Stopped";
     }
 
     // ── Render-thread upload ──────────────────────────────────────────────────
 
-    /// <summary>
-    /// Called from D3DRenderer.Draw() on the render thread.
-    /// Re-creates the D3D11 texture if dimensions changed, then uploads the latest frame.
-    /// </summary>
     public void UploadFrame(ID3D11DeviceContext ctx)
     {
         if (_needsNewTexture)
@@ -189,7 +227,7 @@ public sealed class VideoPlayer : IDisposable
 
     // ── Internal playback helpers ─────────────────────────────────────────────
 
-    private async Task PlayFileAsync(string path)
+    private async Task PlayFileAsync(string path, int version)
     {
         try
         {
@@ -203,6 +241,9 @@ public sealed class VideoPlayer : IDisposable
             var media = new Media(_libVlc, new Uri(path));
             await media.Parse(MediaParseOptions.ParseLocal);
 
+            // Abort if a newer Play() was called while we were parsing.
+            if (_playVersion != version) { media.Dispose(); return; }
+
             uint vw = 1920, vh = 1080;
             foreach (var track in media.Tracks)
             {
@@ -215,7 +256,7 @@ public sealed class VideoPlayer : IDisposable
             }
 
             Plugin.Log.Info($"[FFXIV-TV] VideoPlayer: {vw}x{vh} — '{Path.GetFileName(path)}'");
-            StartPlayback(media, vw, vh);
+            StartPlayback(media, vw, vh, version);
         }
         catch (Exception ex)
         {
@@ -240,17 +281,18 @@ public sealed class VideoPlayer : IDisposable
         return false;
     }
 
-    private async Task PlayNetworkAsync(string url)
+    private async Task PlayNetworkAsync(string url, int version)
     {
         try
         {
-            // Direct media files (mp4, m3u8, etc.) go straight to LibVLC.
-            // Everything else — YouTube, rule34video, Twitch, etc. — goes through yt-dlp.
-            // yt-dlp supports 1000+ sites; if it fails we fall back to LibVLC directly.
             if (!IsDirectMediaUrl(url))
             {
                 _status = "Resolving URL...";
                 string? resolved = await ResolveWithYtDlpAsync(url);
+
+                // Abort if a newer Play() was called while yt-dlp was running.
+                if (_playVersion != version) return;
+
                 if (resolved != null)
                 {
                     Plugin.Log.Info($"[FFXIV-TV] VideoPlayer: yt-dlp resolved stream URL");
@@ -262,10 +304,12 @@ public sealed class VideoPlayer : IDisposable
                 }
             }
 
+            if (_playVersion != version) return;
+
             _status = "Connecting...";
             Plugin.Log.Info($"[FFXIV-TV] VideoPlayer: opening network stream");
             var media = new Media(_libVlc, new Uri(url));
-            StartPlayback(media, 1920, 1080);
+            StartPlayback(media, 1920, 1080, version);
         }
         catch (Exception ex)
         {
@@ -274,8 +318,16 @@ public sealed class VideoPlayer : IDisposable
         }
     }
 
-    private void StartPlayback(Media media, uint vw, uint vh)
+    private void StartPlayback(Media media, uint vw, uint vh, int version)
     {
+        // Final version check immediately before touching shared state.
+        // Guards against the window between the last async check and this call.
+        if (_playVersion != version)
+        {
+            media.Dispose();
+            return;
+        }
+
         AllocatePixelBuffer((int)vw, (int)vh);
         _pendingTexW     = (int)vw;
         _pendingTexH     = (int)vh;
@@ -292,10 +344,6 @@ public sealed class VideoPlayer : IDisposable
 
     // ── yt-dlp integration ────────────────────────────────────────────────────
 
-    /// <summary>
-    /// Runs yt-dlp to extract a direct stream URL from a YouTube (or other supported) URL.
-    /// Returns null if yt-dlp is not found or the process fails.
-    /// </summary>
     private async Task<string?> ResolveWithYtDlpAsync(string url)
     {
         string? ytdlp = FindYtDlp();
@@ -321,8 +369,6 @@ public sealed class VideoPlayer : IDisposable
             string output = await proc.StandardOutput.ReadToEndAsync();
             await proc.WaitForExitAsync();
 
-            // yt-dlp may output multiple lines (separate audio/video URLs for merging).
-            // LibVLC can't merge; take the first URL which is the best combined stream.
             string firstLine = output.Trim().Split('\n')[0].Trim();
             return string.IsNullOrEmpty(firstLine) ? null : firstLine;
         }
@@ -335,16 +381,13 @@ public sealed class VideoPlayer : IDisposable
 
     private string? FindYtDlp()
     {
-        // 1. Explicit path from config/property
         if (!string.IsNullOrEmpty(YtDlpPath) && File.Exists(YtDlpPath))
             return YtDlpPath;
 
-        // 2. Plugin directory
         string pluginDirPath = Path.Combine(_pluginDir, "yt-dlp.exe");
         if (File.Exists(pluginDirPath))
             return pluginDirPath;
 
-        // 3. System PATH via `where` (Windows)
         try
         {
             using var proc = Process.Start(new ProcessStartInfo("where", "yt-dlp")
@@ -361,7 +404,7 @@ public sealed class VideoPlayer : IDisposable
                     return result.Trim();
             }
         }
-        catch { /* PATH lookup is best-effort */ }
+        catch { }
 
         return null;
     }
@@ -424,13 +467,22 @@ public sealed class VideoPlayer : IDisposable
     {
         _frameDirty = true;
         _status     = "Playing";
+
+        // A-B loop: when position reaches B, jump back to A.
+        // Dispatched via Task.Run to avoid re-entering LibVLC from its own callback.
+        if (_abLoopActive && _loopA < _loopB && _player.Position >= _loopB)
+            Task.Run(() => _player.Position = _loopA);
     }
 
     private void OnEndReached(object? sender, EventArgs e)
     {
+        // Capture version so we don't restart if Play() was called since end-of-file fired.
+        int version = _playVersion;
         Task.Run(() =>
         {
+            if (_playVersion != version) return;
             _player.Stop();
+            if (_playVersion != version) return;
             _player.Play();
         });
     }
@@ -440,6 +492,7 @@ public sealed class VideoPlayer : IDisposable
     public void Dispose()
     {
         _player.EndReached -= OnEndReached;
+        Interlocked.Increment(ref _playVersion); // cancel any in-flight tasks
         Stop();
         _player.Dispose();
         _media?.Dispose();

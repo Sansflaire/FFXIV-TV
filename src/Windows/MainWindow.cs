@@ -301,6 +301,35 @@ public sealed class MainWindow
 
         if (!hasLength && ImGui.IsItemHovered())
             ImGui.SetTooltip("Seeking not available for live streams.");
+
+        // ── A-B loop controls ─────────────────────────────────────────────────
+        if (ImGui.SmallButton("Set A")) _videoPlayer.SetLoopA();
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip("Mark loop start at current position.");
+
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Set B")) _videoPlayer.SetLoopB();
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip("Mark loop end at current position.");
+
+        ImGui.SameLine();
+
+        bool loopOn = _videoPlayer.AbLoopActive;
+        if (loopOn) ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.15f, 0.65f, 0.15f, 1f));
+        if (ImGui.SmallButton(loopOn ? "A-B: ON " : "A-B: OFF")) _videoPlayer.ToggleAbLoop();
+        if (loopOn) ImGui.PopStyleColor();
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip("Toggle A-B loop.");
+
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Clear")) _videoPlayer.ClearAbLoop();
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip("Clear A and B points.");
+
+        // Show A/B timestamps when either point has been moved from default
+        if (_videoPlayer.LoopA > 0f || _videoPlayer.LoopB < 1f)
+        {
+            string aStr = hasLength ? FormatTime((long)(_videoPlayer.LoopA * lengthMs)) : $"{_videoPlayer.LoopA:P0}";
+            string bStr = hasLength ? FormatTime((long)(_videoPlayer.LoopB * lengthMs)) : $"{_videoPlayer.LoopB:P0}";
+            ImGui.SameLine();
+            ImGui.TextDisabled($"A: {aStr}  B: {bStr}");
+        }
     }
 
     private static string FormatTime(long ms)
