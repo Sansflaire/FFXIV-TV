@@ -1,0 +1,42 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Platforms>x64</Platforms>
+    <Platform>x64</Platform>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <ProduceReferenceAssembly>false</ProduceReferenceAssembly>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <AssemblyName>FFXIV-TV</AssemblyName>
+    <RootNamespace>FFXIVTv</RootNamespace>
+    <Version>0.1.0</Version>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <DalamudLibPath>$(APPDATA)\XIVLauncher\addon\Hooks\dev\</DalamudLibPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="Dalamud"               HintPath="$(DalamudLibPath)Dalamud.dll"               Private="false" />
+    <Reference Include="Dalamud.Common"        HintPath="$(DalamudLibPath)Dalamud.Common.dll"        Private="false" />
+    <Reference Include="Dalamud.Bindings.ImGui" HintPath="$(DalamudLibPath)Dalamud.Bindings.ImGui.dll" Private="false" />
+    <Reference Include="FFXIVClientStructs"    HintPath="$(DalamudLibPath)FFXIVClientStructs.dll"    Private="false" />
+    <Reference Include="InteropGenerator.Runtime" HintPath="$(DalamudLibPath)InteropGenerator.Runtime.dll" Private="false" />
+    <Reference Include="Lumina"                HintPath="$(DalamudLibPath)Lumina.dll"                Private="false" />
+    <Reference Include="Lumina.Excel"          HintPath="$(DalamudLibPath)Lumina.Excel.dll"          Private="false" />
+    <Reference Include="Newtonsoft.Json"       HintPath="$(DalamudLibPath)Newtonsoft.Json.dll"       Private="false" />
+    <Reference Include="Serilog"               HintPath="$(DalamudLibPath)Serilog.dll"               Private="false" />
+  </ItemGroup>
+
+  <!-- Auto-copy DLL to devPlugins after build -->
+  <Target Name="CopyToDevPlugins" AfterTargets="Build">
+    <Copy
+      SourceFiles="$(TargetPath)"
+      DestinationFolder="$(APPDATA)\XIVLauncher\devPlugins\FFXIV-TV\"
+      OverwriteReadOnlyFiles="true"
+    />
+  </Target>
+</Project>
