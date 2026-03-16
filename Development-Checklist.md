@@ -152,6 +152,7 @@ LibVLC already supports HTTP natively; YouTube requires yt-dlp to extract the di
 - [x] yt-dlp: switch to `-j` (JSON dump) to capture http_headers (Referer, User-Agent, Origin) and pass them to LibVLC so CDN streams (Reddit, anime sites, etc.) don't 403
 - [x] yt-dlp: change format to `best` (no mp4 restriction) so DASH/HLS manifests are returned for sites like Reddit that serve separate audio/video — LibVLC handles the mux internally
 - [x] Fix: rapid flicker/retry loop when stream fails — detect yt-dlp stderr errors and set error status instead of silently looping
+- [x] Fix: infinite retry loop when stream resolves but LibVLC can't decode it (0 frames decoded) — EndReached fires immediately; HandleEndOfMedia re-loops forever; fix by tracking FramesDecoded in VideoPlayer and not looping if 0
 - [x] yt-dlp lookup: explicit `YtDlpPath` prop → plugin dir → system `where` fallback
 - [x] Unified `Play(string pathOrUrl)` handles both files and URLs
 - [x] `Status` property: "Stopped" / "Loading..." / "Resolving YouTube URL..." / "Connecting..." / "Playing" / "Paused" / "Error: ..."

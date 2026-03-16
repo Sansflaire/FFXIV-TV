@@ -78,9 +78,21 @@ public sealed class SyncCoordinator : IDisposable
         var items = Playlist;
         if (items == null || items.Count == 0)
         {
-            // No playlist: loop the single current file.
+            // No playlist: loop the single current file — but only if it actually decoded frames.
+            // If 0 frames were decoded the stream was unplayable (bad format, CDN reject, etc.).
+            // Retrying would spam the infinite Resolving→Playing→Resolving loop.
             string url = _vp.CurrentPath;
-            if (!string.IsNullOrEmpty(url)) { _vp.Stop(); Play(url); }
+            if (!string.IsNullOrEmpty(url))
+            {
+                if (_vp.FramesDecoded == 0)
+                {
+                    Plugin.Log.Warning($"[FFXIV-TV] Stream ended with 0 frames decoded — stopping instead of looping: {url}");
+                    _vp.Stop();
+                    return;
+                }
+                _vp.Stop();
+                Play(url);
+            }
             return;
         }
 

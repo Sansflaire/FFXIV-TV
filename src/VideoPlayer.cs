@@ -52,6 +52,13 @@ public sealed class VideoPlayer : IDisposable
     // at the point they are launched and abort before StartPlayback() if it changed.
     private volatile int _playVersion = 0;
 
+    // ── Frame decode counter ──────────────────────────────────────────────────
+    // Reset to 0 on each StartPlayback(); incremented by DisplayCallback().
+    // SyncCoordinator checks this at EndReached: if 0, the stream was unplayable
+    // and the loop should not retry (prevents infinite Resolving→Playing→Resolving spam).
+    private int _framesDecoded = 0;
+    public int FramesDecoded => _framesDecoded;
+
     // ── D3D11 resources ───────────────────────────────────────────────────────
     private ID3D11Device?             _device;
     private ID3D11Texture2D?          _dynTex;
@@ -383,6 +390,7 @@ public sealed class VideoPlayer : IDisposable
             return;
         }
 
+        _framesDecoded   = 0;
         AllocatePixelBuffer((int)vw, (int)vh);
         _pendingTexW     = (int)vw;
         _pendingTexH     = (int)vh;
@@ -580,6 +588,7 @@ public sealed class VideoPlayer : IDisposable
     {
         _frameDirty = true;
         _status     = "Playing";
+        _framesDecoded++;
 
         // A-B loop: when position reaches B, jump back to A.
         // Dispatched via Task.Run to avoid re-entering LibVLC from its own callback.
