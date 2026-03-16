@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Numerics;
 using System.Runtime.InteropServices;
@@ -18,15 +19,14 @@ using SDImaging = System.Drawing.Imaging;
 namespace FFXIVTv;
 
 /// <summary>
-/// Phase 2 renderer: D3D11 world-space quad injected into ImGui's render pipeline.
+/// Phase 2 renderer: D3D11 world-space quad injected into FFXIV's render pipeline.
 ///
-/// UV approach: All interpolated TEXCOORD semantics are silently zeroed in this D3D context
-/// (TEXCOORD0, TEXCOORD1, all confirmed broken across rounds 3–15). SV_VertexID is always 0.
-/// The only working per-pixel data is SV_POSITION (rasterizer system value, not interpolated).
-///
-/// Solution: PS reads SV_POSITION (screen pixels) and computes UV via bilinear inverse mapping
-/// from the quad's four screen-space corner positions, passed via a constant buffer (b1).
-/// Non-perspective-correct (screen-space bilinear), acceptable for near-head-on viewing.
+/// Shader architecture (PyonPix-inspired):
+///   - No vertex buffer. VS generates a flat quad from SV_VertexID (6 vertices, TriangleList).
+///   - ScreenTransform TRS matrix in cbuffer — enables full Yaw/Pitch/Roll orientation.
+///   - UV generated in VS from vertex index → correctly interpolated through rasterizer.
+///   - Single cbuffer (b0) contains ViewProj + ScreenTransform + post-processing params.
+///   - PS: standard tex.Sample(uv) + brightness/gamma/contrast/tint pipeline.
 ///
 /// Reversed-Z note: FFXIV uses near=1.0, far=0.0.
 /// </summary>
@@ -35,26 +35,28 @@ public sealed unsafe class D3DRenderer : IDisposable
     private ID3D11Device?        _device;
     private ID3D11DeviceContext? _context;
 
-    // Expose device so Plugin can pass it to VideoPlayer after init.
     public ID3D11Device? Device => _device;
 
-    // Optional video player — if set and has a texture, its SRV is used instead of _imageSrv.
-    private VideoPlayer? _videoPlayer;
+    private VideoPlayer?  _videoPlayer;
     public void SetVideoPlayer(VideoPlayer? vp) { _videoPlayer = vp; }
 
-    private ID3D11Buffer?        _vb;
-    private ID3D11Buffer?        _cb;             // VS b0: ViewProj matrix
-    private ID3D11Buffer?        _cbCorners;      // PS b1: screen-space quad corner positions
-    private ID3D11Buffer?        _cbBrightness;   // PS b2: brightness multiplier
+    private BrowserPlayer? _browserPlayer;
+    public void SetBrowserPlayer(BrowserPlayer? bp) { _browserPlayer = bp; }
 
-    /// <summary>Brightness multiplier applied to every pixel. 1.0 = original. Set each Draw() call.</summary>
+    // Single merged cbuffer replaces the old b0+b1+b2 split.
+    private ID3D11Buffer? _cbParams;
+
+    /// <summary>Brightness multiplier applied to every pixel. 1.0 = original.</summary>
     public float Brightness { get; set; } = 1.0f;
-
+    /// <summary>Gamma power curve. 1.0 = no change. >1 = darker midtones. Range 0.1–3.0.</summary>
+    public float Gamma { get; set; } = 1.0f;
+    /// <summary>Contrast around 0.5 midpoint. 1.0 = no change. >1 = more contrast. Range 0.0–3.0.</summary>
+    public float Contrast { get; set; } = 1.0f;
     /// <summary>RGBA tint multiplier. (1,1,1,1) = no change. A &lt; 1 makes screen transparent.</summary>
     public Vector4 Tint { get; set; } = Vector4.One;
-    private ID3D11VertexShader?  _vs;
-    private ID3D11PixelShader?   _ps;
-    private ID3D11InputLayout?   _inputLayout;
+
+    private ID3D11VertexShader?      _vs;
+    private ID3D11PixelShader?       _ps;
     private ID3D11BlendState?        _blendState;
     private ID3D11RasterizerState?   _rasterizer;
     private ID3D11DepthStencilState? _dsNoDepth;
@@ -62,44 +64,43 @@ public sealed unsafe class D3DRenderer : IDisposable
     private ID3D11SamplerState?      _sampler;
 
     // DSV tracking via OMSetRenderTargets vtable hook.
-    // FFXIV unbinds its depth buffer before UiBuilder.Draw fires, so we can't capture it
-    // from Draw(). Instead, we hook OMSetRenderTargets on the immediate context's vtable
-    // and save the last non-null DSV that FFXIV binds during scene rendering.
-    // OMSetRenderTargets is vtable index 33 in ID3D11DeviceContext.
-    //
-    // UI occlusion fix: we also detect the 3D→2D transition (DSV goes from bound to null)
-    // and inject our draw there — after 3D scene (depth-tested) but BEFORE native 2D UI.
-    // Parameters are cached from the previous frame (1-frame lag; imperceptible for still screens).
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
     private delegate void OMSetRenderTargetsDelegate(
         nint pContext, uint numViews, nint* ppRTVs, nint pDSV);
 
-    private Hook<OMSetRenderTargetsDelegate>?  _omSetRTHook;
-    private ID3D11DepthStencilView?            _trackedDsv;  // last non-null DSV seen on our context
-    private nint                               _contextPtr;  // raw pointer to our context, for hook filtering
-    private bool _dsvLoggedOnce;       // one-shot: log when _trackedDsv first set + DSV dimensions
-    private int  _cbkFrameCount;       // counts callback invocations for periodic logging
+    // Injection via ClearRenderTargetView vtable hook.
+    // FFXIV clears the backbuffer before drawing native 2D UI; we inject our draw right after
+    // the clear so native UI renders on top of our TV (correct depth ordering).
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private unsafe delegate void ClearRenderTargetViewDelegate(
+        nint pContext, nint pRTV, float* pColorRGBA);
 
-    // 3D→2D transition injection state.
-    private bool _prevCallHadDsv   = false;   // was the previous OMSetRenderTargets call DSV-bound?
-    private bool _injectedThisTransition = false; // guard: inject once per 3D→2D transition
-    private volatile bool _cachedDrawReady = false; // set by Draw(); consumed by hook on render thread
+    private Hook<OMSetRenderTargetsDelegate>?     _omSetRTHook;
+    private Hook<ClearRenderTargetViewDelegate>?  _clearRtvHook;
+    private ID3D11DepthStencilView?           _trackedDsv;
+    private nint                              _contextPtr;
+    private bool _dsvLoggedOnce;
+    private int  _cbkFrameCount;
 
-    // 1×1 black RGBA texture — safety fallback if gradient texture fails to init.
-    private static readonly byte[] _blackPixelData = { 0, 0, 0, 255 }; // BGRA opaque black
+    // Backbuffer RTV pointers learned at ImGui-time via OMGetRenderTargets.
+    // FFXIV may double- or triple-buffer its swapchain, so multiple RTVs rotate per frame.
+    // The hook matches any pointer in this set to find the true 2D UI injection point.
+    private readonly HashSet<nint> _knownBackbufferRtvPtrs = new();
+    // Set when inline draw fires; reset by Draw(). Draw() skips the fallback if true.
+    private volatile bool _frameInjectionDone = false;
+    private volatile bool _cachedDrawReady = false;
+
+    // 1×1 black RGBA texture — safety fallback.
+    private static readonly byte[] _blackPixelData = { 0, 0, 0, 255 };
     private ID3D11ShaderResourceView? _blackSrv;
 
     // 2×2 dynamic texture for the idle gradient screensaver.
-    // Each pixel = one quad corner (TL, TR, BL, BR). Bilinear sampling blends them smoothly.
-    // Updated every DrawBlack() call with slowly-animated cool hues (cyan → violet range).
     private ID3D11Texture2D?          _gradientTex;
     private ID3D11ShaderResourceView? _gradientSrv;
     private float                     _gradientTime = 0f;
 
-    // Fixed phase offsets keep the four corners permanently spaced on the hue wheel
-    // (0°, 90°, 180°, 270° in cycle space) so they are never the same color simultaneously.
     private static readonly float[] _gradientPhaseOffsets = { 0.0f, 0.25f, 0.5f, 0.75f };
-    private const float GradientSpeed = 0.018f; // one full hue cycle per ~55 s — calm and slow
+    private const float GradientSpeed = 0.018f;
 
     // Own texture loaded from the image file.
     private ID3D11ShaderResourceView? _imageSrv;
@@ -107,104 +108,79 @@ public sealed unsafe class D3DRenderer : IDisposable
 
     private bool _initialized;
     public bool IsAvailable => _initialized;
-    public bool HasTexture  => _imageSrv != null || (_videoPlayer?.HasTexture == true);
+    public bool HasTexture  => _imageSrv != null || (_videoPlayer?.HasTexture == true) || (_browserPlayer?.HasTexture == true);
 
-    // Active SRV for the current frame — set in Draw(), used in ExecuteDrawCallback().
     private ID3D11ShaderResourceView? _activeSrv;
-
-    // Set each frame Draw() is called; cleared after the callback fires.
     private bool _drawPending;
 
-    // World corners and ViewProj stored in Draw(), used in the callback to compute screen corners.
-    private Vector3  _wTL, _wTR, _wBL, _wBR;
-    private Matrix4x4 _storedViewProj;
-
-
+    // Stored each Draw() call for use in the render-thread callback.
+    private Matrix4x4        _storedViewProj;
+    private ScreenDefinition? _storedScreen;
 
     private readonly ImDrawCallback _renderCallback;
 
-    // ── Vertex layout ─────────────────────────────────────────────────────────
-    // TriangleStrip order: 0=TL  1=TR  2=BL  3=BR
-    // UV column in VB is unused by shaders (UV comes from PS cbuffer computation),
-    // but kept so the input layout stride remains correct.
+    // ── Cbuffer layout ────────────────────────────────────────────────────────
+    // Single 160-byte cbuffer at register b0, bound to both VS and PS.
     [StructLayout(LayoutKind.Sequential)]
-    private struct ScreenVertex { public Vector3 Position; public Vector2 UV; }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct CbPerFrame { public Matrix4x4 ViewProj; }
-
-    // PS cbuffer: screen-space pixel positions of the four quad corners.
-    // .xy = screen pixels, .zw unused (padding for 16-byte alignment).
-    [StructLayout(LayoutKind.Sequential)]
-    private struct CbCorners
+    private struct CbParams
     {
-        public Vector4 TL, TR, BL, BR;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct CbBrightness
-    {
-        public float   Brightness;
-        public float   _pad0, _pad1, _pad2; // 16-byte alignment before Tint
-        public Vector4 Tint;                 // rgba multiplier, default (1,1,1,1)
+        public Matrix4x4 ViewProj;        // 64 bytes — camera view * projection
+        public Matrix4x4 ScreenTransform; // 64 bytes — TRS for the screen in world space
+        public float     Brightness;      // 4 — linear exposure multiplier
+        public float     Gamma;           // 4 — power curve (1/Gamma applied to rgb)
+        public float     Contrast;        // 4 — contrast around 0.5 midpoint
+        public float     _pad0;           // 4 — 16-byte alignment
+        public Vector4   Tint;            // 16 — rgba multiplier (1,1,1,1 = no change)
     }
 
     // ── HLSL ─────────────────────────────────────────────────────────────────
-    // VS: transforms world positions to clip space. No TEXCOORD output —
-    // PS computes UV from SV_POSITION instead (all interpolated semantics are broken).
-    private const string VS_SRC = @"
-cbuffer CbPerFrame : register(b0) { row_major float4x4 ViewProj; };
-struct VSIn { float3 pos : POSITION; float2 uv : TEXCOORD; };
-float4 main(VSIn v) : SV_POSITION {
-    return mul(float4(v.pos, 1.0f), ViewProj);
+
+    // CBUFFER_DEF is the shared cbuffer declaration used in both VS and PS.
+    private const string CBUFFER_DEF = @"
+cbuffer CbParams : register(b0) {
+    row_major float4x4 ViewProj;
+    row_major float4x4 ScreenTransform;
+    float Brightness; float Gamma; float Contrast; float _pad0;
+    float4 Tint;
+};";
+
+    // VS: generates a flat quad from SV_VertexID.
+    // Local-space positions form a unit quad in the XY plane.
+    // ScreenTransform (TRS) maps local → world; ViewProj maps world → clip.
+    // UV is generated per vertex and interpolates correctly through the rasterizer.
+    private const string VS_SRC = CBUFFER_DEF + @"
+static const float3 kPos[6] = {
+    float3(-0.5f,  0.5f, 0.0f),  // TL
+    float3( 0.5f,  0.5f, 0.0f),  // TR
+    float3(-0.5f, -0.5f, 0.0f),  // BL
+    float3( 0.5f,  0.5f, 0.0f),  // TR
+    float3( 0.5f, -0.5f, 0.0f),  // BR
+    float3(-0.5f, -0.5f, 0.0f),  // BL
+};
+static const float2 kUV[6] = {
+    float2(0.0f, 0.0f), float2(1.0f, 0.0f), float2(0.0f, 1.0f),
+    float2(1.0f, 0.0f), float2(1.0f, 1.0f), float2(0.0f, 1.0f),
+};
+struct VSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };
+VSOut main(uint id : SV_VertexID) {
+    float4 world = mul(float4(kPos[id], 1.0f), ScreenTransform);
+    VSOut o;
+    o.pos = mul(world, ViewProj);
+    o.uv  = kUV[id];
+    return o;
 }";
 
-    // PS: computes UV via bilinear inverse from screen-space corner positions.
-    // SV_POSITION is a rasterizer system value and is always correctly populated.
-    // Non-perspective-correct (screen-space bilinear). Acceptable for near-head-on viewing.
-    // Corner positions (screen pixels) passed via cbuffer b1, updated each callback from ViewProj.
-    // Brightness + tint (rgba multiplier) passed via cbuffer b2. Both default to neutral (1,1,1,1).
-    private const string PS_SRC = @"
-cbuffer CbCorners    : register(b1) { float4 TL, TR, BL, BR; };
-cbuffer CbBrightness : register(b2) { float Brightness; float3 _pad; float4 Tint; };
+    // PS: standard texture sample + brightness → contrast → gamma → tint pipeline.
+    private const string PS_SRC = CBUFFER_DEF + @"
 Texture2D    tex  : register(t0);
 SamplerState samp : register(s0);
-
-float2 bilinear_uv(float2 p, float2 p00, float2 p10, float2 p01, float2 p11)
-{
-    float2 e = p10 - p00;
-    float2 f = p01 - p00;
-    float2 g = p00 - p10 - p01 + p11;
-    float2 h = p  - p00;
-
-    // Quadratic in v: Av*v^2 + Bv*v + Cv = 0
-    // For linear case (Av~0): Bv*v + Cv = 0  =>  v = -Cv/Bv
-    float Av = g.x*f.y - g.y*f.x;
-    float Bv = e.x*f.y - e.y*f.x + h.x*g.y - h.y*g.x;
-    float Cv = h.x*e.y - h.y*e.x;
-
-    float v;
-    if (abs(Av) < 1e-4) {
-        v = -Cv / (Bv + 1e-10);   // R17 fix: was Cv/Bv (wrong sign)
-    } else {
-        float disc = max(0.0, Bv*Bv - 4.0*Av*Cv);
-        float sq   = sqrt(disc);
-        float v1   = (-Bv + sq) / (2.0*Av);
-        float v2   = (-Bv - sq) / (2.0*Av);
-        v = (v1 >= -0.01 && v1 <= 1.01) ? v1 : v2;
-    }
-
-    float2 numer = h   - f*v;
-    float2 denom = e + g*v;
-    float u = (abs(denom.x) >= abs(denom.y)) ? numer.x/denom.x : numer.y/denom.y;
-
-    return saturate(float2(u, v));
-}
-
-float4 main(float4 pos : SV_POSITION) : SV_TARGET {
-    float2 uv    = bilinear_uv(pos.xy, TL.xy, TR.xy, BL.xy, BR.xy);
-    float4 color = tex.Sample(samp, uv);
-    return float4(color.rgb * Brightness * Tint.rgb, color.a * Tint.a);
+struct VSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };
+float4 main(VSOut input) : SV_TARGET {
+    float4 color = tex.Sample(samp, input.uv);
+    color.rgb *= Brightness;
+    color.rgb  = saturate((color.rgb - 0.5f) * Contrast + 0.5f);
+    color.rgb  = pow(saturate(color.rgb), 1.0f / max(Gamma, 0.001f));
+    return float4(color.rgb * Tint.rgb, color.a * Tint.a);
 }";
 
     private readonly IGameInteropProvider _interop;
@@ -247,7 +223,7 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET {
             CreateResources();
             InstallOMSetRTHook();
             _initialized = true;
-            Plugin.Log.Info("[FFXIV-TV] D3DRenderer initialized — Phase 2 active.");
+            Plugin.Log.Info("[FFXIV-TV] D3DRenderer initialized — Phase 2 active (ScreenTransform shader).");
             return true;
         }
         catch (Exception ex)
@@ -260,78 +236,106 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET {
 
     private void InstallOMSetRTHook()
     {
-        // Hook ID3D11DeviceContext::OMSetRenderTargets (vtable index 33).
-        // We use this to track the last non-null DSV that FFXIV binds during scene rendering,
-        // since FFXIV unbinds its depth buffer before UiBuilder.Draw fires.
-        // vtable[33] = OMSetRenderTargets function pointer (D3D11 spec).
         nint* vtable = *(nint**)_contextPtr;
-        nint omSetRTAddr = vtable[33];
+
+        // vtable[33] = OMSetRenderTargets — for DSV tracking and backbuffer detection.
         _omSetRTHook = _interop.HookFromAddress<OMSetRenderTargetsDelegate>(
-            omSetRTAddr, OMSetRenderTargetsDetour);
+            vtable[33], OMSetRenderTargetsDetour);
         _omSetRTHook.Enable();
-        Plugin.Log.Info("[FFXIV-TV] OMSetRenderTargets hook installed.");
+
+        // vtable[50] = ClearRenderTargetView — injection point.
+        // FFXIV clears the backbuffer before 2D UI; we draw immediately after the clear
+        // so native chat/hotbar/map renders on top of our TV.
+        _clearRtvHook = _interop.HookFromAddress<ClearRenderTargetViewDelegate>(
+            vtable[50], ClearRenderTargetViewDetour);
+        _clearRtvHook.Enable();
+
+        Plugin.Log.Info("[FFXIV-TV] OMSetRenderTargets + ClearRenderTargetView hooks installed.");
     }
 
     private void OMSetRenderTargetsDetour(nint pCtx, uint numViews, nint* ppRTVs, nint pDSV)
     {
-        if (pCtx == _contextPtr)
+        try
         {
-            bool thisCallHasDsv = pDSV != 0 && numViews > 0 && ppRTVs != null && ppRTVs[0] != 0;
-
-            // Track the main scene DSV (3D pass: numViews>0, RTV bound, DSV bound).
-            if (thisCallHasDsv)
+            if (pCtx == _contextPtr)
             {
-                _trackedDsv?.Dispose();
-                _trackedDsv = new ID3D11DepthStencilView(pDSV);
-                _trackedDsv.AddRef();
-                _injectedThisTransition = false; // reset for the next transition
-                if (!_dsvLoggedOnce)
+                // Track the main-scene DSV for depth testing in inline draws.
+                // Only capture when both RTV and DSV are bound (main 3D scene pass).
+                // Shadow passes (numViews=0, pDSV=shadowDSV) are excluded by the RTV check.
+                bool thisCallHasDsv = pDSV != 0 && numViews > 0 && ppRTVs != null && ppRTVs[0] != 0;
+                if (thisCallHasDsv)
                 {
-                    _dsvLoggedOnce = true;
-                    Plugin.Log.Info($"[FFXIV-TV] main-scene DSV captured: 0x{pDSV:X}");
+                    _trackedDsv?.Dispose();
+                    _trackedDsv = new ID3D11DepthStencilView(pDSV);
+                    _trackedDsv.AddRef();
+                    if (!_dsvLoggedOnce)
+                    {
+                        _dsvLoggedOnce = true;
+                        Plugin.Log.Info($"[FFXIV-TV] main-scene DSV captured: 0x{pDSV:X}");
+                    }
                 }
             }
-
-            // Detect 3D→2D transition: previous call had DSV, this one doesn't (UI pass starting).
-            // Inject our world-space draw HERE — after 3D scene but before FFXIV's native 2D UI.
-            bool isUiPass = !thisCallHasDsv && numViews > 0 && ppRTVs != null && ppRTVs[0] != 0;
-            if (_prevCallHadDsv && isUiPass && !_injectedThisTransition && _cachedDrawReady && _activeSrv != null)
-            {
-                _injectedThisTransition = true;
-                _cachedDrawReady = false;
-                try { ExecuteInlineDraw(new ID3D11RenderTargetView(ppRTVs[0])); }
-                catch (Exception ex) { Plugin.Log.Warning($"[FFXIV-TV] inline draw failed: {ex.Message}"); }
-            }
-
-            _prevCallHadDsv = thisCallHasDsv;
         }
-
-        _omSetRTHook!.Original(pCtx, numViews, ppRTVs, pDSV);
+        catch (Exception ex)
+        {
+            Plugin.Log.Warning($"[FFXIV-TV] OMSetRenderTargetsDetour exception: {ex.GetType().Name}: {ex.Message}");
+        }
+        finally
+        {
+            _omSetRTHook?.Original(pCtx, numViews, ppRTVs, pDSV);
+        }
     }
 
-    // Executes our draw directly on the render thread at the 3D→2D pipeline transition.
-    // At this point we're between FFXIV render calls — the 3D scene RTV is still the last one used.
-    // We temporarily bind it + the tracked depth buffer, draw, then restore.
+    private unsafe void ClearRenderTargetViewDetour(nint pCtx, nint pRTV, float* pColorRGBA)
+    {
+        // Call Original FIRST — we draw on top of the clear, not before it.
+        // The clear wipes the backbuffer; our TV draw fires immediately after so
+        // native 2D UI (chat/hotbar/map) then renders on top of our TV.
+        _clearRtvHook?.Original(pCtx, pRTV, pColorRGBA);
+        try
+        {
+            if (pCtx == _contextPtr
+                && _knownBackbufferRtvPtrs.Contains(pRTV)
+                && !_frameInjectionDone
+                && _initialized && _activeSrv != null && _storedScreen != null
+                && _dsReverseZ != null && _dsNoDepth != null && _cbParams != null)
+            {
+                _frameInjectionDone = true;
+                _drawPending     = false;
+                _cachedDrawReady = false;
+                var inlineRtv = new ID3D11RenderTargetView(pRTV);
+                inlineRtv.AddRef();
+                try { ExecuteInlineDraw(inlineRtv); }
+                catch (Exception ex) { Plugin.Log.Warning($"[FFXIV-TV] clear-hook draw failed: {ex.Message}"); }
+                finally { inlineRtv.Dispose(); }
+            }
+        }
+        catch (Exception ex)
+        {
+            Plugin.Log.Warning($"[FFXIV-TV] ClearRenderTargetViewDetour exception: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
     private void ExecuteInlineDraw(ID3D11RenderTargetView rtv)
     {
-        if (_context == null || _activeSrv == null) return;
+        if (_context == null || _activeSrv == null || _storedScreen == null) return;
 
         var depthState = _trackedDsv != null ? _dsReverseZ! : _dsNoDepth!;
 
-        UpdateCbCorners();
+        UpdateCbParams();
 
         var saved = SaveState();
         try
         {
             _context.OMSetRenderTargets(new[] { rtv }, _trackedDsv);
             SetState(_activeSrv, depthState);
-            _context.Draw(4, 0);
+            _context.Draw(6, 0);
         }
         finally
         {
             RestoreState(saved);
-            rtv.Dispose();
             _drawPending = false;
+            // rtv lifetime is managed by the caller (OMSetRenderTargetsDetour) — do NOT Dispose here.
         }
 
         _cbkFrameCount++;
@@ -341,15 +345,7 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET {
 
     private void CreateResources()
     {
-        _vb = _device!.CreateBuffer(
-            (uint)(sizeof(ScreenVertex) * 4),
-            BindFlags.VertexBuffer,
-            ResourceUsage.Dynamic,
-            CpuAccessFlags.Write);
-
-        _cb           = _device.CreateConstantBuffer<CbPerFrame>();
-        _cbCorners    = _device.CreateConstantBuffer<CbCorners>();
-        _cbBrightness = _device.CreateConstantBuffer<CbBrightness>();
+        _cbParams = _device!.CreateConstantBuffer<CbParams>();
 
         ReadOnlyMemory<byte> vsBlob = Compiler.Compile(VS_SRC, "main", "screen_vs", "vs_5_0");
         ReadOnlyMemory<byte> psBlob = Compiler.Compile(PS_SRC, "main", "screen_ps", "ps_5_0");
@@ -359,12 +355,7 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET {
         _vs = _device.CreateVertexShader(vsBlob.Span);
         _ps = _device.CreatePixelShader(psBlob.Span);
 
-        InputElementDescription[] layout =
-        {
-            new("POSITION", 0, Format.R32G32B32_Float, 0,  0, InputClassification.PerVertexData, 0),
-            new("TEXCOORD", 0, Format.R32G32_Float,    0, 12, InputClassification.PerVertexData, 0),
-        };
-        _inputLayout = _device.CreateInputLayout(layout, vsBlob.Span);
+        // No vertex buffer, no input layout — SV_VertexID drives the geometry.
 
         _blendState = _device.CreateBlendState(BlendDescription.NonPremultiplied);
 
@@ -398,7 +389,7 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET {
             new Color4(0f), 0f, float.MaxValue);
         _sampler = _device.CreateSamplerState(samplerDesc);
 
-        // 1×1 black texture — safety fallback if gradient texture fails to init.
+        // 1×1 black texture fallback.
         fixed (byte* p = _blackPixelData)
         {
             var blackTexDesc = new Texture2DDescription
@@ -417,7 +408,7 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET {
             _blackSrv = _device.CreateShaderResourceView(blackTex);
         }
 
-        // 2×2 dynamic texture for the idle gradient screensaver.
+        // 2×2 dynamic gradient texture for idle screensaver.
         var gradDesc = new Texture2DDescription
         {
             Width             = 2,
@@ -488,50 +479,43 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET {
         }
     }
 
-    // ── Per-frame draw (called from UiBuilder.Draw on the main/ImGui thread) ──
-    // Uploads new video frame and caches draw parameters for the render thread to consume.
-    // The actual D3D draw is injected by the OMSetRenderTargets hook at the 3D→2D transition
-    // (one frame later) so the screen renders BEHIND native FFXIV 2D UI (chat, map, hotbar).
-    // Fallback: if the hook injection didn't fire (transition not detected), queue an ImGui
-    // callback so the screen still draws — just on top of UI instead of behind it.
+    // ── Per-frame draw ────────────────────────────────────────────────────────
     public void Draw(ScreenDefinition screen)
     {
-        // Upload latest decoded video frame + (re)create GPU texture if dimensions changed.
         if (_videoPlayer != null && _context != null)
             _videoPlayer.UploadFrame(_context);
+        if (_browserPlayer != null && _context != null)
+            _browserPlayer.UploadFrame(_context);
 
-        // Prefer video SRV when a video is playing; fall back to static image.
-        _activeSrv = (_videoPlayer != null && _videoPlayer.HasTexture)
-            ? _videoPlayer.FrameSrv
-            : _imageSrv;
+        _activeSrv = (_browserPlayer?.HasTexture == true)
+            ? _browserPlayer.FrameSrv
+            : (_videoPlayer?.HasTexture == true)
+                ? _videoPlayer.FrameSrv
+                : _imageSrv;
         if (!_initialized || _context == null || _activeSrv == null) return;
 
         var ctrl = Control.Instance();
         if (ctrl == null) return;
 
-        Matrix4x4 viewProj = ctrl->ViewProjectionMatrix;
+        _storedViewProj = ctrl->ViewProjectionMatrix;
+        _storedScreen   = screen;
 
-        var (wTL, wTR, wBR, wBL) = screen.GetWorldCorners();
-        _wTL = wTL; _wTR = wTR; _wBL = wBL; _wBR = wBR;
-        _storedViewProj = viewProj;
-
-        UpdateVB(wTL, wTR, wBL, wBR);
-        UpdateCB(viewProj);
-
-        // Signal the OMSetRenderTargets hook that it should inject on the next 3D→2D transition.
         _cachedDrawReady = true;
-        _drawPending     = true;
 
-        // Fallback ImGui callback: fires if the hook transition injection doesn't happen
-        // (e.g. no 3D→2D transition detected this frame). Draws on top of UI — not ideal
-        // but better than nothing.
-        ImGui.GetBackgroundDrawList().AddCallback(_renderCallback, null);
+        // Read and reset the per-frame injection flag. If the inline draw fired at the
+        // 3D→2D transition earlier this frame, skip the fallback callback — it would draw
+        // AFTER native UI and cover chat/hotbar/map. Reset here so next frame starts clean.
+        bool inlineFiredThisFrame = _frameInjectionDone;
+        _frameInjectionDone = false;
+
+        if (!inlineFiredThisFrame)
+        {
+            _drawPending = true;
+            ImGui.GetBackgroundDrawList().AddCallback(_renderCallback, null);
+        }
     }
 
-    // Draws the idle gradient screensaver quad using the D3D11 pipeline (depth-tested).
-    // Used when video is stopped and ShowBlackBacking is on. Must NEVER use ImGui overlay.
-    // The 2×2 gradient texture is updated each call; bilinear sampling creates a smooth
-    // four-corner color blend across the whole quad.
+    // Draws the idle gradient screensaver quad (depth-tested).
     public void DrawBlack(ScreenDefinition screen)
     {
         if (!_initialized || _context == null) return;
@@ -541,30 +525,30 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET {
         var ctrl = Control.Instance();
         if (ctrl == null) return;
 
-        Matrix4x4 viewProj = ctrl->ViewProjectionMatrix;
-        var (wTL, wTR, wBR, wBL) = screen.GetWorldCorners();
-        _wTL = wTL; _wTR = wTR; _wBL = wBL; _wBR = wBR;
-        _storedViewProj = viewProj;
+        _storedViewProj = ctrl->ViewProjectionMatrix;
+        _storedScreen   = screen;
 
-        UpdateVB(wTL, wTR, wBL, wBR);
-        UpdateCB(viewProj);
         UpdateGradientTexture();
 
         _activeSrv       = srv;
         _cachedDrawReady = true;
-        _drawPending     = true;
 
-        ImGui.GetBackgroundDrawList().AddCallback(_renderCallback, null);
+        bool inlineFiredThisFrame = _frameInjectionDone;
+        _frameInjectionDone = false;
+
+        if (!inlineFiredThisFrame)
+        {
+            _drawPending = true;
+            ImGui.GetBackgroundDrawList().AddCallback(_renderCallback, null);
+        }
     }
 
-    // Advances the gradient animation and writes the four corner colors into the 2×2 texture.
-    // Each corner cycles through cool hues (cyan → blue → indigo → violet) at a fixed phase offset,
-    // ensuring corners are always distinct and no single color ever repeats across all four corners.
+    // ── Gradient screensaver ──────────────────────────────────────────────────
     private void UpdateGradientTexture()
     {
         if (_gradientTex == null || _context == null) return;
 
-        _gradientTime += 1f / 60f; // advance at assumed ~60 fps; fine for a visual effect
+        _gradientTime += 1f / 60f;
 
         _context.Map(_gradientTex!, 0, MapMode.WriteDiscard, Vortice.Direct3D11.MapFlags.None, out var mapped);
         byte* r0 = (byte*)mapped.DataPointer;
@@ -579,13 +563,9 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET {
         _context.Unmap(_gradientTex!, 0);
     }
 
-    // Writes a single BGRA pixel from a hue value.
-    // Uses the full hue wheel [0, 1) so there is never a hard pop —
-    // the wheel wraps seamlessly (hue 0 and hue 1 are both red).
-    // Low saturation (0.40) keeps all hues soft/pastel even through warm tones.
     private static void WriteHsvPixel(byte* dst, float hue)
     {
-        hue = hue - MathF.Floor(hue); // wrap to [0, 1) — seamless, no pop
+        hue = hue - MathF.Floor(hue);
 
         const float s = 0.40f, v = 0.72f;
         float c = v * s;
@@ -601,38 +581,40 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET {
             case 4:  r = x; g = 0; b = c; break;
             default: r = c; g = 0; b = x; break;
         }
-        dst[0] = (byte)((b + m) * 255f); // B
-        dst[1] = (byte)((g + m) * 255f); // G
-        dst[2] = (byte)((r + m) * 255f); // R
-        dst[3] = 255;                     // A
+        dst[0] = (byte)((b + m) * 255f);
+        dst[1] = (byte)((g + m) * 255f);
+        dst[2] = (byte)((r + m) * 255f);
+        dst[3] = 255;
     }
 
-    // ── ImGui render callback (fallback only) ────────────────────────────────
-    // Fires during ImGui rendering (after native UI). Used if the inline hook injection
-    // already consumed _cachedDrawReady this frame. If _drawPending is still set here,
-    // the inline injection did NOT fire and we draw now as a fallback (on top of UI).
+    // ── ImGui render callback (fallback) ─────────────────────────────────────
     private void ExecuteDrawCallback(ImDrawList* parentList, ImDrawCmd* cmd)
     {
-        if (!_drawPending || _activeSrv == null || _context == null) return;
+        if (!_drawPending || _activeSrv == null || _context == null || _storedScreen == null) return;
         _drawPending     = false;
         _cachedDrawReady = false;
 
-        // At this point we're in ImGui rendering. Use the tracked DSV for depth.
         var depthState = _trackedDsv != null ? _dsReverseZ! : _dsNoDepth!;
 
         var rtvBuf = new ID3D11RenderTargetView[1];
         _context.OMGetRenderTargets(1, rtvBuf, out var currentDsv);
         var rtv = rtvBuf[0];
 
+        // Learn the backbuffer RTV pointer. FFXIV may use multiple backbuffers (double/triple
+        // buffering), so we collect all pointers seen at ImGui-time into a HashSet. The
+        // ClearRTV hook matches any of these to find the true 2D UI injection point.
+        if (rtv != null)
+            _knownBackbufferRtvPtrs.Add(rtv.NativePointer);
+
         if (rtv != null)
             _context.OMSetRenderTargets(new[] { rtv }, _trackedDsv);
 
-        UpdateCbCorners();
+        UpdateCbParams();
         var saved = SaveState();
         try
         {
             SetState(_activeSrv, depthState);
-            _context.Draw(4, 0);
+            _context.Draw(6, 0);
         }
         finally
         {
@@ -644,76 +626,42 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET {
         }
     }
 
-    // Projects one world corner to screen pixels using the stored ViewProj + current viewport.
-    private Vector4 WorldToScreenPixels(Vector3 world, Viewport vp)
+    // ── Cbuffer update ────────────────────────────────────────────────────────
+    // Builds the ScreenTransform TRS matrix from the stored ScreenDefinition
+    // and uploads the full CbParams struct to the GPU.
+    private void UpdateCbParams()
     {
-        var clip = Vector4.Transform(new Vector4(world, 1f), _storedViewProj);
-        if (MathF.Abs(clip.W) < 1e-6f) clip.W = 1e-6f;  // guard against degenerate W
-        float ndcX =  clip.X / clip.W;
-        float ndcY =  clip.Y / clip.W;
-        float sx = (ndcX + 1f) * 0.5f * vp.Width  + vp.X;
-        float sy = (1f - ndcY) * 0.5f * vp.Height + vp.Y;
-        return new Vector4(sx, sy, 0f, 0f);
+        if (_cbParams == null || _context == null || _storedScreen == null) return;
+
+        var transform = _storedScreen.ComputeScreenTransform();
+
+        var mapped = _context.Map(_cbParams, MapMode.WriteDiscard);
+        mapped.AsSpan<CbParams>(1)[0] = new CbParams
+        {
+            ViewProj        = _storedViewProj,
+            ScreenTransform = transform,
+            Brightness      = Brightness,
+            Gamma           = Gamma,
+            Contrast        = Contrast,
+            Tint            = Tint,
+        };
+        _context.Unmap(_cbParams);
     }
 
-    private void UpdateCbCorners()
-    {
-        var vpArr = new Viewport[1];
-        uint vpCount = 1;
-        _context!.RSGetViewports(ref vpCount, vpArr);
-        var vp = vpArr[0];
-
-        var tl = WorldToScreenPixels(_wTL, vp);
-        var tr = WorldToScreenPixels(_wTR, vp);
-        var bl = WorldToScreenPixels(_wBL, vp);
-        var br = WorldToScreenPixels(_wBR, vp);
-
-        var mapped = _context.Map(_cbCorners!, MapMode.WriteDiscard);
-        mapped.AsSpan<CbCorners>(1)[0] = new CbCorners { TL = tl, TR = tr, BL = bl, BR = br };
-        _context.Unmap(_cbCorners!);
-    }
-
-    private void UpdateVB(Vector3 tl, Vector3 tr, Vector3 bl, Vector3 br)
-    {
-        var mapped = _context!.Map(_vb!, MapMode.WriteDiscard);
-        var f = mapped.AsSpan<float>(20);
-        f[ 0]=tl.X; f[ 1]=tl.Y; f[ 2]=tl.Z; f[ 3]=0f; f[ 4]=0f;
-        f[ 5]=tr.X; f[ 6]=tr.Y; f[ 7]=tr.Z; f[ 8]=1f; f[ 9]=0f;
-        f[10]=bl.X; f[11]=bl.Y; f[12]=bl.Z; f[13]=0f; f[14]=1f;
-        f[15]=br.X; f[16]=br.Y; f[17]=br.Z; f[18]=1f; f[19]=1f;
-        _context.Unmap(_vb!);
-    }
-
-    private void UpdateCB(Matrix4x4 viewProj)
-    {
-        var mapped = _context!.Map(_cb!, MapMode.WriteDiscard);
-        mapped.AsSpan<CbPerFrame>(1)[0] = new CbPerFrame { ViewProj = viewProj };
-        _context.Unmap(_cb!);
-    }
-
-    private void UpdateCbBrightness()
-    {
-        var mapped = _context!.Map(_cbBrightness!, MapMode.WriteDiscard);
-        mapped.AsSpan<CbBrightness>(1)[0] = new CbBrightness { Brightness = Brightness, Tint = Tint };
-        _context.Unmap(_cbBrightness!);
-    }
-
+    // ── Pipeline state ────────────────────────────────────────────────────────
     private void SetState(ID3D11ShaderResourceView srv, ID3D11DepthStencilState depthState)
     {
-        _context!.IASetVertexBuffer(0, _vb!, (uint)sizeof(ScreenVertex));
-        _context.IASetInputLayout(_inputLayout!);
-        _context.IASetPrimitiveTopology(PrimitiveTopology.TriangleStrip);
+        // No vertex buffer or input layout — SV_VertexID drives geometry.
+        _context!.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
 
         _context.VSSetShader(_vs!);
         _context.GSSetShader(null);
         _context.HSSetShader(null);
         _context.DSSetShader(null);
-        _context.VSSetConstantBuffer(0, _cb!);
+        _context.VSSetConstantBuffer(0, _cbParams!);
 
-        UpdateCbBrightness();
         _context.PSSetShader(_ps!);
-        _context.PSSetConstantBuffer(1, _cbCorners!);
-        _context.PSSetConstantBuffer(2, _cbBrightness!);
+        _context.PSSetConstantBuffer(0, _cbParams!);
         _context.PSSetShaderResource(0, srv);
         _context.PSSetSampler(0, _sampler!);
 
@@ -723,58 +671,39 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET {
     }
 
     // ── State save / restore ──────────────────────────────────────────────────
+    // We only save/restore what we actually change in SetState.
+    // VB, IB, and InputLayout are deliberately NOT touched (SV_VertexID ignores them).
     private struct SavedState
     {
-        public ID3D11InputLayout?         InputLayout;
-        public ID3D11Buffer?              VB;
-        public uint                       VBStride;
-        public uint                       VBOffset;
-        public ID3D11Buffer?              IB;
-        public Format                     IBFormat;
-        public uint                       IBOffset;
+        public PrimitiveTopology          Topology;
         public ID3D11VertexShader?        VS;
         public ID3D11GeometryShader?      GS;
         public ID3D11HullShader?          HS;
         public ID3D11DomainShader?        DS;
+        public ID3D11Buffer?              VSCb0;
         public ID3D11PixelShader?         PS;
-        public ID3D11Buffer?              VSCb;
-        public ID3D11Buffer?              PSCb1;  // PS constant buffer slot 1 (_cbCorners)
-        public ID3D11Buffer?              PSCb2;  // PS constant buffer slot 2 (_cbBrightness)
-        public ID3D11ShaderResourceView?  PSSrv;
-        public ID3D11SamplerState?        PSSampler;
+        public ID3D11Buffer?              PSCb0;
+        public ID3D11ShaderResourceView?  PSSrv0;
+        public ID3D11SamplerState?        PSSampler0;
         public ID3D11RasterizerState?     RS;
         public ID3D11BlendState?          Blend;
         public ID3D11DepthStencilState?   DSS;
         public uint                       StencilRef;
-        public PrimitiveTopology          Topology;
     }
 
     private SavedState SaveState()
     {
         var s = new SavedState();
-        s.Topology    = _context!.IAGetPrimitiveTopology();
-        s.InputLayout = _context.IAGetInputLayout();
-
-        var vbs     = new ID3D11Buffer[1];
-        var strides = new uint[1];
-        var offsets = new uint[1];
-        _context.IAGetVertexBuffers(0, 1, vbs, strides, offsets);
-        s.VB       = vbs[0];
-        s.VBStride = strides[0];
-        s.VBOffset = offsets[0];
-
-        _context.IAGetIndexBuffer(out s.IB, out s.IBFormat, out s.IBOffset);
-
+        s.Topology = _context!.IAGetPrimitiveTopology();
         s.VS = _context.VSGetShader();
         s.GS = _context.GSGetShader();
         s.HS = _context.HSGetShader();
         s.DS = _context.DSGetShader();
-        var vsCbs = new ID3D11Buffer[1]; _context.VSGetConstantBuffers(0, vsCbs); s.VSCb = vsCbs[0];
+        var vsCbs = new ID3D11Buffer[1]; _context.VSGetConstantBuffers(0, vsCbs); s.VSCb0 = vsCbs[0];
         s.PS = _context.PSGetShader();
-        var psCbs1 = new ID3D11Buffer[1]; _context.PSGetConstantBuffers(1, psCbs1); s.PSCb1 = psCbs1[0];
-        var psCbs2 = new ID3D11Buffer[1]; _context.PSGetConstantBuffers(2, psCbs2); s.PSCb2 = psCbs2[0];
-        var srvs     = new ID3D11ShaderResourceView[1]; _context.PSGetShaderResources(0, srvs); s.PSSrv     = srvs[0];
-        var samplers = new ID3D11SamplerState[1];        _context.PSGetSamplers(0, samplers);   s.PSSampler = samplers[0];
+        var psCbs = new ID3D11Buffer[1]; _context.PSGetConstantBuffers(0, psCbs); s.PSCb0 = psCbs[0];
+        var srvs     = new ID3D11ShaderResourceView[1]; _context.PSGetShaderResources(0, srvs); s.PSSrv0     = srvs[0];
+        var samplers = new ID3D11SamplerState[1];        _context.PSGetSamplers(0, samplers);   s.PSSampler0 = samplers[0];
         s.RS    = _context.RSGetState();
         s.Blend = _context.OMGetBlendState(out _, out _);
         _context.OMGetDepthStencilState(out s.DSS, out s.StencilRef);
@@ -784,36 +713,28 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET {
     private void RestoreState(SavedState s)
     {
         _context!.IASetPrimitiveTopology(s.Topology);
-        _context.IASetInputLayout(s.InputLayout);
-        _context.IASetVertexBuffer(0, s.VB, s.VBStride, s.VBOffset);
-        _context.IASetIndexBuffer(s.IB, s.IBFormat, s.IBOffset);
         _context.VSSetShader(s.VS);
         _context.GSSetShader(s.GS);
         _context.HSSetShader(s.HS);
         _context.DSSetShader(s.DS);
-        _context.VSSetConstantBuffer(0, s.VSCb);
+        _context.VSSetConstantBuffer(0, s.VSCb0);
         _context.PSSetShader(s.PS);
-        _context.PSSetConstantBuffer(1, s.PSCb1);
-        _context.PSSetConstantBuffer(2, s.PSCb2);
-        if (s.PSSrv != null) _context.PSSetShaderResource(0, s.PSSrv);
-        _context.PSSetSampler(0, s.PSSampler);
+        _context.PSSetConstantBuffer(0, s.PSCb0);
+        if (s.PSSrv0 != null) _context.PSSetShaderResource(0, s.PSSrv0);
+        _context.PSSetSampler(0, s.PSSampler0);
         _context.RSSetState(s.RS);
         _context.OMSetBlendState(s.Blend);
         _context.OMSetDepthStencilState(s.DSS, s.StencilRef);
 
-        s.InputLayout?.Dispose();
-        s.VB?.Dispose();
-        s.IB?.Dispose();
         s.VS?.Dispose();
         s.GS?.Dispose();
         s.HS?.Dispose();
         s.DS?.Dispose();
-        s.VSCb?.Dispose();
-        s.PSCb1?.Dispose();
-        s.PSCb2?.Dispose();
+        s.VSCb0?.Dispose();
         s.PS?.Dispose();
-        s.PSSrv?.Dispose();
-        s.PSSampler?.Dispose();
+        s.PSCb0?.Dispose();
+        s.PSSrv0?.Dispose();
+        s.PSSampler0?.Dispose();
         s.RS?.Dispose();
         s.Blend?.Dispose();
         s.DSS?.Dispose();
@@ -832,9 +753,11 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET {
     private void DisposeResources()
     {
         _omSetRTHook?.Disable();
-        _omSetRTHook?.Dispose();  _omSetRTHook  = null;
+        _omSetRTHook?.Dispose();   _omSetRTHook   = null;
+        _clearRtvHook?.Disable();
+        _clearRtvHook?.Dispose();  _clearRtvHook  = null;
         _trackedDsv?.Dispose();   _trackedDsv   = null;
-        _activeSrv  = null;       // not owned here — owned by VideoPlayer or _imageSrv
+        _activeSrv  = null;
         _gradientSrv?.Dispose();  _gradientSrv  = null;
         _gradientTex?.Dispose();  _gradientTex  = null;
         _blackSrv?.Dispose();     _blackSrv     = null;
@@ -845,12 +768,8 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET {
         _dsNoDepth?.Dispose();    _dsNoDepth    = null;
         _rasterizer?.Dispose();   _rasterizer   = null;
         _blendState?.Dispose();   _blendState   = null;
-        _inputLayout?.Dispose();  _inputLayout  = null;
         _ps?.Dispose();           _ps           = null;
         _vs?.Dispose();           _vs           = null;
-        _cbBrightness?.Dispose(); _cbBrightness = null;
-        _cbCorners?.Dispose();    _cbCorners    = null;
-        _cb?.Dispose();           _cb           = null;
-        _vb?.Dispose();           _vb           = null;
+        _cbParams?.Dispose();     _cbParams     = null;
     }
 }

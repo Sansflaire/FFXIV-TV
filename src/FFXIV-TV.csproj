@@ -12,7 +12,8 @@
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <AssemblyName>FFXIV-TV</AssemblyName>
     <RootNamespace>FFXIVTv</RootNamespace>
-    <Version>0.5.14</Version>
+    <Version>0.5.25</Version>
+    <UseWindowsForms>true</UseWindowsForms>
   </PropertyGroup>
 
   <PropertyGroup>
@@ -27,6 +28,7 @@
     <PackageReference Include="System.Drawing.Common"    Version="9.0.3" />
     <PackageReference Include="LibVLCSharp"              Version="3.9.0" />
     <PackageReference Include="VideoLAN.LibVLC.Windows"  Version="3.0.21" />
+    <PackageReference Include="Microsoft.Web.WebView2"   Version="1.0.3065.32" />
   </ItemGroup>
 
   <ItemGroup>
@@ -49,8 +51,13 @@
       DestinationFolder="$(APPDATA)\XIVLauncher\devPlugins\FFXIV-TV\"
       OverwriteReadOnlyFiles="true"
     />
+    <!-- Copy managed assemblies, excluding WebView2Loader.dll (x86 from NuGet; x64 copy follows) -->
+    <ItemGroup>
+      <_RefsCopy Include="@(ReferenceCopyLocalPaths)" />
+      <_RefsCopy Remove="@(_RefsCopy)" Condition="'%(Filename)' == 'WebView2Loader'" />
+    </ItemGroup>
     <Copy
-      SourceFiles="@(ReferenceCopyLocalPaths)"
+      SourceFiles="@(_RefsCopy)"
       DestinationFolder="$(APPDATA)\XIVLauncher\devPlugins\FFXIV-TV\"
       OverwriteReadOnlyFiles="true"
     />
@@ -69,6 +76,13 @@
       SourceFiles="@(_LibVlcPlugins)"
       DestinationFiles="@(_LibVlcPlugins->'$(APPDATA)\XIVLauncher\devPlugins\FFXIV-TV\plugins\%(RecursiveDir)%(Filename)%(Extension)')"
       OverwriteReadOnlyFiles="true"
+    />
+    <!-- WebView2Loader.dll: ReferenceCopyLocalPaths copies the x86 version; overwrite with x64 -->
+    <Copy
+      SourceFiles="$(TargetDir)runtimes\win-x64\native\WebView2Loader.dll"
+      DestinationFolder="$(APPDATA)\XIVLauncher\devPlugins\FFXIV-TV\"
+      OverwriteReadOnlyFiles="true"
+      Condition="Exists('$(TargetDir)runtimes\win-x64\native\WebView2Loader.dll')"
     />
   </Target>
 </Project>
