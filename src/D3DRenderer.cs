@@ -152,6 +152,14 @@ public sealed unsafe class D3DRenderer : IDisposable
     private int _drawDrvEligCount = 0;
     // Diagnostic counter for OMSetRenderTargets injection logging (throttled).
     private int _omSetRtInjectCount = 0;
+    // One-shot: logs the first call to PrepareHooks so we know it's running.
+    private bool _prepareHooksLoggedOnce = false;
+    // Counts how many times DrawDetour fired on the bb but injection was blocked.
+    private int _drawBlockedLogCount = 0;
+    // Counts how many times OMSetRT detected bb but intermediateRTV was null.
+    private int _omsetNullIntermCount = 0;
+    // Counts how many times OMSetRT detected bb but conditions other than intermediate blocked.
+    private int _omsetBlockedLogCount = 0;
     // Cached result of DSV vs backbuffer dimension check.
     // null = not yet checked; true = compatible (use depth); false = mismatch (no depth).
     private bool? _depthCompatible = null;
@@ -468,8 +476,18 @@ float4 main(VSOut input) : SV_TARGET {
                                         try { ExecuteInlineDraw(intermediateRtvArr[0], useDepth); }
                                         catch (Exception ex) { Plugin.Log.Warning($"[FFXIV-TV] OMSetRT inject failed: {ex.Message}"); }
                                     }
+                                    else if (_omsetNullIntermCount < 5)
+                                    {
+                                        _omsetNullIntermCount++;
+                                        Plugin.Log.Warning($"[FFXIV-TV] OMSetRT bb=0x{rtvPtr:X} but intermediate RTV is null (no RT bound before BB bind?)");
+                                    }
                                     intermediateRtvArr[0]?.Dispose();
                                     intermediateDsv?.Dispose();
+                                }
+                                else if (!_frameInjectionDone && _omsetBlockedLogCount < 5)
+                                {
+                                    _omsetBlockedLogCount++;
+                                    Plugin.Log.Warning($"[FFXIV-TV] OMSetRT bb=0x{rtvPtr:X} BLOCKED: init={_initialized} screen={_storedScreen != null} dsRZ={_dsReverseZ != null} dsND={_dsNoDepth != null} cb={_cbParams != null}");
                                 }
                             }
                         }
@@ -593,6 +611,19 @@ float4 main(VSOut input) : SV_TARGET {
         bool calledOriginal = false;
         try
         {
+            if (pCtx == _contextPtr && _inUiPass && _currentBbRtvPtr != 0 && !_frameInjectionDone)
+            {
+                // Log which condition is blocking injection (throttled to first 5).
+                if (!_initialized || _storedScreen == null || _dsReverseZ == null || _dsNoDepth == null || _cbParams == null)
+                {
+                    if (_drawBlockedLogCount < 5)
+                    {
+                        _drawBlockedLogCount++;
+                        Plugin.Log.Warning($"[FFXIV-TV] DrawDetour bb=0x{_currentBbRtvPtr:X} BLOCKED: init={_initialized} screen={_storedScreen != null} dsRZ={_dsReverseZ != null} dsND={_dsNoDepth != null} cb={_cbParams != null}");
+                    }
+                }
+            }
+
             if (pCtx == _contextPtr && _inUiPass && _currentBbRtvPtr != 0
                 && !_frameInjectionDone
                 && _initialized && _storedScreen != null
@@ -673,7 +704,11 @@ float4 main(VSOut input) : SV_TARGET {
         // Use active SRV when available; fall back to 1x1 black when _activeSrv is null
         // (e.g. video stopped, no image loaded) so the rect shape is still visible.
         var srv = _activeSrv ?? _blackSrv;
-        if (srv == null) return;
+        if (srv == null)
+        {
+            Plugin.Log.Warning("[FFXIV-TV] ExecuteInlineDraw: no SRV (activeSrv=null, blackSrv=null) — draw skipped");
+            return;
+        }
 
         ID3D11DepthStencilView? dsv = useDepth ? _trackedDsv : null;
         var depthState = dsv != null ? _dsReverseZ! : _dsNoDepth!;
@@ -897,6 +932,12 @@ float4 main(VSOut input) : SV_TARGET {
 
         _storedViewProj = ctrl->ViewProjectionMatrix;
         _storedScreen   = screen;
+
+        if (!_prepareHooksLoggedOnce)
+        {
+            _prepareHooksLoggedOnce = true;
+            Plugin.Log.Info($"[FFXIV-TV] PrepareHooks: first call. screen.Visible={screen.Visible} bbTexCount={_knownBackbufferTexturePtrs.Count} bbRtvCount={_knownBackbufferRtvPtrs.Count}");
+        }
     }
 
     public void Draw(ScreenDefinition screen)
