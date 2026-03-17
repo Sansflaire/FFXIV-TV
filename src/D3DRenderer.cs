@@ -166,6 +166,13 @@ public sealed unsafe class D3DRenderer : IDisposable
     private int _prepareHooksCallCount = 0;
     // Throttle for _pendingLearnBackbuffer-consumed-but-skipped log.
     private int _bbLearnSkipLogCount = 0;
+    // Last no-DSV RTV seen this frame.
+    // The Dalamud ImGui backbuffer bind is the LAST no-DSV OMSetRenderTargets each frame,
+    // so _lastNoDsvRtvPtr at the END of frame N is the swapchain backbuffer RTV.
+    // We check it at the START of frame N+1 (in PrepareHooks) to learn the bb texture.
+    // This replaces the flawed _pendingLearnBackbuffer heuristic which fires too early
+    // and captures FFXIV post-processing surfaces instead of the real swapchain bb.
+    private nint _lastNoDsvRtvPtr = 0;
     // Cached result of DSV vs backbuffer dimension check.
     // null = not yet checked; true = compatible (use depth); false = mismatch (no depth).
     private bool? _depthCompatible = null;
@@ -384,6 +391,11 @@ float4 main(VSOut input) : SV_TARGET {
                     if (!hasDsv)
                     {
                         nint rtvPtr = ppRTVs[0];
+
+                        // Track the last no-DSV RTV seen this frame.
+                        // The Dalamud ImGui bb bind is the LAST one — PrepareHooks on
+                        // the next frame uses this to learn the real swapchain backbuffer.
+                        _lastNoDsvRtvPtr = rtvPtr;
 
                         // STEP A: Learn backbuffer texture ptr from Dalamud's ImGui bind.
                         // _pendingLearnBackbuffer is set by Draw()/DrawBlack(). The first
@@ -946,6 +958,33 @@ float4 main(VSOut input) : SV_TARGET {
     {
         if (!_initialized) return;
 
+        // Last-RTV bb identification: the Dalamud ImGui bind is the LAST no-DSV
+        // OMSetRenderTargets in the frame. Check it now (start of next frame) to
+        // learn the backbuffer texture. This is more reliable than _pendingLearnBackbuffer
+        // which fires too early and captures FFXIV post-processing surfaces.
+        if (_lastNoDsvRtvPtr != 0 && _knownBackbufferTexturePtrs.Count == 0)
+        {
+            nint rtvPtr = _lastNoDsvRtvPtr;
+            try
+            {
+                var v = new ID3D11View(rtvPtr);
+                v.AddRef();
+                try
+                {
+                    using var res = v.Resource;
+                    nint texPtr = res.NativePointer;
+                    if (_knownBackbufferTexturePtrs.Add(texPtr))
+                    {
+                        _knownBackbufferRtvPtrs.Add(rtvPtr);
+                        Plugin.Log.Info($"[FFXIV-TV] bb learned (last-RTV): rtv=0x{rtvPtr:X} tex=0x{texPtr:X}");
+                    }
+                }
+                finally { v.Dispose(); }
+            }
+            catch (Exception ex) { Plugin.Log.Warning($"[FFXIV-TV] last-RTV bb-learn failed: {ex.Message}"); }
+        }
+
+        _lastNoDsvRtvPtr         = 0; // reset — will be updated to the last no-DSV RTV this frame
         _pendingLearnBackbuffer  = true;
         _inUiPass                = false;
         _frameInjectionDone      = false;
