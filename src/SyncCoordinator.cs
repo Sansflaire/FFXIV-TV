@@ -90,8 +90,7 @@ public sealed class SyncCoordinator : IDisposable
                     _vp.Stop();
                     return;
                 }
-                _vp.Stop();
-                Play(url);
+                Play(url); // Play() calls Stop() internally — no explicit Stop() here
             }
             return;
         }

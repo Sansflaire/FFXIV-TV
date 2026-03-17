@@ -8,6 +8,7 @@ public enum ContentMode
     Image,
     LocalVideo,
     UrlVideo,
+    Browser,
 }
 
 public enum NetworkMode
@@ -48,11 +49,20 @@ public sealed class Configuration : IPluginConfiguration
     /// </summary>
     public string YtDlpPath { get; set; } = string.Empty;
 
+    /// <summary>URL navigated to when ActiveMode == Browser. Persisted across reloads.</summary>
+    public string BrowserUrl { get; set; } = string.Empty;
+
     /// <summary>
     /// Brightness multiplier applied to the rendered content. 1.0 = original. Range 0–4.
     /// Applied in the pixel shader; 0 = black, 2 = double brightness, etc.
     /// </summary>
     public float Brightness { get; set; } = 1.0f;
+
+    /// <summary>Gamma power curve. 1.0 = no change. >1 darkens midtones; &lt;1 lifts them. Range 0.1–3.0.</summary>
+    public float Gamma { get; set; } = 1.0f;
+
+    /// <summary>Contrast around 0.5 midpoint. 1.0 = no change. >1 = more contrast. Range 0.0–3.0.</summary>
+    public float Contrast { get; set; } = 1.0f;
 
     /// <summary>Tint color applied to the displayed image/video (RGBA, 0–1 per channel).</summary>
     public float TintR { get; set; } = 1f;

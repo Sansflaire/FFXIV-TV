@@ -19,6 +19,7 @@ public sealed class MainWindow
     private string _videoPathBuffer;
     private string _videoUrlBuffer;
     private string _ytDlpPathBuffer;
+    private string _browserUrlBuffer;
 
     // Network sync buffers
     private int    _syncPortBuffer;
@@ -30,27 +31,35 @@ public sealed class MainWindow
     // Sync coordinator — set after D3D device is available.
     private SyncCoordinator? _sync;
 
+    // Browser player — set after plugin wires it up.
+    private BrowserPlayer? _browserPlayer;
+
     // Cached local IP — expensive to query every frame via NetworkInterface.
     private string? _cachedLocalIp;
     private int     _syncPortAtLastIpQuery = -1;
 
-    private static readonly string[] ContentModeNames  = { "Image", "Local Video", "URL / Stream" };
-    private static readonly string[] NetworkModeNames  = { "Off", "Host", "Client" };
+    // Settings pop-out window state.
+    private bool _settingsOpen = false;
+
+    private static readonly string[] ContentModeNames = { "Image", "Local Video", "URL / Stream", "Browser (WebView2)" };
+    private static readonly string[] NetworkModeNames = { "Off", "Host", "Client" };
 
     public MainWindow(Configuration config, IObjectTable objectTable)
     {
-        _config       = config;
-        _objectTable  = objectTable;
+        _config            = config;
+        _objectTable       = objectTable;
 
         _imagePathBuffer   = config.ImagePath;
         _videoPathBuffer   = config.VideoPath;
         _videoUrlBuffer    = config.VideoUrl;
         _ytDlpPathBuffer   = config.YtDlpPath;
+        _browserUrlBuffer  = config.BrowserUrl;
         _syncPortBuffer    = config.SyncPort;
         _syncAddressBuffer = config.SyncHostAddress;
     }
 
     public void SetSync(SyncCoordinator sync) => _sync = sync;
+    public void SetBrowserPlayer(BrowserPlayer bp) => _browserPlayer = bp;
 
     public void Draw()
     {
@@ -60,7 +69,7 @@ public sealed class MainWindow
         ImGui.SetNextWindowSizeConstraints(new Vector2(360, 300), new Vector2(800, 900));
 
         bool open = IsVisible;
-        if (!ImGui.Begin("FFXIV-TV Settings", ref open))
+        if (!ImGui.Begin("FFXIV-TV", ref open))
         {
             IsVisible = open;
             ImGui.End();
@@ -68,106 +77,129 @@ public sealed class MainWindow
         }
         IsVisible = open;
 
-        DrawScreenSection();
-        ImGui.Spacing();
-        DrawContentSection();
-        ImGui.Spacing();
-        DrawNetworkSection();
-        ImGui.Spacing();
-        DrawTintSection();
+        if (ImGui.BeginTabBar("##maintabs"))
+        {
+            if (ImGui.BeginTabItem("Player"))
+            {
+                DrawPlayerTab();
+                ImGui.EndTabItem();
+            }
+            if (ImGui.BeginTabItem("Placement"))
+            {
+                DrawScreenSection();
+                ImGui.EndTabItem();
+            }
+            if (ImGui.BeginTabItem("Network"))
+            {
+                DrawNetworkTab();
+                ImGui.EndTabItem();
+            }
+            ImGui.EndTabBar();
+        }
 
         ImGui.End();
+
+        // Settings pop-out — separate floating window, toggled by ⚙ button.
+        if (_settingsOpen)
+            DrawSettingsWindow();
     }
 
-    // ─── Screen Transform ────────────────────────────────────────────────────
+    // ─── Player Tab ───────────────────────────────────────────────────────────
+
+    private void DrawPlayerTab()
+    {
+        DrawContentSection();
+    }
+
+    // ─── Screen Transform ─────────────────────────────────────────────────────
 
     private void DrawScreenSection()
     {
-        if (!ImGui.CollapsingHeader("Screen Transform", ImGuiTreeNodeFlags.DefaultOpen))
-            return;
-
         bool isClient = _config.SyncMode == NetworkMode.Client && (_sync?.Client.IsConnected ?? false);
-        if (isClient)
-        {
-            ImGui.TextDisabled("Screen position is controlled by the host.");
-            ImGui.BeginDisabled();
-        }
+        var  screen   = _config.Screen;
+        bool changed  = false;
 
-        var screen = _config.Screen;
-        bool changed = false;
-
+        // Row: Visible | Place at Player | ⚙
         bool vis = screen.Visible;
-        if (ImGui.Checkbox("Visible", ref vis)) { screen.Visible = vis; changed = true; }
+        if (ImGui.Checkbox("Visible##vis", ref vis)) { screen.Visible = vis; changed = true; }
 
         ImGui.SameLine();
-
-        bool always = _config.AlwaysDraw;
-        if (ImGui.Checkbox("Always Draw", ref always)) { _config.AlwaysDraw = always; changed = true; }
-        if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("Keep drawing even when corners go behind the camera.");
-
-        ImGui.SameLine();
-
-        bool sandbox = _config.UsePhase1Sandbox;
-        if (ImGui.Checkbox("Phase 1 Sandbox", ref sandbox)) { _config.UsePhase1Sandbox = sandbox; changed = true; }
-        if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("Force Phase 1 rendering (WorldToScreen + ImGui). No depth testing.");
-
-        ImGui.SameLine();
-
-        bool backing = _config.ShowBlackBacking;
-        if (ImGui.Checkbox("Black Backing", ref backing)) { _config.ShowBlackBacking = backing; changed = true; }
-        if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("Draw a solid black rectangle behind the content.");
-
-        ImGui.SameLine();
-
         if (ImGui.SmallButton("Place at Player"))
         {
             var player = _objectTable.LocalPlayer;
             if (player != null)
             {
-                screen.Center = player.Position + new Vector3(0f, 0f, 3f);
+                screen.Center     = player.Position + new Vector3(0f, 0f, 3f);
                 screen.YawDegrees = player.Rotation * (180f / MathF.PI);
                 changed = true;
             }
         }
 
-        ImGui.Separator();
-
-        var center = screen.Center;
-        if (ImGui.DragFloat3("Position (X/Y/Z)", ref center, 0.05f))
-        {
-            screen.Center = center;
-            changed = true;
-        }
-
-        float yaw = screen.YawDegrees;
-        if (ImGui.SliderFloat("Yaw (degrees)", ref yaw, -180f, 180f))
-        {
-            screen.YawDegrees = yaw;
-            changed = true;
-        }
-
-        float w = screen.Width;
-        float h = screen.Height;
-
-        if (ImGui.DragFloat("Width (units)", ref w, 0.05f, 0.1f, 30f))
-        {
-            screen.Width = w;
-            changed = true;
-        }
-        if (ImGui.DragFloat("Height (units)", ref h, 0.05f, 0.1f, 20f))
-        {
-            screen.Height = h;
-            changed = true;
-        }
-
         ImGui.SameLine();
-        if (ImGui.SmallButton("Lock 16:9"))
+        bool settingsWasOpen = _settingsOpen;
+        if (settingsWasOpen)
+            ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.2f, 0.45f, 0.75f, 1f));
+        if (ImGui.SmallButton("  ⚙  ##settingstoggle"))
+            _settingsOpen = !_settingsOpen;
+        if (settingsWasOpen)
+            ImGui.PopStyleColor();
+
+        // When connected as a client, HIDE position controls entirely.
+        if (isClient)
         {
-            screen.Height = screen.Width * 9f / 16f;
-            changed = true;
+            ImGui.TextDisabled("Screen position is controlled by the host.");
+        }
+        else
+        {
+            var center = screen.Center;
+            if (ImGui.DragFloat3("Position (X/Y/Z)", ref center, 0.05f))
+            {
+                screen.Center = center;
+                changed = true;
+            }
+
+            float yaw = screen.YawDegrees;
+            if (ImGui.SliderFloat("Yaw (degrees)", ref yaw, -180f, 180f))
+            {
+                screen.YawDegrees = yaw;
+                changed = true;
+            }
+
+            float pitch = screen.PitchDegrees;
+            if (ImGui.SliderFloat("Pitch (degrees)", ref pitch, -90f, 90f))
+            {
+                screen.PitchDegrees = pitch;
+                changed = true;
+            }
+
+            float roll = screen.RollDegrees;
+            if (ImGui.SliderFloat("Roll (degrees)", ref roll, -180f, 180f))
+            {
+                screen.RollDegrees = roll;
+                changed = true;
+            }
+
+            float w = screen.Width;
+            float h = screen.Height;
+
+            if (ImGui.DragFloat("Width (units)", ref w, 0.05f, 0.1f, 30f))
+            {
+                screen.Width = w;
+                changed = true;
+            }
+
+            if (ImGui.DragFloat("Height (units)", ref h, 0.05f, 0.1f, 20f))
+            {
+                screen.Height = h;
+                changed = true;
+            }
+
+            ImGui.SameLine();
+            if (ImGui.SmallButton("Lock 16:9"))
+            {
+                screen.Height = screen.Width * 9f / 16f;
+                changed = true;
+            }
         }
 
         if (changed)
@@ -176,16 +208,14 @@ public sealed class MainWindow
             if (_sync?.Mode == NetworkMode.Host && _sync.Server.IsRunning)
                 _sync.Server.BroadcastScreenConfig(screen);
         }
-
-        if (isClient) ImGui.EndDisabled();
     }
 
-    // ─── Content Source ──────────────────────────────────────────────────────
+    // ─── Content Source ───────────────────────────────────────────────────────
 
     private void DrawContentSection()
     {
-        if (!ImGui.CollapsingHeader("Content Source", ImGuiTreeNodeFlags.DefaultOpen))
-            return;
+        ImGui.Text("Content");
+        ImGui.Separator();
 
         int mode = (int)_config.ActiveMode;
         if (ImGui.Combo("Mode###contentmode", ref mode, ContentModeNames, ContentModeNames.Length))
@@ -194,16 +224,18 @@ public sealed class MainWindow
             _config.Save();
         }
 
-        ImGui.Separator();
+        ImGui.Spacing();
 
         switch (_config.ActiveMode)
         {
             case ContentMode.Image:      DrawImageControls();      break;
             case ContentMode.LocalVideo: DrawLocalVideoControls(); break;
             case ContentMode.UrlVideo:   DrawUrlVideoControls();   break;
+            case ContentMode.Browser:    DrawBrowserControls();    break;
         }
 
-        if (_config.ActiveMode != ContentMode.Image)
+        // Playlist only applies to video modes.
+        if (_config.ActiveMode == ContentMode.LocalVideo || _config.ActiveMode == ContentMode.UrlVideo)
         {
             ImGui.Spacing();
             DrawPlaylistSection();
@@ -211,6 +243,7 @@ public sealed class MainWindow
 
         ImGui.Spacing();
         ImGui.Separator();
+
         float brightness = _config.Brightness;
         ImGui.SetNextItemWidth(200);
         if (ImGui.SliderFloat("Brightness##bright", ref brightness, 0f, 4f, "%.2f"))
@@ -221,40 +254,45 @@ public sealed class MainWindow
         if (ImGui.IsItemHovered())
             ImGui.SetTooltip("1.0 = original. Increase if video appears dark.");
 
-        if (_config.ActiveMode != ContentMode.Image)
+        // Volume/Mute only applies to video modes.
+        if (_config.ActiveMode == ContentMode.LocalVideo || _config.ActiveMode == ContentMode.UrlVideo)
         {
             ImGui.Spacing();
-
-            bool muted = _config.Muted;
-            if (muted)
-                ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.7f, 0.2f, 0.2f, 1f));
-            if (ImGui.Button(muted ? "Unmute##mute" : "  Mute  ##mute"))
-            {
-                _config.Muted = !muted;
-                if (_sync != null) _sync.Muted = !muted;
-                _config.Save();
-            }
-            if (muted) ImGui.PopStyleColor();
-
-            ImGui.SameLine();
-            if (muted) ImGui.BeginDisabled();
-            ImGui.SetNextItemWidth(200);
-            int vol = _config.Volume;
-            if (ImGui.SliderInt("Volume##vol", ref vol, 0, 100))
-            {
-                _config.Volume = vol;
-                if (_sync != null) _sync.Volume = vol;
-                _config.Save();
-            }
-            if (muted) ImGui.EndDisabled();
+            DrawVolumeMute();
         }
+    }
+
+    private void DrawVolumeMute()
+    {
+        bool muted = _config.Muted;
+        if (muted)
+            ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.7f, 0.2f, 0.2f, 1f));
+        if (ImGui.Button(muted ? "Unmute##mute" : "  Mute  ##mute"))
+        {
+            _config.Muted = !muted;
+            if (_sync != null) _sync.Muted = !muted;
+            _config.Save();
+        }
+        if (muted) ImGui.PopStyleColor();
+
+        ImGui.SameLine();
+        if (muted) ImGui.BeginDisabled();
+        ImGui.SetNextItemWidth(200);
+        int vol = _config.Volume;
+        if (ImGui.SliderInt("Volume##vol", ref vol, 0, 100))
+        {
+            _config.Volume = vol;
+            if (_sync != null) _sync.Volume = vol;
+            _config.Save();
+        }
+        if (muted) ImGui.EndDisabled();
     }
 
     private void DrawImageControls()
     {
         if (_imagePathBufferDirty)
         {
-            _imagePathBuffer     = _config.ImagePath;
+            _imagePathBuffer      = _config.ImagePath;
             _imagePathBufferDirty = false;
         }
 
@@ -282,7 +320,7 @@ public sealed class MainWindow
         ImGui.SetNextItemWidth(-1);
         ImGui.InputText("##videopath", ref _videoPathBuffer, 512);
 
-        bool hasPlayer = _sync != null;
+        bool hasPlayer      = _sync != null;
         bool disableControls = !hasPlayer || isClient;
         if (disableControls) ImGui.BeginDisabled();
 
@@ -321,7 +359,7 @@ public sealed class MainWindow
         ImGui.SetNextItemWidth(-1);
         ImGui.InputText("##videourl", ref _videoUrlBuffer, 1024);
 
-        bool hasPlayer = _sync != null;
+        bool hasPlayer       = _sync != null;
         bool disableControls = !hasPlayer || isClient;
         if (disableControls) ImGui.BeginDisabled();
 
@@ -350,22 +388,30 @@ public sealed class MainWindow
         }
 
         if (!isClient) DrawScrubBar();
+    }
 
-        ImGui.Spacing();
-        ImGui.TextDisabled("yt-dlp path (optional — needed for YouTube):");
-        if (ImGui.InputText("##ytdlppath", ref _ytDlpPathBuffer, 512,
-                            ImGuiInputTextFlags.EnterReturnsTrue))
+    private void DrawBrowserControls()
+    {
+        ImGui.TextDisabled("URL to open (YouTube, Reddit, any website — no yt-dlp needed):");
+        ImGui.SetNextItemWidth(-1);
+        ImGui.InputText("##browserurl", ref _browserUrlBuffer, 1024);
+
+        if (ImGui.Button("Open##br"))
         {
-            _config.YtDlpPath = _ytDlpPathBuffer;
+            _config.BrowserUrl = _browserUrlBuffer;
             _config.Save();
+            _browserPlayer?.Navigate(_browserUrlBuffer);
         }
         ImGui.SameLine();
-        if (ImGui.SmallButton("Apply##ytd"))
-        {
-            _config.YtDlpPath = _ytDlpPathBuffer;
-            _config.Save();
-        }
-        ImGui.TextDisabled("(Leave empty to auto-find yt-dlp.exe in plugin folder)");
+        if (ImGui.Button("Stop##br"))
+            _browserPlayer?.Stop();
+
+        ImGui.SameLine();
+        ImGui.TextDisabled($"  [{_browserPlayer?.Status ?? "Stopped"}]");
+
+        ImGui.Spacing();
+        ImGui.TextDisabled("Captures at ~6fps. First load takes a moment to start WebView2.");
+        ImGui.TextDisabled("Requires: Microsoft Edge / WebView2 Runtime (pre-installed on Win11).");
     }
 
     private void DrawPlaylistSection()
@@ -374,10 +420,9 @@ public sealed class MainWindow
             return;
 
         bool isClient = _config.SyncMode == NetworkMode.Client;
-        var playlist  = _config.Playlist;
+        var  playlist = _config.Playlist;
         int  count    = playlist.Count;
 
-        // Loop toggle + item count
         bool loop = _config.PlaylistLoop;
         if (ImGui.Checkbox("Loop##plloop", ref loop))
         {
@@ -387,7 +432,7 @@ public sealed class MainWindow
         if (count > 0)
         {
             ImGui.SameLine();
-            int cur = _config.PlaylistIndex;
+            int    cur      = _config.PlaylistIndex;
             string idxLabel = cur >= 0 && cur < count
                 ? $"  Item {cur + 1} / {count}"
                 : $"  {count} item(s)";
@@ -396,7 +441,6 @@ public sealed class MainWindow
 
         ImGui.Separator();
 
-        // Item list
         int removeIdx = -1, moveUp = -1, moveDown = -1;
         for (int i = 0; i < count; i++)
         {
@@ -448,7 +492,6 @@ public sealed class MainWindow
 
         ImGui.Separator();
 
-        // Add new item
         ImGui.SetNextItemWidth(-82);
         ImGui.InputText("##pladd", ref _playlistAddBuffer, 1024);
         ImGui.SameLine();
@@ -480,8 +523,8 @@ public sealed class MainWindow
         long timeMs   = _sync.TimeMs;
         long lengthMs = _sync.LengthMs;
 
-        bool hasLength = lengthMs > 0;
-        string timeLabel = hasLength
+        bool   hasLength  = lengthMs > 0;
+        string timeLabel  = hasLength
             ? $"{FormatTime(timeMs)} / {FormatTime(lengthMs)}"
             : FormatTime(timeMs);
         ImGui.TextDisabled(timeLabel);
@@ -497,7 +540,6 @@ public sealed class MainWindow
         if (!hasLength && ImGui.IsItemHovered())
             ImGui.SetTooltip("Seeking not available for live streams.");
 
-        // ── A-B loop controls ─────────────────────────────────────────────────
         if (ImGui.SmallButton("Set A")) _sync.SetLoopA();
         if (ImGui.IsItemHovered()) ImGui.SetTooltip("Mark loop start at current position.");
 
@@ -535,17 +577,13 @@ public sealed class MainWindow
             : $"{ts.Minutes}:{ts.Seconds:D2}";
     }
 
-    // ─── Network Sync ─────────────────────────────────────────────────────────
+    // ─── Network Tab ─────────────────────────────────────────────────────────
 
-    private void DrawNetworkSection()
+    private void DrawNetworkTab()
     {
-        if (!ImGui.CollapsingHeader("Network Sync"))
-            return;
-
         int netMode = (int)_config.SyncMode;
         if (ImGui.Combo("Role###networkmode", ref netMode, NetworkModeNames, NetworkModeNames.Length))
         {
-            // Changing role stops active server/client first
             if (_config.SyncMode == NetworkMode.Host)
                 _sync?.Server.Stop();
             else if (_config.SyncMode == NetworkMode.Client)
@@ -583,7 +621,7 @@ public sealed class MainWindow
         ImGui.SetNextItemWidth(80);
         if (ImGui.InputInt("##syncport", ref _syncPortBuffer, 0))
         {
-            _syncPortBuffer      = Math.Clamp(_syncPortBuffer, 1024, 65535);
+            _syncPortBuffer  = Math.Clamp(_syncPortBuffer, 1024, 65535);
             _config.SyncPort = _syncPortBuffer;
             _config.Save();
         }
@@ -605,7 +643,7 @@ public sealed class MainWindow
                 _config.SyncServerRunning = true;
                 _config.Save();
                 server.Start(_config.SyncPort);
-                server.BroadcastScreenConfig(_config.Screen); // seeds _latestScreenJson for new clients
+                server.BroadcastScreenConfig(_config.Screen);
             }
             if (!string.IsNullOrEmpty(server.LastError))
             {
@@ -614,7 +652,6 @@ public sealed class MainWindow
             }
         }
 
-        // Warn if active content is a local file — can't be shared
         bool localFileActive =
             (_config.ActiveMode == ContentMode.LocalVideo && !string.IsNullOrEmpty(_config.VideoPath)) ||
             (_config.ActiveMode == ContentMode.Image);
@@ -625,7 +662,6 @@ public sealed class MainWindow
                 "Only URLs can be shared. Switch to URL mode to sync playback.");
         }
 
-        // UPnP status
         ImGui.Spacing();
         if (!string.IsNullOrEmpty(server.UPnPStatus))
         {
@@ -636,7 +672,6 @@ public sealed class MainWindow
                 ImGui.TextDisabled(server.UPnPStatus);
         }
 
-        // "Tell clients to connect to" — prefer public IP when UPnP gave us one
         ImGui.Spacing();
         string displayIp;
         if (!string.IsNullOrEmpty(server.PublicIp))
@@ -691,7 +726,6 @@ public sealed class MainWindow
                 client.Connect(_syncAddressBuffer);
             }
             ImGui.SameLine();
-            // Red for errors/failures, grey for connecting/reconnecting
             bool isFailed = client.Status.StartsWith("Failed:");
             if (isFailed) ImGui.TextColored(new Vector4(1f, 0.4f, 0.4f, 1f), client.Status);
             else          ImGui.TextDisabled(client.Status);
@@ -701,12 +735,71 @@ public sealed class MainWindow
         ImGui.TextDisabled("Playback is controlled by the host while connected.");
     }
 
-    // ─── Tint / Opacity ──────────────────────────────────────────────────────
+    // ─── Settings Pop-out Window ──────────────────────────────────────────────
 
-    private void DrawTintSection()
+    private void DrawSettingsWindow()
     {
-        if (!ImGui.CollapsingHeader("Tint / Opacity"))
+        ImGui.SetNextWindowSize(new Vector2(380, 260), ImGuiCond.FirstUseEver);
+        bool open = _settingsOpen;
+        if (!ImGui.Begin("FFXIV-TV  ⚙  Settings", ref open))
+        {
+            _settingsOpen = open;
+            ImGui.End();
             return;
+        }
+        _settingsOpen = open;
+
+        bool changed = false;
+
+        bool always = _config.AlwaysDraw;
+        if (ImGui.Checkbox("Always Draw", ref always)) { _config.AlwaysDraw = always; changed = true; }
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("Keep drawing even when corners go behind the camera.");
+
+        bool backing = _config.ShowBlackBacking;
+        if (ImGui.Checkbox("Black Backing", ref backing)) { _config.ShowBlackBacking = backing; changed = true; }
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("Draw a solid black rectangle behind the content.");
+
+        bool sandbox = _config.UsePhase1Sandbox;
+        if (ImGui.Checkbox("Phase 1 Sandbox", ref sandbox)) { _config.UsePhase1Sandbox = sandbox; changed = true; }
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("Force Phase 1 rendering (WorldToScreen + ImGui). No depth testing.");
+
+        if (changed) _config.Save();
+
+        ImGui.Separator();
+
+        // Post-processing curves
+        float gamma = _config.Gamma;
+        ImGui.SetNextItemWidth(200);
+        if (ImGui.SliderFloat("Gamma##gamma", ref gamma, 0.1f, 3.0f, "%.2f"))
+        {
+            _config.Gamma = gamma;
+            _config.Save();
+        }
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("1.0 = no change. >1 darkens midtones; <1 lifts them.");
+
+        float contrast = _config.Contrast;
+        ImGui.SetNextItemWidth(200);
+        if (ImGui.SliderFloat("Contrast##contrast", ref contrast, 0.0f, 3.0f, "%.2f"))
+        {
+            _config.Contrast = contrast;
+            _config.Save();
+        }
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("1.0 = no change. >1 = more contrast; <1 = flat/grey.");
+
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Reset##curves"))
+        {
+            _config.Gamma    = 1.0f;
+            _config.Contrast = 1.0f;
+            _config.Save();
+        }
+
+        ImGui.Separator();
 
         var tint = new Vector4(_config.TintR, _config.TintG, _config.TintB, _config.TintA);
         if (ImGui.ColorEdit4("Tint color", ref tint))
@@ -717,5 +810,28 @@ public sealed class MainWindow
             _config.TintA = tint.W;
             _config.Save();
         }
+
+        ImGui.Separator();
+
+        ImGui.TextDisabled("yt-dlp path (host only — needed for YouTube):");
+        if (ImGui.InputText("##ytdlppath", ref _ytDlpPathBuffer, 512,
+                            ImGuiInputTextFlags.EnterReturnsTrue))
+        {
+            _config.YtDlpPath = _ytDlpPathBuffer;
+            _config.Save();
+        }
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Apply##ytd"))
+        {
+            _config.YtDlpPath = _ytDlpPathBuffer;
+            _config.Save();
+        }
+        ImGui.TextDisabled("(Leave empty to auto-find yt-dlp.exe in plugin folder)");
+
+        if (_config.SyncMode == NetworkMode.Client)
+            ImGui.TextColored(new Vector4(1f, 0.8f, 0.2f, 1f),
+                "yt-dlp runs on the host only — not needed for clients.");
+
+        ImGui.End();
     }
 }

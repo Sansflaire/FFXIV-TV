@@ -54,6 +54,20 @@ solid color placeholder or an image loaded from disk.
 
 ---
 
+## Phase 2 Injection Fixes (v0.5.34)
+
+- [x] v0.5.34: Fix backbuffer learning — replace broken OMGetRenderTargets-at-Draw() with _pendingLearnBackbuffer + texture ptr matching via GetResource()
+- [x] v0.5.35: Inject on 2nd backbuffer bind (not 1st) — 1st bind is 3D→backbuffer composite which overwrites our pixels
+- [x] v0.5.36: Hook DrawIndexed (vtable[12]) + Draw (vtable[13]); inject after first draw call on backbuffer (composite blit) so 2D UI draws on top — no 2nd bind exists
+- [x] v0.5.37: Inject at ClearRTV on surfaces that are in _inUiPassRtvPtrs (cleared+drawn-to during UI pass = HUD RT); DrawIndexed fallback kept
+- [x] v0.5.38: Inject into LAST cleared intermediate RT before composite fires (not first); add PSGetShaderResources logging to identify composite SRV inputs definitively
+- [x] v0.5.39: Fix _frameInjectionDone not reset on Draw() early return; fix ClearRTV filter too restrictive; store composite input tex ptr and create RTV for direct injection; restore backbuffer RT after inject
+- [x] v0.5.40: Add PrepareHooks(screen) to D3DRenderer — runs unconditionally from Plugin.cs so backbuffer learning fires even in DrawPlaceholder path; add DrawIndexedDetour diagnostic logs
+- [x] v0.5.41: Diagnosed render pipeline timing — composite DrawIndexed fires BEFORE OMSetRT(backbuffer); removed _currentBbRtvPtr != 0 gate from outer condition; confirmed inject fires ~900 frames; identified D3D11 SRV hazard as reason rect stays invisible
+- [x] v0.5.43: Fix D3D11 SRV hazard — save PS SRV[0] before compositeInputRtv inject, restore it after; remove stale _currentBbRtvPtr != 0 gate from outer DrawIndexedDetour condition
+
+---
+
 ## Phase 2 — D3D11 World-Space Rendering (Proper Depth)
 
 Goal: Replace the ImGui overlay with actual D3D11 geometry injected into the render pipeline
@@ -309,6 +323,7 @@ Goal: Host PC serves a WebSocket server; all connected clients play the same con
 - [x] Fix: hook ClearRenderTargetView (vtable[50]); call Original first then draw; rect now stable and visible with correct depth testing (v0.5.24)
 - [x] Fix: FFXIV swapchain double-buffering causes 30 Hz flicker — HashSet tracks all backbuffer RTV ptrs; fallback no longer blocked by _frameInjectionDone (v0.5.25)
 - [ ] Fix: chat box panel background still renders BEHIND rect (ClearRTV fires after chat background draw) — see BROKEN.md active issue
+- [x] Fix: ALL base game UI hidden behind rect — ClearRTV ptr-matching fails because FFXIV clears intermediate scene buffer (not DXGI backbuffer); replace ptr check with _inUiPass transition detection (v0.5.30)
 - [x] Improve sampler quality: anisotropic filtering (16x) for screens at steep angles
 - [x] Revert UNorm_SRgb texture change (caused double-gamma darkening — FFXIV RT is linear UNorm)
 - [x] Add per-screen brightness multiplier (PS shader cbuffer b2, slider 0.0–4.0, default 1.0)

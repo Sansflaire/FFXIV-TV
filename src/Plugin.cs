@@ -35,6 +35,10 @@ public sealed class Plugin : IDalamudPlugin
     private readonly VideoPlayer      _videoPlayer;
     private bool _videoSetupDone;
 
+    // Phase 3.7: Browser mode via WebView2
+    private readonly BrowserPlayer    _browserPlayer;
+    private bool _browserSetupDone;
+
     // Phase 4: Network sync (host/client)
     private readonly SyncCoordinator _sync;
 
@@ -47,9 +51,11 @@ public sealed class Plugin : IDalamudPlugin
         _screenRenderer = new ScreenRenderer(GameGui, TextureProvider);
         _d3dRenderer    = new D3DRenderer(GameInterop);
         _videoPlayer    = new VideoPlayer(PluginInterface.AssemblyLocation.DirectoryName!);
+        _browserPlayer  = new BrowserPlayer(PluginInterface.AssemblyLocation.DirectoryName!);
         _sync           = new SyncCoordinator(_videoPlayer);
         _mainWindow     = new MainWindow(Config, ObjectTable);
         _mainWindow.SetSync(_sync);
+        _mainWindow.SetBrowserPlayer(_browserPlayer);
 
         _sync.Volume = Config.Volume;
         _sync.Muted  = Config.Muted;
@@ -90,6 +96,7 @@ public sealed class Plugin : IDalamudPlugin
         CommandManager.RemoveHandler(CmdMain);
         _sync.Dispose();
         _videoPlayer.Dispose();
+        _browserPlayer.Dispose();
         _d3dRenderer.Dispose();
         _screenRenderer.Dispose();
         Config.Save();
@@ -200,6 +207,18 @@ public sealed class Plugin : IDalamudPlugin
             _videoSetupDone = true;
         }
 
+        // Wire BrowserPlayer to the D3D device once (first frame after D3D init).
+        if (_d3dRenderer.IsAvailable && !_browserSetupDone && _d3dRenderer.Device != null)
+        {
+            _browserPlayer.SetDevice(_d3dRenderer.Device);
+            _d3dRenderer.SetBrowserPlayer(_browserPlayer);
+            _browserSetupDone = true;
+
+            // Auto-navigate if browser mode was active when plugin was reloaded.
+            if (Config.ActiveMode == ContentMode.Browser && !string.IsNullOrEmpty(Config.BrowserUrl))
+                _browserPlayer.Navigate(Config.BrowserUrl);
+        }
+
         // Keep sync mode, yt-dlp path, and playlist state current each frame.
         _sync.Mode          = Config.SyncMode;
         _sync.YtDlpPath     = Config.YtDlpPath;
@@ -218,10 +237,19 @@ public sealed class Plugin : IDalamudPlugin
         if (_d3dRenderer.IsAvailable)
         {
             _d3dRenderer.Brightness = Config.Brightness;
+            _d3dRenderer.Gamma      = Config.Gamma;
+            _d3dRenderer.Contrast   = Config.Contrast;
             _d3dRenderer.Tint       = new Vector4(Config.TintR, Config.TintG, Config.TintB, Config.TintA);
 
             // Only load the image texture when in Image mode.
             _d3dRenderer.SetImagePath(Config.ActiveMode == ContentMode.Image ? Config.ImagePath : string.Empty);
+
+            // CRITICAL: PrepareHooks must run every frame regardless of which draw path is taken.
+            // Without this, the DrawPlaceholder path (Image mode + no image) never sets
+            // _pendingLearnBackbuffer, breaking the entire backbuffer-learning cascade and
+            // preventing any injection from firing. Draw() and DrawBlack() also call PrepareHooks
+            // internally so the double-call is harmless (idempotent).
+            _d3dRenderer.PrepareHooks(screen);
 
             // Always call D3DRenderer.Draw() in video modes so UploadFrame() runs and
             // the GPU texture is created on the first decoded frame.

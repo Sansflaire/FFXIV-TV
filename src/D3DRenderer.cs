@@ -1,9 +1,7 @@
 using System;
-using System.Collections.Generic;
 using System.IO;
 using System.Numerics;
 using System.Runtime.InteropServices;
-using Dalamud.Bindings.ImGui;
 using Dalamud.Hooking;
 using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.Game.Control;
@@ -63,32 +61,100 @@ public sealed unsafe class D3DRenderer : IDisposable
     private ID3D11DepthStencilState? _dsReverseZ;
     private ID3D11SamplerState?      _sampler;
 
-    // DSV tracking via OMSetRenderTargets vtable hook.
+    // ── Vtable hook delegates ─────────────────────────────────────────────────
+    // FFXIV's ImmediateContext uses STANDARD absolute D3D11 vtable indices.
+    // (IUnknown[0-2] + ID3D11DeviceChild[3-6] + ID3D11DeviceContext[7+])
+    // Confirmed working: OMSetRenderTargets=33, ClearRTV=50.
+
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
     private delegate void OMSetRenderTargetsDelegate(
         nint pContext, uint numViews, nint* ppRTVs, nint pDSV);
 
-    // Injection via ClearRenderTargetView vtable hook.
-    // FFXIV clears the backbuffer before drawing native 2D UI; we inject our draw right after
-    // the clear so native UI renders on top of our TV (correct depth ordering).
+    // ClearRenderTargetView (vtable[50]): kept for potential future use.
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
-    private unsafe delegate void ClearRenderTargetViewDelegate(
+    private delegate void ClearRenderTargetViewDelegate(
         nint pContext, nint pRTV, float* pColorRGBA);
 
-    private Hook<OMSetRenderTargetsDelegate>?     _omSetRTHook;
-    private Hook<ClearRenderTargetViewDelegate>?  _clearRtvHook;
-    private ID3D11DepthStencilView?           _trackedDsv;
-    private nint                              _contextPtr;
+    // DrawIndexed (vtable[12]) + Draw (vtable[13]): injection point (v0.5.36+).
+    // FFXIV does NOT rebind the backbuffer between the 3D composite blit and
+    // the 2D UI draws — only one OMSetRenderTargets on the backbuffer per frame.
+    // We inject AFTER the first Draw/DrawIndexed call on the backbuffer (composite),
+    // so subsequent 2D UI draw calls (chat, hotbar, map) render on top of our rect.
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate void DrawIndexedDelegate(
+        nint pContext, uint indexCount, uint startIndexLocation, int baseVertexLocation);
+
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate void DrawDelegate(
+        nint pContext, uint vertexCount, uint startVertexLocation);
+
+    private Hook<OMSetRenderTargetsDelegate>?      _omSetRTHook;
+    private Hook<ClearRenderTargetViewDelegate>?   _clearRtvHook;
+    private Hook<DrawIndexedDelegate>?             _drawIndexedHook;
+    private Hook<DrawDelegate>?                    _drawHook;
+
+    private ID3D11DepthStencilView? _trackedDsv;
+    private nint                    _contextPtr;
     private bool _dsvLoggedOnce;
     private int  _cbkFrameCount;
 
-    // Backbuffer RTV pointers learned at ImGui-time via OMGetRenderTargets.
-    // FFXIV may double- or triple-buffer its swapchain, so multiple RTVs rotate per frame.
-    // The hook matches any pointer in this set to find the true 2D UI injection point.
-    private readonly HashSet<nint> _knownBackbufferRtvPtrs = new();
-    // Set when inline draw fires; reset by Draw(). Draw() skips the fallback if true.
+    // 3D→2D transition detection. OMSetRenderTargets tracks whether the previous call
+    // bound a DSV (3D scene pass). When it switches to no-DSV (2D UI pass), _inUiPass is
+    // set to true so the ClearRTV inject knows it's in the right phase.
+    private bool _prevCallHadDsv   = false;
+    private bool _inUiPass         = false;
+    // Set by ClearRTV inject to prevent double-injection in the same frame.
+    // Reset by Draw()/DrawBlack() at ImGui time.
     private volatile bool _frameInjectionDone = false;
-    private volatile bool _cachedDrawReady = false;
+
+    // Backbuffer identification.
+    // OMGetRenderTargets at Draw() time returns null because Draw() fires during ImGui
+    // command-collection phase — Dalamud hasn't bound the backbuffer yet (that happens
+    // in ImGui_ImplDX11_RenderDrawData, which runs AFTER all Draw() callbacks).
+    // We learn the backbuffer texture ptr from that first no-DSV OMSetRenderTargets call
+    // after Draw() returns (_pendingLearnBackbuffer). We then match by TEXTURE pointer
+    // (GetResource) rather than RTV pointer, because FFXIV and Dalamud may create separate
+    // RTV COM objects for the same underlying backbuffer texture.
+    private readonly System.Collections.Generic.HashSet<nint> _knownBackbufferTexturePtrs = new();
+    private readonly System.Collections.Generic.HashSet<nint> _knownBackbufferRtvPtrs     = new();
+    private readonly System.Collections.Generic.HashSet<nint> _checkedRtvPtrs             = new();
+    private volatile bool _pendingLearnBackbuffer = false;
+    private int _diagOmsetNodsv = 0;
+    // Counts how many times the known backbuffer RTV is bound during _inUiPass each frame.
+    // Confirmed (v0.5.35 diagnostics): only 1 bind per frame. The 1st (and only) bind is
+    // the 3D→backbuffer composite. 2D UI draws follow on the SAME bind without rebinding.
+    private int _bbBindCountThisUiPass = 0;
+    // All intermediate (non-backbuffer) RTV ptrs seen via OMSetRenderTargets during _inUiPass.
+    // Populated lazily across frames (never reset).
+    private readonly System.Collections.Generic.HashSet<nint> _inUiPassRtvPtrs = new();
+    // Maps intermediate RTV ptr → underlying texture ptr (for cross-referencing composite SRVs).
+    // Populated alongside _inUiPassRtvPtrs when GetResource() is called for bb-check.
+    private readonly System.Collections.Generic.Dictionary<nint, nint> _rtvToTexture = new();
+    // Raw ptr of the backbuffer RTV currently bound (non-zero after first bb bind during _inUiPass).
+    private nint _currentBbRtvPtr = 0;
+    // Total bb-bind log entries emitted (prevents per-frame spam after pattern is confirmed).
+    private int _bbBindLogCount = 0;
+    // Most recently cleared intermediate RT during _inUiPass (updated each matching ClearRTV call).
+    // This is the injection target: we draw into it BEFORE the composite DrawIndexed reads it.
+    // "Last cleared" heuristic: post-processing surfaces are cleared early; the SDR/HUD RT is
+    // cleared late (just before content is drawn to it), so _lastClearedUiPassRtvPtr converges
+    // to the final composited surface — the correct injection point.
+    private nint _lastClearedUiPassRtvPtr = 0;
+    // Set to true once the composite SRV inputs have been logged (one-shot diagnostic).
+    private bool _compositeInputsLogged = false;
+    // Texture ptr of the composite input surface (SRV[0] at composite DrawIndexed time).
+    // Stored by LogCompositeInputs; used to create _compositeInputRtv for direct injection.
+    private nint _compositeInputTexPtr = 0;
+    // Cached RTV created from _compositeInputTexPtr. We inject our rect into this surface
+    // BEFORE the composite DrawIndexed reads it as an SRV and blits it to the backbuffer.
+    private ID3D11RenderTargetView? _compositeInputRtv = null;
+    // Diagnostic counter for DrawDetour injection logging (throttled).
+    private int _drawDrvEligCount = 0;
+    // Diagnostic counter for OMSetRenderTargets injection logging (throttled).
+    private int _omSetRtInjectCount = 0;
+    // Cached result of DSV vs backbuffer dimension check.
+    // null = not yet checked; true = compatible (use depth); false = mismatch (no depth).
+    private bool? _depthCompatible = null;
 
     // 1×1 black RGBA texture — safety fallback.
     private static readonly byte[] _blackPixelData = { 0, 0, 0, 255 };
@@ -111,13 +177,10 @@ public sealed unsafe class D3DRenderer : IDisposable
     public bool HasTexture  => _imageSrv != null || (_videoPlayer?.HasTexture == true) || (_browserPlayer?.HasTexture == true);
 
     private ID3D11ShaderResourceView? _activeSrv;
-    private bool _drawPending;
 
-    // Stored each Draw() call for use in the render-thread callback.
+    // Stored each Draw() call for use in the ClearRTV inject (one frame stale — intentional).
     private Matrix4x4        _storedViewProj;
     private ScreenDefinition? _storedScreen;
-
-    private readonly ImDrawCallback _renderCallback;
 
     // ── Cbuffer layout ────────────────────────────────────────────────────────
     // Single 160-byte cbuffer at register b0, bound to both VS and PS.
@@ -188,8 +251,7 @@ float4 main(VSOut input) : SV_TARGET {
     // ── Constructor ───────────────────────────────────────────────────────────
     public D3DRenderer(IGameInteropProvider interop)
     {
-        _interop        = interop;
-        _renderCallback = new ImDrawCallback(ExecuteDrawCallback);
+        _interop = interop;
     }
 
     // ── Init ──────────────────────────────────────────────────────────────────
@@ -238,19 +300,29 @@ float4 main(VSOut input) : SV_TARGET {
     {
         nint* vtable = *(nint**)_contextPtr;
 
-        // vtable[33] = OMSetRenderTargets — for DSV tracking and backbuffer detection.
+        // vtable[33] = OMSetRenderTargets — DSV tracking + backbuffer identification.
         _omSetRTHook = _interop.HookFromAddress<OMSetRenderTargetsDelegate>(
             vtable[33], OMSetRenderTargetsDetour);
         _omSetRTHook.Enable();
 
-        // vtable[50] = ClearRenderTargetView — injection point.
-        // FFXIV clears the backbuffer before 2D UI; we draw immediately after the clear
-        // so native chat/hotbar/map renders on top of our TV.
+        // vtable[50] = ClearRenderTargetView — kept, no active injection.
         _clearRtvHook = _interop.HookFromAddress<ClearRenderTargetViewDelegate>(
             vtable[50], ClearRenderTargetViewDetour);
         _clearRtvHook.Enable();
 
-        Plugin.Log.Info("[FFXIV-TV] OMSetRenderTargets + ClearRenderTargetView hooks installed.");
+        // vtable[12] = DrawIndexed, vtable[13] = Draw — injection point (v0.5.36+).
+        // FFXIV has only ONE backbuffer OMSetRenderTargets per frame (confirmed v0.5.35).
+        // We inject AFTER the first draw call on the backbuffer (3D composite blit) so
+        // all subsequent 2D UI draw calls render on top of our rect.
+        _drawIndexedHook = _interop.HookFromAddress<DrawIndexedDelegate>(
+            vtable[12], DrawIndexedDetour);
+        _drawIndexedHook.Enable();
+
+        _drawHook = _interop.HookFromAddress<DrawDelegate>(
+            vtable[13], DrawDetour);
+        _drawHook.Enable();
+
+        Plugin.Log.Info("[FFXIV-TV] OMSetRenderTargets + ClearRTV + DrawIndexed + Draw hooks installed.");
     }
 
     private void OMSetRenderTargetsDetour(nint pCtx, uint numViews, nint* ppRTVs, nint pDSV)
@@ -259,19 +331,148 @@ float4 main(VSOut input) : SV_TARGET {
         {
             if (pCtx == _contextPtr)
             {
-                // Track the main-scene DSV for depth testing in inline draws.
-                // Only capture when both RTV and DSV are bound (main 3D scene pass).
-                // Shadow passes (numViews=0, pDSV=shadowDSV) are excluded by the RTV check.
-                bool thisCallHasDsv = pDSV != 0 && numViews > 0 && ppRTVs != null && ppRTVs[0] != 0;
-                if (thisCallHasDsv)
+                // Only consider calls that bind at least one RTV (ignore depth-only shadow passes).
+                bool hasRtvs = numViews > 0 && ppRTVs != null && ppRTVs[0] != 0;
+                if (hasRtvs)
                 {
-                    _trackedDsv?.Dispose();
-                    _trackedDsv = new ID3D11DepthStencilView(pDSV);
-                    _trackedDsv.AddRef();
-                    if (!_dsvLoggedOnce)
+                    bool hasDsv = pDSV != 0;
+
+                    // Track the main-scene DSV for depth testing during our inject.
+                    // Only update BEFORE _inUiPass — once we enter post-processing/2D, freeze it.
+                    // Post-processing passes may bind DSVs with different dimensions (would mismatch BB).
+                    if (hasDsv && !_inUiPass)
                     {
-                        _dsvLoggedOnce = true;
-                        Plugin.Log.Info($"[FFXIV-TV] main-scene DSV captured: 0x{pDSV:X}");
+                        _trackedDsv?.Dispose();
+                        _trackedDsv = new ID3D11DepthStencilView(pDSV);
+                        _trackedDsv.AddRef();
+                        _depthCompatible = null; // reset check when DSV changes
+                        if (!_dsvLoggedOnce)
+                        {
+                            _dsvLoggedOnce = true;
+                            Plugin.Log.Info($"[FFXIV-TV] main-scene DSV captured: 0x{pDSV:X}");
+                        }
+                    }
+
+                    // Detect 3D→2D transition: first RTV-binding no-DSV call after a DSV call.
+                    if (!hasDsv && _prevCallHadDsv)
+                        _inUiPass = true;
+
+                    _prevCallHadDsv = hasDsv;
+
+                    if (!hasDsv)
+                    {
+                        nint rtvPtr = ppRTVs[0];
+
+                        // STEP A: Learn backbuffer texture ptr from Dalamud's ImGui bind.
+                        // _pendingLearnBackbuffer is set by Draw()/DrawBlack(). The first
+                        // no-DSV OMSetRenderTargets after Draw() returns is
+                        // ImGui_ImplDX11_RenderDrawData binding the swapchain backbuffer.
+                        if (_pendingLearnBackbuffer)
+                        {
+                            _pendingLearnBackbuffer = false;
+                            if (!_checkedRtvPtrs.Contains(rtvPtr))
+                            {
+                                _checkedRtvPtrs.Add(rtvPtr);
+                                try
+                                {
+                                    // Wrap as ID3D11View to access Resource property
+                                    // (Vortice does not expose base-class members on derived types).
+                                    var lv = new ID3D11View(rtvPtr);
+                                    lv.AddRef();
+                                    try
+                                    {
+                                        using var lres = lv.Resource;
+                                        nint texPtr = lres.NativePointer;
+                                        if (_knownBackbufferTexturePtrs.Add(texPtr))
+                                            Plugin.Log.Info($"[FFXIV-TV] bb-tex learned (ImGui bind): rtv=0x{rtvPtr:X} tex=0x{texPtr:X}");
+                                    }
+                                    finally { lv.Dispose(); }
+                                }
+                                catch (Exception ex) { Plugin.Log.Warning($"[FFXIV-TV] learn bb-tex failed: {ex.Message}"); }
+                            }
+                        }
+
+                        // STEP B: During inUiPass, identify and inject on the backbuffer bind.
+                        if (_inUiPass)
+                        {
+                            // Track all intermediate (non-backbuffer) RTV ptrs seen during _inUiPass.
+                            // Used by ClearRTV hook to find the 2D HUD RT (cleared+drawn-to surface).
+                            if (!_knownBackbufferRtvPtrs.Contains(rtvPtr))
+                                _inUiPassRtvPtrs.Add(rtvPtr);
+
+                            // Check if this RTV is backed by a known backbuffer texture.
+                            if (!_knownBackbufferRtvPtrs.Contains(rtvPtr)
+                                && !_checkedRtvPtrs.Contains(rtvPtr)
+                                && _knownBackbufferTexturePtrs.Count > 0)
+                            {
+                                _checkedRtvPtrs.Add(rtvPtr);
+                                try
+                                {
+                                    var cv = new ID3D11View(rtvPtr);
+                                    cv.AddRef();
+                                    try
+                                    {
+                                        using var cres = cv.Resource;
+                                        nint texPtr = cres.NativePointer;
+                                        bool isBB = _knownBackbufferTexturePtrs.Contains(texPtr);
+                                        if (_diagOmsetNodsv < 20)
+                                        {
+                                            _diagOmsetNodsv++;
+                                            Plugin.Log.Info($"[FFXIV-TV] OMSetRT inUiPass rtv=0x{rtvPtr:X} tex=0x{texPtr:X} isBB={isBB}");
+                                        }
+                                        if (isBB)
+                                        {
+                                            _knownBackbufferRtvPtrs.Add(rtvPtr);
+                                        }
+                                        else
+                                        {
+                                            // Store texture ptr for cross-referencing composite SRV inputs later.
+                                            _rtvToTexture[rtvPtr] = texPtr;
+                                        }
+                                    }
+                                    finally { cv.Dispose(); }
+                                }
+                                catch (Exception ex) { Plugin.Log.Warning($"[FFXIV-TV] check bb-rtv failed: {ex.Message}"); }
+                            }
+
+                            // When the known backbuffer is bound, inject into the currently-bound
+                            // intermediate RT BEFORE Original fires.
+                            // Hypothesis: intermediate has 3D (post-processed) but not HUD yet.
+                            // After our inject, Original binds BB. FFXIV Draw calls copy intermediate
+                            // (now with rect) → BB, then add HUD on top → HUD renders in front.
+                            if (_knownBackbufferRtvPtrs.Contains(rtvPtr))
+                            {
+                                _bbBindCountThisUiPass++;
+                                _currentBbRtvPtr = rtvPtr;
+                                if (_bbBindLogCount < 3)
+                                {
+                                    _bbBindLogCount++;
+                                    Plugin.Log.Info($"[FFXIV-TV] bb bind #{_bbBindCountThisUiPass} rtv=0x{rtvPtr:X}");
+                                }
+
+                                // Approach: inject into intermediate RT at BB-bind moment.
+                                // ExecuteInlineDraw will re-enter OMSetRenderTargetsDetour when it
+                                // sets/restores RTs — those re-entrant calls are harmless (_frameInjectionDone).
+                                if (!_frameInjectionDone && _initialized && _storedScreen != null
+                                    && _dsReverseZ != null && _dsNoDepth != null && _cbParams != null)
+                                {
+                                    var intermediateRtvArr = new ID3D11RenderTargetView[1];
+                                    _context!.OMGetRenderTargets(1u, intermediateRtvArr, out var intermediateDsv);
+                                    if (intermediateRtvArr[0] != null)
+                                    {
+                                        _frameInjectionDone = true;
+                                        _omSetRtInjectCount++;
+                                        if (_omSetRtInjectCount <= 5 || _omSetRtInjectCount % 300 == 0)
+                                            Plugin.Log.Info($"[FFXIV-TV] OMSetRT inject #{_omSetRtInjectCount} into intermediate=0x{intermediateRtvArr[0].NativePointer:X}");
+                                        bool useDepth = CheckDepthCompatibility(intermediateRtvArr[0]);
+                                        try { ExecuteInlineDraw(intermediateRtvArr[0], useDepth); }
+                                        catch (Exception ex) { Plugin.Log.Warning($"[FFXIV-TV] OMSetRT inject failed: {ex.Message}"); }
+                                    }
+                                    intermediateRtvArr[0]?.Dispose();
+                                    intermediateDsv?.Dispose();
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -286,61 +487,254 @@ float4 main(VSOut input) : SV_TARGET {
         }
     }
 
-    private unsafe void ClearRenderTargetViewDetour(nint pCtx, nint pRTV, float* pColorRGBA)
+    private void ClearRenderTargetViewDetour(nint pCtx, nint pRTV, float* pColorRGBA)
     {
-        // Call Original FIRST — we draw on top of the clear, not before it.
-        // The clear wipes the backbuffer; our TV draw fires immediately after so
-        // native 2D UI (chat/hotbar/map) then renders on top of our TV.
-        _clearRtvHook?.Original(pCtx, pRTV, pColorRGBA);
+        // Track (don't inject here). Record the most recently cleared non-backbuffer RT during
+        // _inUiPass. DrawIndexed/Draw detour uses this as a fallback injection target.
+        // NOTE: the ClearRTV-cleared surface may have been bound WITH a DSV during the 3D pass
+        // and therefore NOT appear in _inUiPassRtvPtrs. The v0.5.38 filter (_inUiPassRtvPtrs)
+        // was too restrictive — it excluded valid surfaces. Filter only on !backbuffer.
         try
         {
-            if (pCtx == _contextPtr
-                && _knownBackbufferRtvPtrs.Contains(pRTV)
-                && !_frameInjectionDone
-                && _initialized && _activeSrv != null && _storedScreen != null
-                && _dsReverseZ != null && _dsNoDepth != null && _cbParams != null)
+            if (pCtx == _contextPtr && _inUiPass && !_knownBackbufferRtvPtrs.Contains(pRTV))
             {
-                _frameInjectionDone = true;
-                _drawPending     = false;
-                _cachedDrawReady = false;
-                var inlineRtv = new ID3D11RenderTargetView(pRTV);
-                inlineRtv.AddRef();
-                try { ExecuteInlineDraw(inlineRtv); }
-                catch (Exception ex) { Plugin.Log.Warning($"[FFXIV-TV] clear-hook draw failed: {ex.Message}"); }
-                finally { inlineRtv.Dispose(); }
+                _lastClearedUiPassRtvPtr = pRTV;
+                // Sequence log (first 3 frames only — helps identify the HUD RT in the log).
+                if (_cbkFrameCount < 3)
+                    Plugin.Log.Info($"[FFXIV-TV] ClearRTV seq: ptr=0x{pRTV:X} frame={_cbkFrameCount}");
             }
         }
         catch (Exception ex)
         {
             Plugin.Log.Warning($"[FFXIV-TV] ClearRenderTargetViewDetour exception: {ex.GetType().Name}: {ex.Message}");
         }
+        finally
+        {
+            _clearRtvHook?.Original(pCtx, pRTV, pColorRGBA);
+        }
     }
 
-    private void ExecuteInlineDraw(ID3D11RenderTargetView rtv)
+    // DrawIndexedDetour: bookkeeping + sequential DrawIndexed diagnostics.
+    // DrawIndexed calls fire BEFORE OMSetRenderTargets(backbuffer), so _currentBbRtvPtr is
+    // always 0 here. Injection is handled by DrawDetour (fires after BB bind).
+    // Diagnostic: log each DrawIndexed during _inUiPass (index count + current RT + SRV[0] tex)
+    // to find which DrawIndexed is the true final composite before the BB bind.
+    private void DrawIndexedDetour(nint pCtx, uint indexCount, uint startIndex, int baseVertex)
     {
-        if (_context == null || _activeSrv == null || _storedScreen == null) return;
+        bool calledOriginal = false;
+        try
+        {
+            if (pCtx == _contextPtr && _inUiPass && _rtvToTexture.Count > 0)
+            {
+                if (!_compositeInputsLogged)
+                    LogCompositeInputs();
 
-        var depthState = _trackedDsv != null ? _dsReverseZ! : _dsNoDepth!;
+                if (_compositeInputTexPtr != 0 && _compositeInputRtv == null && _device != null)
+                {
+                    try
+                    {
+                        var tex = new ID3D11Texture2D(_compositeInputTexPtr);
+                        tex.AddRef();
+                        try { _compositeInputRtv = _device.CreateRenderTargetView(tex, null); }
+                        finally { tex.Dispose(); }
+                        Plugin.Log.Info($"[FFXIV-TV] Created composite input RTV for tex=0x{_compositeInputTexPtr:X}");
+                    }
+                    catch (Exception ex)
+                    {
+                        Plugin.Log.Warning($"[FFXIV-TV] CreateRenderTargetView(compositeInput) failed: {ex.Message}");
+                        _compositeInputTexPtr = 0;
+                    }
+                }
+
+                // Diagnostic: log every DrawIndexed during _inUiPass for the first few frames.
+                // Shows call order, index counts, and which texture is in SRV[0] at each step.
+                // Goal: identify which DrawIndexed is the true final composite (last one before BB bind).
+                if (_cbkFrameCount < 3)
+                {
+                    try
+                    {
+                        var rtvArr = new ID3D11RenderTargetView[1];
+                        _context!.OMGetRenderTargets(1u, rtvArr, out var dsv);
+                        var srvArr = new ID3D11ShaderResourceView[1];
+                        _context.PSGetShaderResources(0, srvArr);
+                        nint rtvPtr = rtvArr[0]?.NativePointer ?? 0;
+                        nint srvTex = 0;
+                        if (srvArr[0] != null)
+                        {
+                            try { using var res = srvArr[0]!.Resource; srvTex = res.NativePointer; }
+                            catch { /* ignore */ }
+                        }
+                        bool isCompositeSrv = srvTex == _compositeInputTexPtr && _compositeInputTexPtr != 0;
+                        Plugin.Log.Info($"[FFXIV-TV] DrawIndexed seq frame={_cbkFrameCount} idx={indexCount} rt=0x{rtvPtr:X} srv0tex=0x{srvTex:X} isCompositeSrv={isCompositeSrv}");
+                        rtvArr[0]?.Dispose();
+                        dsv?.Dispose();
+                        srvArr[0]?.Dispose();
+                    }
+                    catch (Exception ex) { Plugin.Log.Warning($"[FFXIV-TV] DrawIndexed diag failed: {ex.Message}"); }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Plugin.Log.Warning($"[FFXIV-TV] DrawIndexedDetour exception: {ex.GetType().Name}: {ex.Message}");
+        }
+        finally
+        {
+            if (!calledOriginal)
+                _drawIndexedHook?.Original(pCtx, indexCount, startIndex, baseVertex);
+        }
+    }
+
+    // DrawDetour: injection point. Draw() calls fire after OMSetRenderTargets(backbuffer),
+    // so _currentBbRtvPtr != 0 here. Call Original first (lets FFXIV's draw run), then inject
+    // with useDepth=true so 3D geometry/characters correctly occlude our rect (reversed-Z DSV).
+    private void DrawDetour(nint pCtx, uint vertexCount, uint startVertex)
+    {
+        bool calledOriginal = false;
+        try
+        {
+            if (pCtx == _contextPtr && _inUiPass && _currentBbRtvPtr != 0
+                && !_frameInjectionDone
+                && _initialized && _storedScreen != null
+                && _dsReverseZ != null && _dsNoDepth != null && _cbParams != null)
+            {
+                _frameInjectionDone = true;
+                calledOriginal = true;
+                _drawHook?.Original(pCtx, vertexCount, startVertex);
+
+                _drawDrvEligCount++;
+                if (_drawDrvEligCount <= 5 || _drawDrvEligCount % 300 == 0)
+                    Plugin.Log.Info($"[FFXIV-TV] Draw inject #{_drawDrvEligCount} into bb=0x{_currentBbRtvPtr:X} dsv={_trackedDsv != null}");
+
+                var bbRtv = new ID3D11RenderTargetView(_currentBbRtvPtr);
+                bbRtv.AddRef();
+                try
+                {
+                    bool useDepth = CheckDepthCompatibility(bbRtv);
+                    ExecuteInlineDraw(bbRtv, useDepth);
+                }
+                catch (Exception ex) { Plugin.Log.Warning($"[FFXIV-TV] Draw inject failed: {ex.Message}"); }
+                finally { bbRtv.Dispose(); }
+            }
+        }
+        catch (Exception ex)
+        {
+            Plugin.Log.Warning($"[FFXIV-TV] DrawDetour exception: {ex.GetType().Name}: {ex.Message}");
+        }
+        finally
+        {
+            if (!calledOriginal)
+                _drawHook?.Original(pCtx, vertexCount, startVertex);
+        }
+    }
+
+    // Check whether _trackedDsv can be safely paired with the given RTV (same texture dimensions).
+    // D3D11 silently renders nothing if DSV and RTV sizes differ — no exception, no visible rect.
+    // Result is cached in _depthCompatible; recomputed whenever _trackedDsv changes (new frame DSV).
+    private bool CheckDepthCompatibility(ID3D11RenderTargetView bbRtv)
+    {
+        if (_trackedDsv == null) return false;
+        if (_depthCompatible.HasValue) return _depthCompatible.Value;
+
+        try
+        {
+            uint dsvW, dsvH, bbW, bbH;
+
+            using var dsvRes = _trackedDsv.Resource;
+            var dsvTex = new ID3D11Texture2D(dsvRes.NativePointer);
+            dsvTex.AddRef();
+            try { var d = dsvTex.Description; dsvW = d.Width; dsvH = d.Height; }
+            finally { dsvTex.Dispose(); }
+
+            using var bbRes = bbRtv.Resource;
+            var bbTex = new ID3D11Texture2D(bbRes.NativePointer);
+            bbTex.AddRef();
+            try { var d = bbTex.Description; bbW = d.Width; bbH = d.Height; }
+            finally { bbTex.Dispose(); }
+
+            bool ok = (dsvW == bbW && dsvH == bbH);
+            _depthCompatible = ok;
+            Plugin.Log.Info($"[FFXIV-TV] Depth check: dsv={dsvW}x{dsvH} bb={bbW}x{bbH} compatible={ok}");
+            return ok;
+        }
+        catch (Exception ex)
+        {
+            Plugin.Log.Warning($"[FFXIV-TV] Depth check failed: {ex.Message}");
+            _depthCompatible = false;
+            return false;
+        }
+    }
+
+    // useDepth=true: bind _trackedDsv (reversed-Z depth testing — correct for intermediate RTs).
+    // useDepth=false: no DSV — safe for composite input texture which may differ in size from DSV.
+    private void ExecuteInlineDraw(ID3D11RenderTargetView rtv, bool useDepth = true)
+    {
+        if (_context == null || _storedScreen == null) return;
+        // Use active SRV when available; fall back to 1x1 black when _activeSrv is null
+        // (e.g. video stopped, no image loaded) so the rect shape is still visible.
+        var srv = _activeSrv ?? _blackSrv;
+        if (srv == null) return;
+
+        ID3D11DepthStencilView? dsv = useDepth ? _trackedDsv : null;
+        var depthState = dsv != null ? _dsReverseZ! : _dsNoDepth!;
 
         UpdateCbParams();
 
         var saved = SaveState();
         try
         {
-            _context.OMSetRenderTargets(new[] { rtv }, _trackedDsv);
-            SetState(_activeSrv, depthState);
+            _context.OMSetRenderTargets(new[] { rtv }, dsv);
+            SetState(srv, depthState);
             _context.Draw(6, 0);
         }
         finally
         {
             RestoreState(saved);
-            _drawPending = false;
-            // rtv lifetime is managed by the caller (OMSetRenderTargetsDetour) — do NOT Dispose here.
+            // Reset RT to (surface, no DSV) after our draw. Without this, the 3D depth
+            // stencil view we bound stays active for FFXIV's subsequent 2D UI draw calls
+            // (chat panel, hotbar, etc.), which can cause them to fail depth testing and
+            // disappear.
+            _context.OMSetRenderTargets(new[] { rtv }, (ID3D11DepthStencilView?)null);
+            // rtv lifetime is managed by the caller — do NOT Dispose here.
         }
 
         _cbkFrameCount++;
         if (_cbkFrameCount <= 3 || _cbkFrameCount % 300 == 0)
-            Plugin.Log.Info($"[FFXIV-TV] inline draw frame={_cbkFrameCount} dsv={(_trackedDsv != null ? "yes" : "no")}");
+            Plugin.Log.Info($"[FFXIV-TV] inline draw frame={_cbkFrameCount} dsv={dsv != null}");
+    }
+
+    // Log the PS SRV inputs at composite DrawIndexed time; store SRV[0] texture ptr for injection.
+    // _compositeInputsLogged is set to true ONLY on success — failed calls retry next frame.
+    private void LogCompositeInputs()
+    {
+        try
+        {
+            var srvs = new ID3D11ShaderResourceView[8];
+            _context!.PSGetShaderResources(0, srvs);
+            for (int i = 0; i < srvs.Length; i++)
+            {
+                if (srvs[i] == null) continue;
+                try
+                {
+                    using var res = srvs[i].Resource;
+                    nint texPtr = res.NativePointer;
+                    nint matchRtv = 0;
+                    foreach (var kvp in _rtvToTexture)
+                        if (kvp.Value == texPtr) { matchRtv = kvp.Key; break; }
+                    Plugin.Log.Info($"[FFXIV-TV] composite SRV[{i}]: tex=0x{texPtr:X} matchRtv=0x{matchRtv:X}");
+                    // Store SRV[0] as the composite input texture for direct RTV injection.
+                    if (i == 0 && _compositeInputTexPtr == 0)
+                        _compositeInputTexPtr = texPtr;
+                }
+                finally { srvs[i].Dispose(); }
+            }
+            _compositeInputsLogged = true; // mark done only after successful execution
+        }
+        catch (Exception ex)
+        {
+            Plugin.Log.Warning($"[FFXIV-TV] LogCompositeInputs failed: {ex.Message}");
+            // _compositeInputsLogged stays false → retries next eligible frame
+        }
     }
 
     private void CreateResources()
@@ -480,6 +874,31 @@ float4 main(VSOut input) : SV_TARGET {
     }
 
     // ── Per-frame draw ────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Primes hook state for the current frame. MUST be called every frame when D3DRenderer
+    /// is available — even when Draw() is not called (e.g. DrawPlaceholder path in Image mode
+    /// with no image loaded). Ensures _pendingLearnBackbuffer is set so the backbuffer-learning
+    /// cascade fires, and resets per-frame injection flags so DrawIndexedDetour can fire.
+    /// </summary>
+    public void PrepareHooks(ScreenDefinition screen)
+    {
+        if (!_initialized) return;
+
+        _pendingLearnBackbuffer  = true;
+        _inUiPass                = false;
+        _frameInjectionDone      = false;
+        _bbBindCountThisUiPass   = 0;
+        _currentBbRtvPtr         = 0;
+        _lastClearedUiPassRtvPtr = 0;
+
+        var ctrl = Control.Instance();
+        if (ctrl == null) return;
+
+        _storedViewProj = ctrl->ViewProjectionMatrix;
+        _storedScreen   = screen;
+    }
+
     public void Draw(ScreenDefinition screen)
     {
         if (_videoPlayer != null && _context != null)
@@ -492,27 +911,12 @@ float4 main(VSOut input) : SV_TARGET {
             : (_videoPlayer?.HasTexture == true)
                 ? _videoPlayer.FrameSrv
                 : _imageSrv;
-        if (!_initialized || _context == null || _activeSrv == null) return;
 
-        var ctrl = Control.Instance();
-        if (ctrl == null) return;
-
-        _storedViewProj = ctrl->ViewProjectionMatrix;
-        _storedScreen   = screen;
-
-        _cachedDrawReady = true;
-
-        // Read and reset the per-frame injection flag. If the inline draw fired at the
-        // 3D→2D transition earlier this frame, skip the fallback callback — it would draw
-        // AFTER native UI and cover chat/hotbar/map. Reset here so next frame starts clean.
-        bool inlineFiredThisFrame = _frameInjectionDone;
-        _frameInjectionDone = false;
-
-        if (!inlineFiredThisFrame)
-        {
-            _drawPending = true;
-            ImGui.GetBackgroundDrawList().AddCallback(_renderCallback, null);
-        }
+        // PrepareHooks handles all per-frame resets + backbuffer learning signal.
+        // Called here so Draw() remains self-contained (Plugin.cs also calls PrepareHooks
+        // unconditionally before the DrawPlaceholder/Draw branch, so this is a harmless
+        // double-call — same values, idempotent).
+        PrepareHooks(screen);
     }
 
     // Draws the idle gradient screensaver quad (depth-tested).
@@ -522,25 +926,11 @@ float4 main(VSOut input) : SV_TARGET {
         var srv = _gradientSrv ?? _blackSrv;
         if (srv == null) return;
 
-        var ctrl = Control.Instance();
-        if (ctrl == null) return;
-
-        _storedViewProj = ctrl->ViewProjectionMatrix;
-        _storedScreen   = screen;
-
         UpdateGradientTexture();
+        _activeSrv = srv;
 
-        _activeSrv       = srv;
-        _cachedDrawReady = true;
-
-        bool inlineFiredThisFrame = _frameInjectionDone;
-        _frameInjectionDone = false;
-
-        if (!inlineFiredThisFrame)
-        {
-            _drawPending = true;
-            ImGui.GetBackgroundDrawList().AddCallback(_renderCallback, null);
-        }
+        // PrepareHooks handles per-frame resets + backbuffer learning signal.
+        PrepareHooks(screen);
     }
 
     // ── Gradient screensaver ──────────────────────────────────────────────────
@@ -585,45 +975,6 @@ float4 main(VSOut input) : SV_TARGET {
         dst[1] = (byte)((g + m) * 255f);
         dst[2] = (byte)((r + m) * 255f);
         dst[3] = 255;
-    }
-
-    // ── ImGui render callback (fallback) ─────────────────────────────────────
-    private void ExecuteDrawCallback(ImDrawList* parentList, ImDrawCmd* cmd)
-    {
-        if (!_drawPending || _activeSrv == null || _context == null || _storedScreen == null) return;
-        _drawPending     = false;
-        _cachedDrawReady = false;
-
-        var depthState = _trackedDsv != null ? _dsReverseZ! : _dsNoDepth!;
-
-        var rtvBuf = new ID3D11RenderTargetView[1];
-        _context.OMGetRenderTargets(1, rtvBuf, out var currentDsv);
-        var rtv = rtvBuf[0];
-
-        // Learn the backbuffer RTV pointer. FFXIV may use multiple backbuffers (double/triple
-        // buffering), so we collect all pointers seen at ImGui-time into a HashSet. The
-        // ClearRTV hook matches any of these to find the true 2D UI injection point.
-        if (rtv != null)
-            _knownBackbufferRtvPtrs.Add(rtv.NativePointer);
-
-        if (rtv != null)
-            _context.OMSetRenderTargets(new[] { rtv }, _trackedDsv);
-
-        UpdateCbParams();
-        var saved = SaveState();
-        try
-        {
-            SetState(_activeSrv, depthState);
-            _context.Draw(6, 0);
-        }
-        finally
-        {
-            RestoreState(saved);
-            if (rtv != null)
-                _context.OMSetRenderTargets(new[] { rtv }, null);
-            rtv?.Dispose();
-            currentDsv?.Dispose();
-        }
     }
 
     // ── Cbuffer update ────────────────────────────────────────────────────────
@@ -752,10 +1103,16 @@ float4 main(VSOut input) : SV_TARGET {
 
     private void DisposeResources()
     {
+        _compositeInputRtv?.Dispose(); _compositeInputRtv  = null;
+        _compositeInputTexPtr = 0;
         _omSetRTHook?.Disable();
-        _omSetRTHook?.Dispose();   _omSetRTHook   = null;
+        _omSetRTHook?.Dispose();         _omSetRTHook      = null;
         _clearRtvHook?.Disable();
-        _clearRtvHook?.Dispose();  _clearRtvHook  = null;
+        _clearRtvHook?.Dispose();        _clearRtvHook     = null;
+        _drawIndexedHook?.Disable();
+        _drawIndexedHook?.Dispose();     _drawIndexedHook  = null;
+        _drawHook?.Disable();
+        _drawHook?.Dispose();            _drawHook         = null;
         _trackedDsv?.Dispose();   _trackedDsv   = null;
         _activeSrv  = null;
         _gradientSrv?.Dispose();  _gradientSrv  = null;

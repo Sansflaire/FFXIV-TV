@@ -1,80 +1,373 @@
 # FFXIV-TV — Active Issues
 
-Last updated: 2026-03-15 (v0.5.25)
+Last updated: 2026-03-16 (v0.5.47)
 
 ---
 
-## Active Issue — Chat box background renders behind rect
+## THE ONE PROBLEM — Rect not visible in 3D world
 
-**Symptom:** The rect is correctly behind 3D-world characters (depth testing works), and chat text
-renders in front of the rect. However, the dark chat-box panel background is NOT visible — the rect
-color shows through where the background should be, making chat harder to read.
-
-**Hypothesis:** FFXIV's 2D pass rendering order is not fully uniform. The chat panel background
-appears to draw at a different point in the pipeline than the chat text. The current injection point
-(immediately after `ClearRenderTargetView` on the backbuffer) may fire AFTER the chat background
-has already been drawn to the backbuffer, meaning our rect overwrites it. The chat text then draws
-on top of our rect, which is why text is readable but the background is gone.
-
-**What was tried:**
-- v0.5.18: OMSetRenderTargets hook at 3D→2D transition (first no-DSV call). Fired to intermediate
-  FFXIV RT, not backbuffer — draw was invisible.
-- v0.5.23: Learn backbuffer ptr from `ExecuteDrawCallback`, fire OMSetRenderTargets hook when
-  that exact ptr is bound. Correct surface but FFXIV calls ClearRenderTargetView after our draw,
-  wiping our pixels.
-- v0.5.24–v0.5.25: Hook `ClearRenderTargetView` (vtable[50]); call Original first, then draw
-  immediately after. Rect is now stable and visible; depth testing works. BUT: chat background
-  appears behind rect (above hypothesis).
-
-**Next to try:**
-- Add a log counter to ClearRTV detour to see how many times it fires per frame and at what point
-  in the frame each fire happens. If it fires more than once and our `_frameInjectionDone` flag
-  prevents re-injection on the second fire, we may need to inject on a LATER ClearRTV call.
-- Alternatively: try hooking `IDXGISwapChain::Present` (vtable[8]) and drawing just before present
-  — this fires after ALL FFXIV rendering including 2D UI, which would mean we're on top of
-  everything (chat, hotbar, map) but would lose depth-testing against 3D geometry.
+**Goal:** Rect is visible as a D3D11 world-space object, with 2D HUD (chat, hotbar,
+map, inventory) rendering IN FRONT of it.
 
 ---
 
-## Resolved Issues (v0.5.24 – v0.5.25)
+## What We Know For Certain (Confirmed Facts)
 
-| Version | Description | Root Cause | Fix |
-|---------|-------------|------------|-----|
-| v0.5.25 | **Rect flickering rapidly (30 Hz blink)** | FFXIV swapchain double-buffering: FLIP_DISCARD rotates through backbuffer RTV pointers A and B each frame. `_knownBackbufferRtvPtr` (single nint) only captured the first pointer seen. On B-frames, ClearRTV hook condition failed → no injection → `_frameInjectionDone` still true (set by fallback on A-frames) → Draw() skipped fallback too → TV invisible every B-frame → 50% duty cycle = 30 Hz blink. Also: `_frameInjectionDone = true` in `ExecuteDrawCallback` blocked the fallback from running on frames where inline missed, preventing new pointers from being learned. | Replace `_knownBackbufferRtvPtr: nint` with `_knownBackbufferRtvPtrs: HashSet<nint>`. Remove `_frameInjectionDone = true` from `ExecuteDrawCallback` so fallback runs freely and adds all backbuffer pointers to the set. ClearRTV hook uses `_knownBackbufferRtvPtrs.Contains(pRTV)`. |
-| v0.5.24 | **Rect not displaying (ClearRTV wipes inline draw)** | Inline draw at backbuffer bind point (OMSetRenderTargets hook, learned from ExecuteDrawCallback) was correct surface but FFXIV calls `ClearRenderTargetView(backbuffer, black)` after binding it, wiping our pixels before the frame is presented. | Added `ClearRenderTargetView` hook at vtable[50]. Call `Original` first (do the clear), then draw immediately after — FFXIV will not clear again after this point in the frame. |
+1. **BB is bound exactly once per frame** (OMSetRenderTargets, no DSV). There is no second bind.
+   *Source: v0.5.35 diagnostics — `bb bind #1` logged every frame, no `bb bind #2`.*
 
-## Resolved Issues (v0.5.21 – v0.5.23)
+2. **The composite DrawIndexed fires on the BB** (vtable[12]) immediately after BB is bound.
+   It reads one or more SRVs and blits the final image to the BB in one opaque pass.
+   *Source: v0.5.34/35/36 analysis.*
 
-| Version | Description | Root Cause | Fix |
-|---------|-------------|------------|-----|
-| v0.5.23 | **Rect no longer displays when UI-layering fix active** | The `ppRTVs[0]` at the first no-DSV OMSetRenderTargets transition (v0.5.22's injection point) is an **intermediate FFXIV render target** (post-processing stage), not the final backbuffer. FFXIV's pipeline overwrites it before the frame is presented. ~50,000 inline draws produced nothing visible. The fallback path (ImGui-time `OMGetRenderTargets`) does reach the actual backbuffer. | Instead of firing at the first no-DSV transition, learn the real backbuffer RTV pointer from `ExecuteDrawCallback` (`OMGetRenderTargets` at ImGui time → saved as `_knownBackbufferRtvPtr`). Hook watches for that exact pointer with `pDSV==0`. Inline draw fires there — before native 2D UI draws, to the actual backbuffer. First frame uses fallback to bootstrap the pointer; frame 2+ uses inline. |
-| v0.5.22 | **Game UI (chat/hotbar/map) still rendering over rect (v0.5.21 fix insufficient)** | `_injectedThisTransition` was reset to `false` by intermediate DSV calls during FFXIV's 2D pass. By the time `Draw()` ran, the flag was already false → fallback added regardless → fired after native UI → covered chat/hotbar/map. | Added `volatile bool _frameInjectionDone` — set by inline draw, only reset by `Draw()`. Immune to intermediate DSV resets. Used in both the inline draw condition (`!_frameInjectionDone` prevents re-injection) and in `Draw()` (skip fallback if inline fired). |
-| v0.5.21 | **Game UI (chat/hotbar/map) rendering over rect** | Fallback `ImGui.GetBackgroundDrawList().AddCallback()` fires during ImGui phase, after native 2D UI, covering chat/hotbar/map. `_injectedThisTransition` check in `Draw()` failed to suppress it because intermediate DSV calls reset the flag before `Draw()` ran. | (Partial fix — see v0.5.22.) |
+3. **Confirmed working state (v0.5.47):** Rect visible, 3D objects/characters correctly
+   occlude it (depth testing with `_trackedDsv` + dimension check works), 2D HUD
+   (chat/hotbar/map) draws BEHIND rect. Rect is on top of 2D UI — not ideal, but 3D
+   depth is correct. This is the current state.
+   *Previously this was called "v0.5.36 state" — now confirmed working again in v0.5.47.*
+
+4. **Injecting BEFORE the composite DrawIndexed → rect invisible.**
+   Composite blit immediately overwrites whatever we drew. Confirmed v0.5.42.
+
+5. **ClearRTV is never called on the backbuffer** — FFXIV only calls ClearRTV on intermediate
+   surfaces. Any strategy based on "inject after ClearRTV on backbuffer" is impossible.
+   *Confirmed v0.5.32.*
+
+6. **The composite input texture (SRV[0]) has `matchRtv=0x0`** — it was never bound as an RTV
+   through OMSetRenderTargets during `_inUiPass`. It's produced through the DSV-bound 3D pass,
+   meaning it is the 3D scene texture, NOT the HUD. HUD may be a separate SRV input.
+   *Source: v0.5.38/39 LogCompositeInputs analysis.*
+
+7. **`_compositeInputRtv` can be created** — `CreateRenderTargetView` on the composite input
+   texture succeeds (confirmed by the "Created composite input RTV" log entry).
+   *Source: v0.5.40+ code, `_compositeInputRtv` is created in DrawIndexedDetour bookkeeping.*
+
+8. **TEXCOORD / SV_VertexID / interpolated semantics are broken in this D3D context.**
+   UV is computed via bilinear inverse from SV_POSITION. This IS working.
+   *Source: Phase2-D3D-Rendering-Notes.md, v0.5.18.*
+
+9. **PyonPix does NOT have UI in front of its rect either.**
+   The "fires at the right point (after scene, before UI)" claim is unverified or wrong.
+   PyonPix has the same unsolved UI layering problem. It is NOT a working reference for
+   UI-over-world-space. It only confirms that a rect CAN appear in 3D world space.
+   *Confirmed by user 2026-03-16. Previous "confirmed working competitor" note was misleading.*
 
 ---
 
-## Resolved Issues (v0.5.18 – v0.5.20)
+## Injection Approaches Tried (Complete History)
 
-| Version | Description | Root Cause | Fix |
-|---------|-------------|------------|-----|
-| v0.5.20 | **Game crash — OMSetRenderTargetsDetour: RTV COM refcount stolen each frame** | `new ID3D11RenderTargetView(ppRTVs[0])` creates a Vortice wrapper WITHOUT calling AddRef. `ExecuteInlineDraw` called `rtv.Dispose()` → COM `Release()` every frame, decrementing the game's own RTV refcount. After N frames (initial refcount was ~3: game ref + D3D internal binding ref) the COM object hit refcount 0, D3D freed it, game dereferenced freed pointer → hardware AV, uncatchable by try/catch. | `AddRef()` on wrapper immediately after creation; `Dispose()` only in detour's `finally` (balanced); removed `rtv.Dispose()` from `ExecuteInlineDraw` (caller now owns lifetime). |
-| v0.5.19 | **Game crash — OMSetRenderTargetsDetour: managed exceptions escaped to native** | Entire detour body was unguarded. Any managed exception (from COM wrappers, string formatting, etc.) propagated through Dalamud's native hook trampoline frames, which don't handle CLR exception propagation — game terminates. Also used `_omSetRTHook!.Original` (null-forgiving on hook field, explicitly prohibited in CLAUDE.md). | Wrapped entire detour body in `try/catch(Exception)`; moved `_omSetRTHook?.Original(...)` to `finally` block so the game's D3D call always completes. |
-| v0.5.18 | **Game UI (chat/hotbar/map) hidden behind video rect** | `Draw()` (which set `_cachedDrawReady = true`) runs in Dalamud's ImGui phase, which fires AFTER the 3D→2D render transition each frame. The inline draw was gated on `_cachedDrawReady`, so it was always false at the transition. The fallback ImGui background draw list fired instead — it draws AFTER native UI, covering chat/hotbar/map. | Removed `_cachedDrawReady` gate from the inline draw condition. Use previous-frame `_activeSrv`/`_storedScreen` instead. Added `_initialized && _dsReverseZ != null && _dsNoDepth != null && _cbParams != null` guards so inline draw only fires when all D3D resources are ready. |
-| v0.5.18 | **Game crash — inline draw fired before D3D resources initialized** | First fix attempt removed `_cachedDrawReady` gate without adding `_initialized`/resource null guards. The detour fired immediately on the first frame before `CreateResources()` had populated `_dsReverseZ`, `_dsNoDepth`, `_cbParams`. | Added explicit null checks for all D3D resources in the inline draw condition. |
-| v0.5.18 | **YouTube URL/Stream mode: resolves → plays → instantly stops (0 frames)** | Two causes: (1) yt-dlp requires `--js-runtimes node` to extract YouTube URLs; deno is default but not installed — node v22 is at `C:\Program Files\nodejs\node.exe`. (2) YouTube's yt-dlp `-j` JSON does NOT hoist stream URL to top-level `url`/`manifest_url` — URL is inside `formats[].url` and must be found by scanning for best merged format (acodec≠none AND vcodec≠none). | Added `--js-runtimes node` to both yt-dlp `-j` and pipe commands. Added `formats[]` fallback scan in VideoPlayer JSON parsing. |
-| v0.5.18 | **Browser (WebView2) silently does nothing after Stop() — status stays "Stopped"** | `Stop()` cleared `_webViewReady = false`. `Navigate()` checked `_webViewReady` and bailed early. WebView2 was still running and ready to navigate, but the flag said otherwise. | Removed `_webViewReady = false` from `Stop()`. Changed `Navigate()` to check `_webView?.CoreWebView2 != null` instead of `_webViewReady`. |
-| v0.5.18 | **Browser (WebView2) shows bot-check / "I'm not a robot" page on Reddit/YouTube** | WebView2 default User-Agent identifies the browser as an embedded/automation WebView. Sites detect this and redirect to bot-check pages. | Spoof Edge UA via `_webView.CoreWebView2.Settings.UserAgent` (`Mozilla/5.0 ... Edg/131.0.0.0`). |
-| v0.5.18 | **Browser (WebView2) fails with BadImageFormatException on init** | NuGet's `ReferenceCopyLocalPaths` copies the x86 `WebView2Loader.dll` from the package. FFXIV is an x64 process. P/Invoke searches the game exe directory first; when it found an x86 DLL, loading it threw `BadImageFormatException`. | Exclude `WebView2Loader.dll` from `_RefsCopy` in csproj; copy the x64 version from `runtimes/win-x64/native/` after all other copies. Preload it via `NativeLibrary.Load(loaderPath)` in `BrowserPlayer` before WebView2 environment creation so the already-loaded x64 module is used by subsequent P/Invoke calls. |
-| v0.5.18 | **⚙ settings button corrupts ALL Dalamud text (global ImGui style stack)** | `DrawScreenSection()` read `_settingsOpen` for both the `PushStyleColor` guard and the `PopStyleColor` guard, but the button click mutated `_settingsOpen` between the two checks. An unmatched `PopStyleColor` corrupts the global ImGui style stack for that frame and all subsequent frames — breaks text rendering in ALL plugins until game restart. | Snapshot `bool settingsWasOpen = _settingsOpen` before the button call. Use `settingsWasOpen` for both Push and Pop guards. |
-| v0.5.18 | **Reddit URLs play video-only (no audio) in URL/Stream mode** | Reddit serves DASH streams with separate audio/video tracks. yt-dlp returns `acodec=none` for the video track. LibVLC can't merge separate DASH A/V. | Detect `acodec=none` in yt-dlp JSON → use `PlayViaPipeAsync` to pipe yt-dlp's merged A/V output directly to LibVLC via `StreamMediaInput`. |
-| v0.5.18 | **BrowserPlayer init error type hidden (only message logged)** | Generic `catch (Exception ex)` only logged `ex.Message`, losing the exception type needed for diagnosis (e.g. distinguishing `BadImageFormatException` from `WebView2RuntimeNotFoundException`). | Log `ex.GetType().Name` + `ex.Message`. Also retry env creation with process-unique folder on failure (avoids locked folder from previous plugin instance on hot-reload). |
+All attempts target the same goal: inject into the D3D pipeline so rect appears in 3D space with 2D UI in front.
+
+| # | Approach | Result | Why It Failed |
+|---|----------|--------|---------------|
+| 1 | **ImGui `ExecuteDrawCallback` / `GetBackgroundDrawList`** | Rect covers all UI | Fires during Dalamud's ImGui phase, which is AFTER all native 2D UI draws. Rect is always on top of everything. |
+| 2 | **OMSetRenderTargets inject at first no-DSV transition (`_inUiPass`)** | Rect invisible | First no-DSV RT is a post-processing intermediate. FFXIV overwrites it before the frame is presented. |
+| 3 | **OMSetRenderTargets inject when BB RTV is bound** | Rect invisible | FFXIV immediately calls ClearRTV* on an intermediate surface (misidentified as the BB), wiping pixels. *(Later confirmed: FFXIV never ClearRTVs the BB at all — the early logic was wrong.)* |
+| 4 | **ClearRTV hook — inject after clear on BB** | Rect invisible | FFXIV never ClearRTVs the actual DXGI backbuffer. The cleared pointer was always an intermediate. Strategy is impossible. *Confirmed v0.5.32.* |
+| 5 | **ClearRTV hook — inject after ANY clear during `_inUiPass`** | Rect invisible (3D geo flickers) | Fires on post-processing surfaces (positions 6, 13 in sequence). Drawing into these surfaces with depth testing feeds into the lighting pipeline → 3D geometry at rect's world location flickers. No rect visible. |
+| 6 | **`_lastClearedUiPassRtvPtr` — inject into most-recently-cleared surface before composite DrawIndexed** | Never ran | Backbuffer-learning cascade was broken by DrawPlaceholder path (v0.5.38/39). Fixed in v0.5.40 but approach abandoned before testing. |
+| 7 | **DrawIndexedDetour inject into `_compositeInputRtv` BEFORE calling Original** | Never correctly ran | v0.5.39 planned this but cascade was broken; v0.5.40 fixed cascade but v0.5.41+ moved away from this approach entirely before it could be tested. |
+| 8 | **DrawIndexedDetour inject into BB (inject-first, then Original)** | Rect invisible | Composite blit (Original) overwrites rect. Order must be Original-first. *v0.5.42.* |
+| 9 | **DrawDetour inject into BB (Original-first, then inject) with `useDepth=false`** | Rect covers EVERYTHING — 3D objects, characters, AND 2D UI. Worst state. | DrawDetour DOES fire after BB bind. But `useDepth=false` disables depth testing, so rect is drawn flat on top of the entire composited scene. Also fires AFTER all game rendering is done (composited 3D+HUD in BB) — there is no way to "insert" before HUD from this hook point. *v0.5.44 confirmed.* |
+| 10 | **DrawIndexedDetour inject into BB when `_currentBbRtvPtr != 0` (Original-first)** | Rect entirely missing. | DrawIndexed calls fire BEFORE OMSetRenderTargets(backbuffer), so `_currentBbRtvPtr` is always 0 when DrawIndexedDetour runs. Condition never true. *v0.5.45.* |
+| 11 | **DrawDetour inject with `useDepth=true` (naive — no dimension check)** | Rect entirely missing. | D3D11 silently renders nothing when DSV and RTV have different texture dimensions. If FFXIV's internal render resolution ≠ output resolution, `_trackedDsv` is the wrong size for the BB. No exception — just invisible. *v0.5.46.* |
+| 10 | **DrawIndexedDetour + DrawDetour both injecting into BB** | Flickering | DrawIndexedDetour missing `_currentBbRtvPtr != 0` guard → NullReferenceException. *v0.5.41.* |
+| 11 | **DrawDetour inject (Original-first) + DrawIndexedDetour composite inject (Original-first)** | Flickering | DrawIndexedDetour set `_frameInjectionDone=true` during post-processing (before BB bind), blocking DrawDetour's BB inject. *v0.5.43.* |
 
 ---
 
-## Resolved Issues (older)
+## Suspect "Resolved" UI Ordering Issues
 
-| Phase | Description | File |
-|-------|-------------|------|
-| Phase 1 / 2 | D3D11 rendering, UV fixes, depth testing | `Phase2-D3D-Rendering-Notes.md` |
-| Phase 3 / 3.5 | LibVLC DLL loading, video callbacks, URL streaming, crash on mode switch | `Phase3-Video-Playback-Notes.md` |
-| Phase 3.5 | Infinite retry loop when stream is unplayable (0 frames decoded) — fixed v0.5.14 | `SyncCoordinator.cs`, `VideoPlayer.cs` |
+**v0.5.26** logged "Map window now renders in front of rect" after fixing the DSV leak in
+`ExecuteInlineDraw`. This was likely WRONG — the inject at that time was hitting an
+intermediate post-processing surface (not the final backbuffer), so UI "appearing in front"
+was coincidental or was only Dalamud-side ImGui windows (which always render after game UI).
+
+**v0.5.24–v0.5.26** used the ClearRTV hook and claimed the backbuffer was being cleared and
+re-injected. This whole chain was invalidated by v0.5.32 confirming FFXIV never ClearRTVs
+the actual backbuffer. Those versions were injecting into intermediate surfaces and the
+"working" state was an illusion.
+
+---
+
+## Untried Approaches (Ranked by Likelihood)
+
+### 1. OMSetRenderTargets inject — at BB-bind moment, into the currently-bound intermediate RT
+**NOT YET TRIED (v0.5.51 target).**
+
+At the moment OMSetRenderTargets fires with the BB (identified via `_knownBackbufferRtvPtrs`),
+the currently-bound RT is the LAST intermediate surface in the post-processing chain — the
+final composited output that's about to be copied to BB.
+
+**Key hypothesis**: If this intermediate contains the 3D scene (post-processing) but NOT the
+HUD yet, injecting into it here means our rect gets baked into the 3D scene. Then FFXIV's
+Draw calls copy intermediate→BB and add HUD on top. HUD ends up in front.
+
+**Key question**: Is HUD in the intermediate (before BB bind) or added by Draw calls after?
+We can answer this empirically: if this approach puts HUD in front → HUD was added after
+(hypothesis correct). If HUD is still behind → HUD was already baked into intermediate.
+
+**Research basis**: PyonPix injects from inside OMSetRenderTargets detour. Multiple sources
+confirm this fires "after scene, before UI." REST (ReshadeEffectShaderToggler-FFXIV_UIONLY)
+similarly fires at the scene→UI transition.
+
+**Also**: FFXIV writes UI presence into the alpha channel of the backbuffer (unique to FFXIV).
+This could be used as a fallback to mask rect pixels where alpha encodes UI — but requires
+copying BB to a temp texture (D3D11 can't read+write same resource in one pass).
+
+**Implementation**: In `OMSetRenderTargetsDetour`, when `_knownBackbufferRtvPtrs.Contains(rtvPtr)`:
+1. `OMGetRenderTargets(1u, intermediateRtvArr, out intermediateDsv)` — get currently-bound RT
+2. If intermediate != null: `ExecuteInlineDraw(intermediate, CheckDepthCompatibility(intermediate))`
+3. Set `_frameInjectionDone = true` — blocks DrawDetour fallback
+4. Call Original — BB gets bound, intermediate stays in GPU memory with rect baked in
+5. FFXIV Draw calls copy intermediate→BB and add HUD on top
+
+**Re-entrancy note**: ExecuteInlineDraw calls `_context.OMSetRenderTargets` internally, which
+fires OMSetRenderTargetsDetour re-entrantly. Re-entrant calls: `_frameInjectionDone = true`
+and non-BB RT → no double-injection. Original in finally uses trampoline (bypasses hook).
+
+**To try:** Implement in v0.5.51.
+
+### 2. DrawIndexedDetour: Original-first injection into BB when `_currentBbRtvPtr != 0`
+**NOT YET TRIED.** The v0.5.44 DrawDetour approach applied to DrawIndexed instead.
+
+The composite blit IS a DrawIndexed. If HUD elements are also DrawIndexed calls that
+follow on the same BB bind, then:
+- DrawIndexedDetour fires on composite blit: call Original (blit runs) → inject rect → set `_frameInjectionDone=true`
+- All subsequent DrawIndexed (HUD) fire normally (Original via `finally`, no inject)
+- Result: rect appears after composite blit (3D scene), HUD draws on top ✓
+
+This has never been attempted because every v0.5.41-44 iteration either injected-first or
+moved injection out of DrawIndexedDetour entirely.
+
+**To try:** In DrawIndexedDetour, when `_currentBbRtvPtr != 0 && !_frameInjectionDone`,
+call Original first, then inject into bb, then set `_frameInjectionDone = true`.
+
+### 2. Composite input injection (SRV[0]) in DrawIndexedDetour BEFORE Original
+**IN PROGRESS (v0.5.49).** v0.5.39 planned this but cascade was broken; v0.5.40+ abandoned it.
+Now attempting properly.
+
+The composite input texture (SRV[0]) is the 3D scene (matchRtv=0x0 = produced via DSV pass,
+not tracked via `_rtvToTexture`). If we inject into it BEFORE the composite reads it,
+our rect becomes part of what the composite blits to the BB. The composite then writes
+3D+rect to BB. 2D HUD draws after on top.
+
+`_compositeInputRtv` is ALREADY BEING CREATED in the current DrawIndexedDetour bookkeeping
+code. It just isn't being used.
+
+**D3D11 SRV/RTV hazard:** When we bind `_compositeInputRtv` (same texture) as RT while
+it's bound as SRV[0], D3D11 auto-unbinds it from the SRV slot. After our inject we must
+explicitly restore: (1) original RT so Original writes to its intended intermediate surface,
+(2) SRV[0]=compositeInputTex so the composite DrawIndexed can actually read it.
+
+**Depth:** `_trackedDsv` is frozen from the 3D pass (not updated during `_inUiPass`).
+Both compositeInputTex and the DSV were created for the same 3D render pass → same
+dimensions → `CheckDepthCompatibility` returns true → depth testing works.
+
+**v0.5.49 attempt:** DrawIndexedDetour: when `_compositeInputRtv != null && !_frameInjectionDone`:
+1. `PSGetShaderResources(0, savedSrvArr)` — save SRV[0]
+2. `OMGetRenderTargets(savedRtvArr, out savedDsv)` — save current RT
+3. `ExecuteInlineDraw(_compositeInputRtv, useDepth)` — inject into 3D scene texture
+4. `OMSetRenderTargets(savedRtvArr, savedDsv)` — restore original RT
+5. `PSSetShaderResources(0, savedSrvArr)` — re-bind SRV[0] (safe now, not bound as RTV)
+6. `Original(...)` — composite blit runs with rect baked into SRV[0], writes to intermediateRT
+DrawDetour: blocked by `_frameInjectionDone = true` (set in DrawIndexedDetour).
+
+**Outcome: FAILED. Rect disappeared entirely.**
+
+Root cause: `LogCompositeInputs` captures SRV[0] on the FIRST eligible DrawIndexed during
+`_inUiPass`. This is NOT the final composite — it's early post-processing (TAA/tone-mapping/
+DOF). FFXIV's post-processing chain has many DrawIndexed passes. The actual composite that
+writes to the final pre-BB surface is a LATER DrawIndexed. By modifying the raw 3D scene
+texture at an early step, we only affect the input to the first post-processing pass. The
+output of that pass (and all subsequent passes) is a different intermediate that we never
+touch. Additionally, `_frameInjectionDone = true` disabled DrawDetour (the working baseline),
+so the frame showed nothing. Reverted in v0.5.50.
+
+**Note on PyonPix:** PyonPix does NOT have UI rendering in front of its rects either.
+It shares the same problem. "Confirmed working" applies only to the rect being visible in
+3D space — not the UI layering. No known plugin has solved UI-over-world-space-objects.
+
+**What's needed to do this correctly:**
+- Know which specific DrawIndexed call in the post-processing chain is the TRUE final composite
+  (the one that writes to the surface that immediately precedes the BB bind)
+- OR inject at a point in the pipeline that is definitely after ALL post-processing but before
+  the BB bind (if such a point exists)
+- v0.5.50 adds DrawIndexed sequence diagnostics: logs every DrawIndexed during _inUiPass
+  for the first 3 frames (index count, current RT, SRV[0] texture ptr, whether SRV[0] is
+  the captured compositeInputTex). This will identify the call order and which call is last.
+
+### 3. PyonPix timing — hook Present + OMSetRenderTargets, draw at scene transition
+**NOT YET TRIED.** PyonPix hooks both functions and fires Draw() when:
+- OMSetRenderTargets is called with main scene RTV+DSV (matching swapchain dimensions)
+- AND `LastPresentIndex != PresentIndex` (new frame has started)
+
+They bind the backbuffer RTV + main DSV and draw there. The claim is this fires
+"after scene, before UI." The underlying mechanism: they track when the main scene DSV
+stops being bound (transition to post-processing or 2D), and draw at that exact point.
+
+**Risk:** We may have the same problem (rect covers UI) if FFXIV's 2D UI is already
+baked into what the composite reads. But PyonPix claims it works, and their source
+is confirmed working software.
+
+### 4. Add draw-call diagnostics after BB bind
+**Not done yet.** Log EVERY Draw + DrawIndexed call after `_currentBbRtvPtr != 0` fires
+(vertex count, context, call order) until Present. This would definitively answer:
+- Are there DrawIndexed calls after the composite blit?
+- Are there Draw calls?
+- How many total?
+Without this data, approaches #1 and #9 (current) are being tried blind.
+
+### 5. Hook `IDXGISwapChain::Present` (vtable[8])
+Fire the inject on Present instead of on a Draw call. At Present time:
+- BB contains the fully composited frame (3D + HUD)
+- We draw on top of everything (same as ImGui path — rect covers UI)
+This does NOT solve the UI layering problem but could confirm the rect itself renders.
+
+### 6. Track the last non-null DSV from the 3D pass
+For composite input injection (#2 above) to support depth testing, we need the 3D scene
+DSV. Currently `_trackedDsv` is captured during DSV-bound passes, but we only use it in
+`ExecuteInlineDraw` with `useDepth=true`. This infrastructure already mostly exists — just
+need to confirm `_trackedDsv` is still valid at composite DrawIndexedDetour time.
+
+---
+
+## Checkpoint: v0.5.48 — Confirmed Working Baseline
+
+**DO NOT REGRESS FROM THIS STATE.**
+
+- Rect visible in world space. 3D objects/characters correctly occlude it (depth testing via `_trackedDsv` + `CheckDepthCompatibility()`).
+- 2D HUD draws BEHIND rect (not ideal — remaining problem), but all other behavior correct.
+- Video loop flash fixed via `_transitioning` flag in `VideoPlayer.cs`.
+- Placement tab added to `MainWindow.cs`.
+
+If any new approach makes the rect invisible or breaks depth testing, revert to this baseline:
+- `DrawDetour`: Original-first, inject into BB, `CheckDepthCompatibility(bbRtv)` to decide depth.
+- `DrawIndexedDetour`: bookkeeping only (`LogCompositeInputs`, `_compositeInputRtv` creation). No injection.
+- `_trackedDsv` frozen at `_inUiPass` start (`!_inUiPass` guard in OMSetRenderTargetsDetour).
+
+---
+
+## ⚠️ NEVER AGAIN — Lessons From v0.5.44–v0.5.46
+
+**DO NOT disable depth testing (`useDepth=false`) when injecting into the backbuffer.**
+Using `useDepth=false` means the rect is drawn as a flat 2D overlay on top of EVERYTHING —
+all 3D geometry, all characters, all UI. This is strictly worse than the ImGui fallback.
+Any BB inject MUST use depth testing to preserve 3D depth relationships.
+
+**DO NOT use `useDepth=true` without checking DSV/RTV dimension compatibility first.**
+D3D11 silently renders NOTHING when the DSV and RTV have different texture dimensions.
+No exception is thrown — the rect just disappears. Always use `CheckDepthCompatibility()`
+before calling `ExecuteInlineDraw`. If dimensions don't match, fall back to `useDepth=false`
+(at least the rect is visible) and log the mismatch.
+
+**DO NOT update `_trackedDsv` during `_inUiPass`.**
+Post-processing may bind DSVs with different dimensions, overwriting the valid main-scene DSV.
+The `!_inUiPass` guard in OMSetRenderTargetsDetour prevents this. If removed, depth breaks.
+
+**DrawIndexed calls fire BEFORE OMSetRenderTargets(backbuffer).**
+`_currentBbRtvPtr` is 0 when DrawIndexedDetour runs. Any injection in DrawIndexedDetour gated
+on `_currentBbRtvPtr != 0` will NEVER fire. Injection belongs in DrawDetour (fires after BB bind).
+
+---
+
+## Current State (v0.5.47 — confirmed working baseline)
+
+DrawIndexedDetour: bookkeeping only (LogCompositeInputs, creates `_compositeInputRtv`).
+DrawDetour: Original-first, inject into BB. Uses `CheckDepthCompatibility()` to decide
+whether to bind `_trackedDsv`. Falls back to no-depth if DSV/RTV sizes mismatch.
+`_trackedDsv` is frozen at start of `_inUiPass` — post-processing can't overwrite it.
+
+**Confirmed (user):** Rect visible. 3D objects/characters correctly occlude the rect.
+2D HUD (chat/hotbar/map) draws IN FRONT is still not achieved — rect is on top of 2D UI.
+
+**Remaining problem:** 2D HUD draws on top of the rect. DrawDetour fires AFTER all HUD is
+composited into the BB. No injection point between composite blit and HUD draw has been found.
+
+**Next target:** Get 2D HUD to render in front of the rect.
+Best untried approach: Approach #2 (composite input injection via `_compositeInputRtv`) —
+inject into SRV[0] (3D scene texture) BEFORE the composite DrawIndexed reads it. If this
+surface is the 3D scene only (not HUD baked in), our rect ends up under HUD after composite.
+
+---
+
+## Crash: A-B Loop Race Condition on Play() (Resolved 2026-03-17)
+
+**Symptom:** Game crashed immediately when hitting Play while a video was already playing with an A-B loop active.
+
+**Root Cause:**
+`DisplayCallback` (LibVLC decode thread) fires `Task.Run(() => _player.Position = _loopA)` every frame when the playhead reaches loop point B. This task sits in the thread pool queue. When the user hits Play, the main thread calls `Stop()` → `_player.Stop()` → `StartPlayback()` (reconfigures the player for the new video). If the A-B seek task fires *during* this reconfiguration — while `_player.Media` is being reassigned and `_player.Play()` is starting — concurrent native LibVLC calls (`libvlc_media_player_set_position` + `libvlc_media_player_play`) race in native code → CLR fatal error / crash.
+
+Secondary issue: `DisplayCallback` had no try/catch. Any exception from it propagates through native LibVLC → unhandled exception → CLR fatal error.
+
+**Fix Applied (2026-03-17):**
+- `DisplayCallback`: Entire body wrapped in try/catch. Any exception is logged and suppressed.
+- A-B loop `Task.Run`: Captures `_playVersion` at dispatch time. The seek only fires if `_playVersion` hasn't changed (i.e., no new `Play()` call happened between dispatch and execution). If Play() was called, the stale seek is discarded.
+- `LockCallback`: Wrapped in try/catch with `_vlcWriting = false` in catch to avoid leaving the spin-wait in `Stop()` stuck forever.
+
+---
+
+## Bug: OMSetRenderTargetsDetour NullRef Spam (Resolved 2026-03-17)
+
+**Symptom:** `NullReferenceException` logged from `OMSetRenderTargetsDetour` ~120 times/second (every frame). Visible in dalamud.log as constant warning spam. Caused render pipeline instability during the 2026-03-17 crash session.
+
+**Root Cause:**
+`_context!.OMGetRenderTargets(1u, intermediateRtvArr, out var intermediateDsv)` — when the currently-bound RT has no depth stencil (normal for post-processing surfaces), Vortice returns `null` for `intermediateDsv`. The immediately following `intermediateDsv.Dispose()` (no null check) threw `NullReferenceException` on every frame. The outer try/catch caught it and logged it, preventing a game crash, but generating constant spam. Same pattern existed in a second `OMGetRenderTargets` call in the `DrawIndexedDetour` path.
+
+**Fix Applied (2026-03-17):**
+Both `intermediateDsv.Dispose()` → `intermediateDsv?.Dispose()` and `dsv.Dispose()` → `dsv?.Dispose()`.
+
+---
+
+## Non-Rendering Issues (Resolved)
+
+| Version | Issue | File |
+|---------|-------|------|
+| v0.5.18–v0.5.20 | Game crashes, COM refcount, managed exceptions in detours | inline above |
+| v0.5.18 | Video/browser players: YouTube, Reddit, WebView2 bugs | `Phase3-Video-Playback-Notes.md` |
+| Phase 1/2 | UV rendering, depth testing, image display | `Phase2-D3D-Rendering-Notes.md` |
+
+---
+
+## Crash: CLR Fatal Internal Error 0x80131506 (Resolved 2026-03-17)
+
+**Symptom:** Game crash at 03:16:34 on 2026-03-17. `output.log` ends with `"Stopping addons..."`.
+Crash dump: `dalamud_appcrash_20260317_031634_222_55932.dmp`. Exit code `0x80131506`
+(ExecutionEngineException — fatal CLR internal error, unrecoverable).
+
+**Root Cause Identified:**
+`VideoPlayer` previously called `Core.Initialize()` + `new LibVLC()` + `new MediaPlayer()` in its
+**constructor**, which ran the moment FFXIV-TV was enabled — regardless of whether any video was
+ever played. LibVLC responds to `Core.Initialize()` by scanning the plugins directory and loading
+every codec/protocol/filter DLL it finds (~200 native DLLs). Loading ~200 native DLLs into the
+managed CLR process dramatically increases memory pressure and native/managed interop surface area.
+The CLR fatal error (0x80131506) is consistent with memory corruption or a GC/JIT failure
+triggered by this native code load.
+
+**Contributing factor:** FFXIV-TV is the only dev plugin that loads this many native DLLs.
+VFXEditor loads FreeImage + nvtt (~3 DLLs). WebView2 is lazy. Nothing else in the 82-plugin
+stack comes close to LibVLC's footprint.
+
+**Fix Applied (2026-03-17):**
+`VideoPlayer.EnsureVlcInitialized()` — lazy initialization. LibVLC, MediaPlayer, and all native
+VLC plugin DLLs are now deferred until the **first `Play()` call**. Plugin startup, image mode,
+browser mode, and sessions that never play video incur zero VLC DLL overhead.
+
+**What changed in `VideoPlayer.cs`:**
+- `_libVlc` and `_player` changed from `readonly` fields to nullable fields (`LibVLC?`, `MediaPlayer?`)
+- Constructor no longer calls `Core.Initialize()`, `new LibVLC()`, or `new MediaPlayer()`
+- New `private void EnsureVlcInitialized()` called at the top of `Play()` only
+- Added `_pendingVolume` / `_pendingMuted` backing fields — Volume/Mute set before first Play
+  are stored and applied when VLC actually initializes
+- All `_player` accesses in properties/methods are null-safe:
+  `IsPlaying` → `_player?.IsPlaying ?? false`
+  `IsPaused` → `_player != null && _player.State == VLCState.Paused`
+  `HasTexture` → `_srv != null && _player != null && ...`
+  `TimeMs`/`LengthMs` → `_player?.Time ?? -1` / `_player?.Length ?? -1`
+  `Seek`, `TogglePause`, `Stop`, `Dispose` — null-guarded before any `_player` access
+
+**Functionality unchanged:**
+- Image mode, browser mode: unaffected (never used `_player`)
+- Volume/Mute persist: stored in `_pendingVolume`/`_pendingMuted`, applied at init
+- All video playback features: identical after first `Play()` call
+- Network sync (SyncCoordinator, SyncClient): all pass-throughs return safe defaults when VLC not yet init'd
