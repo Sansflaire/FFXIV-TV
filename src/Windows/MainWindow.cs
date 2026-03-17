@@ -1,4 +1,6 @@
 using System;
+using System.IO;
+using System.Linq;
 using System.Numerics;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Plugin.Services;
@@ -609,6 +611,42 @@ public sealed class MainWindow
                 DrawClientControls();
                 break;
         }
+
+        ImGui.Separator();
+        ImGui.Spacing();
+        if (ImGui.Button("Copy Diagnostics Log"))
+            CopyDiagnosticsLog();
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("Reads dalamud.log and copies all FFXIV-TV lines to clipboard.\nShare with the developer to diagnose issues.");
+    }
+
+    private static void CopyDiagnosticsLog()
+    {
+        try
+        {
+            var logPath = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                "XIVLauncher", "dalamud.log");
+
+            string allText;
+            using (var stream = new FileStream(logPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            using (var reader = new StreamReader(stream))
+                allText = reader.ReadToEnd();
+
+            var lines = allText
+                .Split('\n')
+                .Where(l => l.Contains("FFXIV-TV"))
+                .TakeLast(1000)
+                .ToArray();
+
+            ImGui.SetClipboardText(lines.Length > 0
+                ? string.Join("\n", lines)
+                : "(No FFXIV-TV log entries found in dalamud.log)");
+        }
+        catch (Exception ex)
+        {
+            ImGui.SetClipboardText($"Error reading dalamud.log: {ex.Message}");
+        }
     }
 
     private void DrawHostControls()
@@ -709,13 +747,20 @@ public sealed class MainWindow
             _config.Save();
         }
 
-        if (client.IsConnected)
+        if (client.IsRunning)
         {
             ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.6f, 0.15f, 0.15f, 1f));
             if (ImGui.Button("Disconnect")) client.Disconnect();
             ImGui.PopStyleColor();
             ImGui.SameLine();
-            ImGui.TextDisabled("Connected");
+            if (client.IsConnected)
+                ImGui.TextDisabled("Connected");
+            else
+            {
+                bool isFailed = client.Status.StartsWith("Failed:");
+                if (isFailed) ImGui.TextColored(new Vector4(1f, 0.4f, 0.4f, 1f), client.Status);
+                else          ImGui.TextDisabled(client.Status);
+            }
         }
         else
         {

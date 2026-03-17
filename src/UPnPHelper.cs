@@ -27,14 +27,40 @@ public static class UPnPHelper
     // ── Discovery ─────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Sends SSDP M-SEARCH multicast and returns the first usable IGD gateway found,
-    /// or null if no UPnP-capable router is reachable within the timeout.
-    ///
-    /// All search targets are blasted out at once (each twice for UDP reliability)
-    /// then we collect every unique LOCATION in a single 4-second window.
-    /// This is faster and catches routers that only respond to ssdp:all or IGD:2.
+    /// Discovers an IGD gateway via SSDP multicast AND direct gateway IP probe in parallel.
+    /// Returns the first usable gateway found, or null if neither method succeeds.
+    /// Running both in parallel handles routers where SSDP is disabled but UPnP HTTP works.
     /// </summary>
     public static async Task<GatewayInfo?> DiscoverAsync(CancellationToken ct = default)
+    {
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+
+        var ssdpTask   = DiscoverViaSsdpAsync(cts.Token);
+        var directTask = ProbeGatewayDirectAsync(cts.Token);
+
+        var pending = new List<Task<GatewayInfo?>> { ssdpTask, directTask };
+        while (pending.Count > 0)
+        {
+            var done = await Task.WhenAny(pending);
+            GatewayInfo? result;
+            try { result = await done; }
+            catch { result = null; }
+
+            if (result != null)
+            {
+                cts.Cancel();
+                return result;
+            }
+            pending.Remove(done);
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Sends SSDP M-SEARCH multicast and returns the first usable IGD gateway found,
+    /// or null if no UPnP-capable router responds within the timeout.
+    /// </summary>
+    private static async Task<GatewayInfo?> DiscoverViaSsdpAsync(CancellationToken ct)
     {
         const string multicastAddr = "239.255.255.250";
         const int    multicastPort = 1900;
@@ -50,7 +76,7 @@ public static class UPnPHelper
             "ssdp:all",
         };
 
-        var endpoint     = new IPEndPoint(IPAddress.Parse(multicastAddr), multicastPort);
+        var endpoint      = new IPEndPoint(IPAddress.Parse(multicastAddr), multicastPort);
         var seenLocations = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         try
@@ -81,7 +107,7 @@ public static class UPnPHelper
                 try { resp = udp.Receive(ref from); }
                 catch (SocketException) { break; }
 
-                string text     = Encoding.UTF8.GetString(resp);
+                string text      = Encoding.UTF8.GetString(resp);
                 string? location = null;
                 foreach (var line in text.Split('\n'))
                 {
@@ -100,6 +126,65 @@ public static class UPnPHelper
         catch (OperationCanceledException) { return null; }
         catch { }
 
+        return null;
+    }
+
+    /// <summary>
+    /// Probes the default gateway IP directly at common UPnP HTTP ports/paths.
+    /// Fallback for routers where SSDP multicast is blocked but UPnP HTTP is reachable.
+    /// Each probe has a 1-second timeout so total worst-case is fast.
+    /// </summary>
+    private static async Task<GatewayInfo?> ProbeGatewayDirectAsync(CancellationToken ct)
+    {
+        var gatewayIps = new HashSet<string>();
+        try
+        {
+            foreach (var iface in NetworkInterface.GetAllNetworkInterfaces())
+            {
+                if (iface.OperationalStatus != OperationalStatus.Up) continue;
+                foreach (var gw in iface.GetIPProperties().GatewayAddresses)
+                {
+                    if (gw.Address.AddressFamily == AddressFamily.InterNetwork &&
+                        !gw.Address.Equals(IPAddress.Any))
+                        gatewayIps.Add(gw.Address.ToString());
+                }
+            }
+        }
+        catch { }
+
+        if (gatewayIps.Count == 0) return null;
+
+        // Common router UPnP description paths (port, path).
+        // Connection refused returns instantly; only firewalled ports wait for timeout.
+        (int Port, string Path)[] probes = {
+            (49152, "/rootDesc.xml"),          // Linksys, many others
+            (5000,  "/rootDesc.xml"),           // ASUS, TP-Link
+            (2869,  "/description.xml"),        // Windows ICS / MSFT router
+            (49000, "/igdupnp/desc/root.xml"),  // FRITZ!Box
+            (1900,  "/rootDesc.xml"),           // some generic
+            (8080,  "/description.xml"),        // uncommon fallback
+        };
+
+        foreach (var ip in gatewayIps)
+        {
+            foreach (var (port, path) in probes)
+            {
+                if (ct.IsCancellationRequested) return null;
+                string url = $"http://{ip}:{port}{path}";
+                try
+                {
+                    using var probeCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                    probeCts.CancelAfter(1000);
+                    var gw = await ParseDescriptionAsync(url, probeCts.Token);
+                    if (gw != null)
+                    {
+                        Plugin.Log.Info($"[FFXIV-TV] UPnP: found gateway via direct probe {url}");
+                        return gw;
+                    }
+                }
+                catch { }
+            }
+        }
         return null;
     }
 

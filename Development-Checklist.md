@@ -294,6 +294,8 @@ Goal: Host PC serves a WebSocket server; all connected clients play the same con
 ### Bug fixes
 - [x] Fix: clicking Connect while already reconnecting shows "Disconnected" (old loop's final status write races new loop's "Connecting..." — fixed by skipping terminal status if cancelled by a new Connect)
 - [x] Fix: UPnP discovery too narrow — sends all M-SEARCH targets simultaneously and listens in one 4s window instead of 3.5s × N sequential waits; adds IGD:2, WANIPConnection:2, WANPPPConnection:1, ssdp:all; sends each packet twice for UDP reliability
+- [ ] Fix: UPnP fallback — add direct gateway IP probe (common UPnP ports) running in parallel with SSDP so routers with SSDP disabled still auto-forward
+- [ ] Fix: Client has no way to cancel a pending Connect/reconnect — add Stop button visible during Connecting/Reconnecting state
 
 ---
 

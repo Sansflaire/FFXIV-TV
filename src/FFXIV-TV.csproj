@@ -12,7 +12,7 @@
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <AssemblyName>FFXIV-TV</AssemblyName>
     <RootNamespace>FFXIVTv</RootNamespace>
-    <Version>0.5.51</Version>
+    <Version>0.5.52</Version>
     <UseWindowsForms>true</UseWindowsForms>
   </PropertyGroup>
 

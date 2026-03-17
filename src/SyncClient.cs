@@ -19,6 +19,7 @@ public sealed class SyncClient : IDisposable
     private bool _running;
 
     public bool   IsConnected { get; private set; }
+    public bool   IsRunning   => _running;
     public string Status      { get; private set; } = "Disconnected";
 
     // ── Events (fired on background thread) ──────────────────────────────────
