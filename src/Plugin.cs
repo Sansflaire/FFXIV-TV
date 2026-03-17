@@ -46,6 +46,7 @@ public sealed class Plugin : IDalamudPlugin
 
     public Plugin()
     {
+        Log.Info("[FFXIV-TV] === SESSION START ===");
         Config = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
 
         _screenRenderer = new ScreenRenderer(GameGui, TextureProvider);
@@ -74,6 +75,7 @@ public sealed class Plugin : IDalamudPlugin
             Config.Screen.Height     = h;
             Config.Screen.Visible    = true;
             Config.Save();
+            Log.Info($"[FFXIV-TV] OnScreenConfig: center=({cx:F2},{cy:F2},{cz:F2}) yaw={yaw:F1} w={w:F1} h={h:F1} → Visible=true");
         };
 
         CommandManager.AddHandler(CmdMain, new CommandInfo(OnCommand)

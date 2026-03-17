@@ -162,6 +162,10 @@ public sealed unsafe class D3DRenderer : IDisposable
     private int _omsetBlockedLogCount = 0;
     // Total DrawIndexed seq entries emitted (prevents infinite spam when _cbkFrameCount stays 0).
     private int _drawSeqLogTotal = 0;
+    // Total PrepareHooks calls — used for periodic heartbeat log.
+    private int _prepareHooksCallCount = 0;
+    // Throttle for _pendingLearnBackbuffer-consumed-but-skipped log.
+    private int _bbLearnSkipLogCount = 0;
     // Cached result of DSV vs backbuffer dimension check.
     // null = not yet checked; true = compatible (use depth); false = mismatch (no depth).
     private bool? _depthCompatible = null;
@@ -289,6 +293,14 @@ float4 main(VSOut input) : SV_TARGET {
         _contextPtr = _context.NativePointer;
 
         Plugin.Log.Info($"[FFXIV-TV] D3DRenderer: device=0x{devicePtr:X}");
+        try
+        {
+            using var dxgiDevice = _device.QueryInterface<IDXGIDevice>();
+            using var adapter    = dxgiDevice.GetAdapter();
+            var desc = adapter.Description;
+            Plugin.Log.Info($"[FFXIV-TV] GPU: {desc.Description} VRAM={desc.DedicatedVideoMemory / 1024 / 1024}MB");
+        }
+        catch (Exception ex) { Plugin.Log.Warning($"[FFXIV-TV] GPU info unavailable: {ex.Message}"); }
 
         try
         {
@@ -399,6 +411,15 @@ float4 main(VSOut input) : SV_TARGET {
                                     finally { lv.Dispose(); }
                                 }
                                 catch (Exception ex) { Plugin.Log.Warning($"[FFXIV-TV] learn bb-tex failed: {ex.Message}"); }
+                            }
+                            else if (_bbLearnSkipLogCount < 5)
+                            {
+                                // _pendingLearnBackbuffer fired but this RTV was already checked —
+                                // the bb-learn opportunity was consumed by a non-bb surface. If this
+                                // keeps happening, _knownBackbufferTexturePtrs stays empty and
+                                // injection can never fire.
+                                _bbLearnSkipLogCount++;
+                                Plugin.Log.Warning($"[FFXIV-TV] bb-learn SKIP #{_bbLearnSkipLogCount}: rtv=0x{rtvPtr:X} already checked — bb tex NOT updated. bbTexCount={_knownBackbufferTexturePtrs.Count}");
                             }
                         }
 
@@ -942,6 +963,18 @@ float4 main(VSOut input) : SV_TARGET {
         {
             _prepareHooksLoggedOnce = true;
             Plugin.Log.Info($"[FFXIV-TV] PrepareHooks: first call. screen.Visible={screen.Visible} bbTexCount={_knownBackbufferTexturePtrs.Count} bbRtvCount={_knownBackbufferRtvPtrs.Count}");
+        }
+
+        _prepareHooksCallCount++;
+        // Periodic heartbeat: frame 1, 60, 300, then every 600 (~10s at 60fps).
+        if (_prepareHooksCallCount == 1 || _prepareHooksCallCount == 60 || _prepareHooksCallCount == 300
+            || _prepareHooksCallCount % 600 == 0)
+        {
+            Plugin.Log.Info($"[FFXIV-TV] Heartbeat #{_prepareHooksCallCount}: " +
+                $"bbTex={_knownBackbufferTexturePtrs.Count} bbRtv={_knownBackbufferRtvPtrs.Count} " +
+                $"cbkFrames={_cbkFrameCount} storedScreen={_storedScreen != null} " +
+                $"inUiPass={_inUiPass} currentBbRtv=0x{_currentBbRtvPtr:X} " +
+                $"init={_initialized} dsRZ={_dsReverseZ != null} dsND={_dsNoDepth != null} cb={_cbParams != null}");
         }
     }
 

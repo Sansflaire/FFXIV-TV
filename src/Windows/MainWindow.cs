@@ -641,15 +641,20 @@ public sealed class MainWindow
             using (var reader = new StreamReader(stream))
                 allText = reader.ReadToEnd();
 
-            // Capture first 200 (init-time: PrepareHooks, BLOCKED, device init) + last 800 (recent activity).
-            // "first N + last M" ensures one-shot startup logs are never pushed out of view by log spam.
             var allLines = allText
                 .Split('\n')
                 .Where(l => l.Contains("FFXIV-TV"))
                 .ToArray();
-            var lines = allLines.Length <= 1000
-                ? allLines
-                : allLines.Take(200).Concat(allLines.TakeLast(800)).ToArray();
+
+            // Find the last SESSION START marker — only show the current session.
+            int sessionIdx = -1;
+            for (int i = allLines.Length - 1; i >= 0; i--)
+            {
+                if (allLines[i].Contains("=== SESSION START ==="))
+                { sessionIdx = i; break; }
+            }
+            var sessionLines = sessionIdx >= 0 ? allLines.Skip(sessionIdx).ToArray() : allLines;
+            var lines = sessionLines.TakeLast(2000).ToArray();
 
             ImGui.SetClipboardText(lines.Length > 0
                 ? string.Join("\n", lines)
