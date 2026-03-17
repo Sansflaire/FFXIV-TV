@@ -160,6 +160,8 @@ public sealed unsafe class D3DRenderer : IDisposable
     private int _omsetNullIntermCount = 0;
     // Counts how many times OMSetRT detected bb but conditions other than intermediate blocked.
     private int _omsetBlockedLogCount = 0;
+    // Total DrawIndexed seq entries emitted (prevents infinite spam when _cbkFrameCount stays 0).
+    private int _drawSeqLogTotal = 0;
     // Cached result of DSV vs backbuffer dimension check.
     // null = not yet checked; true = compatible (use depth); false = mismatch (no depth).
     private bool? _depthCompatible = null;
@@ -564,10 +566,12 @@ float4 main(VSOut input) : SV_TARGET {
                     }
                 }
 
-                // Diagnostic: log every DrawIndexed during _inUiPass for the first few frames.
+                // Diagnostic: log every DrawIndexed during _inUiPass for the first 100 entries total.
                 // Shows call order, index counts, and which texture is in SRV[0] at each step.
                 // Goal: identify which DrawIndexed is the true final composite (last one before BB bind).
-                if (_cbkFrameCount < 3)
+                // Hard-capped at 100 total (not per-frame) so it never drowns out other log entries
+                // even if _cbkFrameCount stays 0 (injection never fires).
+                if (_drawSeqLogTotal < 100)
                 {
                     try
                     {
@@ -583,7 +587,8 @@ float4 main(VSOut input) : SV_TARGET {
                             catch { /* ignore */ }
                         }
                         bool isCompositeSrv = srvTex == _compositeInputTexPtr && _compositeInputTexPtr != 0;
-                        Plugin.Log.Info($"[FFXIV-TV] DrawIndexed seq frame={_cbkFrameCount} idx={indexCount} rt=0x{rtvPtr:X} srv0tex=0x{srvTex:X} isCompositeSrv={isCompositeSrv}");
+                        _drawSeqLogTotal++;
+                        Plugin.Log.Info($"[FFXIV-TV] DrawIndexed seq #{_drawSeqLogTotal} frame={_cbkFrameCount} idx={indexCount} rt=0x{rtvPtr:X} srv0tex=0x{srvTex:X} isCompositeSrv={isCompositeSrv}");
                         rtvArr[0]?.Dispose();
                         dsv?.Dispose();
                         srvArr[0]?.Dispose();

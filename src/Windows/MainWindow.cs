@@ -126,6 +126,8 @@ public sealed class MainWindow
         if (ImGui.Checkbox("Visible##vis", ref vis)) { screen.Visible = vis; changed = true; }
 
         ImGui.SameLine();
+        bool isClientMode = _config.SyncMode == NetworkMode.Client;
+        if (isClientMode) ImGui.BeginDisabled();
         if (ImGui.SmallButton("Place at Player"))
         {
             var player = _objectTable.LocalPlayer;
@@ -135,6 +137,12 @@ public sealed class MainWindow
                 screen.YawDegrees = player.Rotation * (180f / MathF.PI);
                 changed = true;
             }
+        }
+        if (isClientMode)
+        {
+            ImGui.EndDisabled();
+            if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+                ImGui.SetTooltip("Screen position is controlled by the host.");
         }
 
         ImGui.SameLine();
@@ -633,11 +641,15 @@ public sealed class MainWindow
             using (var reader = new StreamReader(stream))
                 allText = reader.ReadToEnd();
 
-            var lines = allText
+            // Capture first 200 (init-time: PrepareHooks, BLOCKED, device init) + last 800 (recent activity).
+            // "first N + last M" ensures one-shot startup logs are never pushed out of view by log spam.
+            var allLines = allText
                 .Split('\n')
                 .Where(l => l.Contains("FFXIV-TV"))
-                .TakeLast(1000)
                 .ToArray();
+            var lines = allLines.Length <= 1000
+                ? allLines
+                : allLines.Take(200).Concat(allLines.TakeLast(800)).ToArray();
 
             ImGui.SetClipboardText(lines.Length > 0
                 ? string.Join("\n", lines)
