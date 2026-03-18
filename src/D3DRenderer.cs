@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Numerics;
+using System.Threading.Tasks;
 using System.Runtime.InteropServices;
 using Dalamud.Hooking;
 using Dalamud.Plugin.Services;
@@ -52,10 +53,10 @@ public sealed unsafe class D3DRenderer : IDisposable
     public float Contrast { get; set; } = 1.0f;
     /// <summary>RGBA tint multiplier. (1,1,1,1) = no change. A &lt; 1 makes screen transparent.</summary>
     public Vector4 Tint { get; set; } = Vector4.One;
-    /// <summary>HDR output scale: maps sRGB [0,1] values into linear HDR range before FFXIV tone-mapping.
-    /// We inject into R16G16B16A16_Float (HDR accumulation buffer) so raw sRGB values are too bright.
-    /// Default 0.18 (~photographic 18% gray reference). Range 0.01–1.0.</summary>
-    public float HdrScale { get; set; } = 0.18f;
+    /// <summary>Output scale multiplier applied before writing to the render target.
+    /// Injecting into the post-tonemap LDR intermediate (sRGB surface): 1.0 = correct.
+    /// Only needs adjustment if colors look wrong; range 0.01–1.0.</summary>
+    public float HdrScale { get; set; } = 1.0f;
 
     private ID3D11VertexShader?      _vs;
     private ID3D11PixelShader?       _ps;
@@ -97,6 +98,11 @@ public sealed unsafe class D3DRenderer : IDisposable
     private Hook<ClearRenderTargetViewDelegate>?   _clearRtvHook;
     private Hook<DrawIndexedDelegate>?             _drawIndexedHook;
     private Hook<DrawDelegate>?                    _drawHook;
+
+    // Re-entrancy guard: prevents ExecuteInlineDraw's internal D3D calls from recursing
+    // back into our hook logic. Any detour call that sees _inHookDetour=true immediately
+    // calls Original and returns, avoiding nested state mutation or exception leaks.
+    [ThreadStatic] private static bool _inHookDetour;
 
     private ID3D11DepthStencilView? _trackedDsv;
     private nint                    _contextPtr;
@@ -186,7 +192,11 @@ public sealed unsafe class D3DRenderer : IDisposable
     private bool _prevSceneRendered      = false;  // RendererServiceAlt: previous-call scene state
     private bool _omSetRtSceneInjectActive = false;  // re-entrancy guard for scene inject
     private int  _sceneInjectCount       = 0;
-    // Cache: rtvPtr → isSceneRtv (full-res + non-BGRA8). Avoids repeated COM queries.
+    // Post-tonemap inject: counter + cache for the first LDR full-res surface after bloom.
+    private int  _postTonemapInjectCount = 0;
+    // Cache: rtvPtr → isValidPostBloom (full-res + not R16 + not BB). Avoids repeated COM queries.
+    private readonly System.Collections.Generic.Dictionary<nint, bool> _postBloomRtvCache = new();
+    // Cache: rtvPtr → isSceneRtv (full-res + R16). Avoids repeated COM queries.
     private readonly System.Collections.Generic.Dictionary<nint, bool> _sceneRtvCache = new();
     private int _sceneRtvLogCount = 0;  // throttle per-ptr identification logs
     // Total PrepareHooks calls — used for periodic heartbeat log.
@@ -297,15 +307,34 @@ float4 main(VSOut input) : SV_TARGET {
     private readonly IGameInteropProvider _interop;
 
     // ── Constructor ───────────────────────────────────────────────────────────
+    // Pre-compiled shader bytecode — compiled on a background thread at construction
+    // to avoid a 300ms+ hitch on the render thread when TryInitialize() is first called.
+    private System.Threading.Tasks.Task<(ReadOnlyMemory<byte> vs, ReadOnlyMemory<byte> ps)>? _shaderCompileTask;
+
     public D3DRenderer(IGameInteropProvider interop)
     {
         _interop = interop;
+        // Kick off shader compilation immediately on a thread-pool thread.
+        // TryInitialize will wait for completion (IsCompleted check) without blocking the render thread.
+        _shaderCompileTask = System.Threading.Tasks.Task.Run(() =>
+        {
+            var vs = Compiler.Compile(VS_SRC, "main", "screen_vs", "vs_5_0");
+            var ps = Compiler.Compile(PS_SRC, "main", "screen_ps", "ps_5_0");
+            return (vs, ps);
+        });
     }
 
     // ── Init ──────────────────────────────────────────────────────────────────
     public bool TryInitialize()
     {
         if (_initialized) return true;
+
+        // Wait for background shader compilation before touching the D3D device.
+        if (_shaderCompileTask != null && !_shaderCompileTask.IsCompleted)
+        {
+            Plugin.Log.Debug("[FFXIV-TV] D3DRenderer: shaders still compiling — deferring init.");
+            return false;
+        }
 
         var kernelDevice = FFXIVClientStructs.FFXIV.Client.Graphics.Kernel.Device.Instance();
         if (kernelDevice == null)
@@ -383,6 +412,8 @@ float4 main(VSOut input) : SV_TARGET {
 
     private void OMSetRenderTargetsDetour(nint pCtx, uint numViews, nint* ppRTVs, nint pDSV)
     {
+        if (_inHookDetour) { _omSetRTHook?.Original(pCtx, numViews, ppRTVs, pDSV); return; }
+        _inHookDetour = true;
         try
         {
             if (pCtx == _contextPtr)
@@ -500,42 +531,18 @@ float4 main(VSOut input) : SV_TARGET {
                         && _mainSceneDsvPtr != 0 && _mainSceneRtvPtr != 0
                         && pDSV == _mainSceneDsvPtr && ppRTVs[0] == _mainSceneRtvPtr;
 
+                    // ── RendererServiceAlt: detect when 3D scene is complete ──────────────
+                    // We DON'T inject into R16G16B16A16_Float here — that causes FFXIV bloom
+                    // and auto-exposure to overexpose the rect. Instead, mark the scene done
+                    // so DrawIndexedDetour can inject into the post-tonemap LDR intermediate
+                    // (clean sRGB, no bloom). HUD draws on that surface after our inject → in front.
                     if (_prevSceneRendered && !currentSceneRendered && !_sceneDrawnThisFrame
-                        && !_omSetRtSceneInjectActive
-                        && _initialized && _storedScreen != null
-                        && _dsReverseZ != null && _dsReverseZWrite != null && _dsNoDepth != null && _cbParams != null)
+                        && !_omSetRtSceneInjectActive)
                     {
                         _sceneDrawnThisFrame = true;
-                        _frameInjectionDone = true;  // block BB inject — only scene path runs
                         _sceneInjectCount++;
                         if (_sceneInjectCount <= 5 || _sceneInjectCount % 300 == 0)
-                            Plugin.Log.Info($"[FFXIV-TV] RendererServiceAlt inject #{_sceneInjectCount} → rtv=0x{_mainSceneRtvPtr:X} dsv=0x{_mainSceneDsvPtr:X}");
-
-                        _omSetRtSceneInjectActive = true;
-                        var sceneRtv = new ID3D11RenderTargetView(_mainSceneRtvPtr);
-                        sceneRtv.AddRef();
-                        // Create a fresh DSV wrapper for this inject (avoids aliasing _trackedDsv).
-                        var sceneInjectDsv = new ID3D11DepthStencilView(_mainSceneDsvPtr);
-                        sceneInjectDsv.AddRef();
-                        var savedTrackedDsv = _trackedDsv;
-                        _trackedDsv = sceneInjectDsv;  // ExecuteInlineDraw reads _trackedDsv
-                        try
-                        {
-                            // restoreAfterDraw=true: restore state + unbind DSV after draw.
-                            // ExecuteInlineDraw re-binds (sceneRtv, sceneInjectDsv) explicitly,
-                            // draws, then restores. PyonPix DrawRenderer pattern.
-                            // _dsReverseZWrite: DepthWriteMask.All so FFXIV geometry depth-tests
-                            // against our written depth values after this inject returns.
-                            ExecuteInlineDraw(sceneRtv, useDepth: true, restoreAfterDraw: true, overrideDepthState: _dsReverseZWrite);
-                        }
-                        catch (Exception ex) { Plugin.Log.Warning($"[FFXIV-TV] Scene-pass inject failed: {ex.Message}"); }
-                        finally
-                        {
-                            _trackedDsv = savedTrackedDsv;  // restore before re-entrancy guard lifts
-                            sceneInjectDsv.Dispose();
-                            _omSetRtSceneInjectActive = false;
-                            sceneRtv.Dispose();
-                        }
+                            Plugin.Log.Info($"[FFXIV-TV] Scene complete #{_sceneInjectCount} → awaiting post-tonemap surface in DrawIndexedDetour");
                     }
 
                     // Update _prevSceneRendered for next call (skip during re-entrant inject call).
@@ -696,12 +703,15 @@ float4 main(VSOut input) : SV_TARGET {
         }
         finally
         {
+            _inHookDetour = false;
             _omSetRTHook?.Original(pCtx, numViews, ppRTVs, pDSV);
         }
     }
 
     private void ClearRenderTargetViewDetour(nint pCtx, nint pRTV, float* pColorRGBA)
     {
+        if (_inHookDetour) { _clearRtvHook?.Original(pCtx, pRTV, pColorRGBA); return; }
+        _inHookDetour = true;
         // Track (don't inject here). Record the most recently cleared non-backbuffer RT during
         // _inUiPass. DrawIndexed/Draw detour uses this as a fallback injection target.
         // NOTE: the ClearRTV-cleared surface may have been bound WITH a DSV during the 3D pass
@@ -723,6 +733,7 @@ float4 main(VSOut input) : SV_TARGET {
         }
         finally
         {
+            _inHookDetour = false;
             _clearRtvHook?.Original(pCtx, pRTV, pColorRGBA);
         }
     }
@@ -734,9 +745,69 @@ float4 main(VSOut input) : SV_TARGET {
     // calls (HUD) and Draw calls just call Original → HUD renders on top of the rect.
     private void DrawIndexedDetour(nint pCtx, uint indexCount, uint startIndex, int baseVertex)
     {
+        if (_inHookDetour) { _drawIndexedHook?.Original(pCtx, indexCount, startIndex, baseVertex); return; }
+        _inHookDetour = true;
         bool calledOriginal = false;
         try
         {
+            // Post-tonemap inject: fires on the first full-res non-R16 non-BB DrawIndexed in
+            // the no-DSV (post-processing) phase after the 3D scene is complete.
+            // Strategy: call Original first (lets the tonemap DrawIndexed write its LDR output
+            // to the intermediate RT), then inject our rect on top. HUD elements draw on the
+            // same intermediate RT afterward → HUD naturally in front of our rect.
+            // No depth testing: we're in a 2D post-processing pass with no DSV.
+            if (pCtx == _contextPtr && _inUiPass && _sceneDrawnThisFrame && !_frameInjectionDone
+                && _initialized && _storedScreen != null && _dsNoDepth != null && _cbParams != null)
+            {
+                var ptRtvArr = new ID3D11RenderTargetView[1];
+                _context!.OMGetRenderTargets(1u, ptRtvArr, out var ptDsv);
+                ptDsv?.Dispose();
+                nint ptRtvPtr = ptRtvArr[0]?.NativePointer ?? 0;
+                if (ptRtvPtr != 0 && !_knownBackbufferRtvPtrs.Contains(ptRtvPtr))
+                {
+                    if (!_postBloomRtvCache.TryGetValue(ptRtvPtr, out bool isValidTarget))
+                    {
+                        isValidTarget = false;
+                        try
+                        {
+                            var kdev = FFXIVClientStructs.FFXIV.Client.Graphics.Kernel.Device.Instance();
+                            using var ptRes = ptRtvArr[0]!.Resource;
+                            var ptTex = new ID3D11Texture2D(ptRes.NativePointer);
+                            ptTex.AddRef();
+                            try
+                            {
+                                var ptDesc = ptTex.Description;
+                                bool fullRes = kdev != null && ptDesc.Width == kdev->Width && ptDesc.Height == kdev->Height;
+                                // Only accept 8bpc BGRA/RGBA — the tonemapped sRGB output.
+                                // R11G11B10_Float, R16, R10G10B10A2 are HDR intermediates;
+                                // drawing into them corrupts the whole-scene color pipeline.
+                                bool isBgra8 = ptDesc.Format == Format.B8G8R8A8_UNorm
+                                            || ptDesc.Format == Format.B8G8R8A8_UNorm_SRgb
+                                            || ptDesc.Format == Format.R8G8B8A8_UNorm
+                                            || ptDesc.Format == Format.R8G8B8A8_UNorm_SRgb;
+                                isValidTarget = fullRes && isBgra8;
+                                Plugin.Log.Info($"[FFXIV-TV] PostBloom candidate 0x{ptRtvPtr:X} {ptDesc.Width}x{ptDesc.Height} fmt={ptDesc.Format} fullRes={fullRes} isBgra8={isBgra8} valid={isValidTarget}");
+                            }
+                            finally { ptTex.Dispose(); }
+                        }
+                        catch (Exception ex) { Plugin.Log.Warning($"[FFXIV-TV] PostBloom check failed: {ex.Message}"); }
+                        _postBloomRtvCache[ptRtvPtr] = isValidTarget;
+                    }
+                    if (isValidTarget)
+                    {
+                        _frameInjectionDone = true;
+                        calledOriginal = true;
+                        _drawIndexedHook?.Original(pCtx, indexCount, startIndex, baseVertex);
+                        _postTonemapInjectCount++;
+                        if (_postTonemapInjectCount <= 5 || _postTonemapInjectCount % 300 == 0)
+                            Plugin.Log.Info($"[FFXIV-TV] PostTonemap inject #{_postTonemapInjectCount} idx={indexCount} rtv=0x{ptRtvPtr:X}");
+                        try { ExecuteInlineDraw(ptRtvArr[0]!, useDepth: false); }
+                        catch (Exception ex) { Plugin.Log.Warning($"[FFXIV-TV] PostTonemap inject failed: {ex.Message}"); }
+                    }
+                }
+                ptRtvArr[0]?.Dispose();
+            }
+
             // BB-path inject: fires on the first DrawIndexed after BB is bound (composite blit).
             if (pCtx == _contextPtr && _currentBbRtvPtr != 0
                 && !_frameInjectionDone
@@ -819,6 +890,7 @@ float4 main(VSOut input) : SV_TARGET {
         }
         finally
         {
+            _inHookDetour = false;
             if (!calledOriginal)
                 _drawIndexedHook?.Original(pCtx, indexCount, startIndex, baseVertex);
         }
@@ -829,6 +901,8 @@ float4 main(VSOut input) : SV_TARGET {
     // with useDepth=true so 3D geometry/characters correctly occlude our rect (reversed-Z DSV).
     private void DrawDetour(nint pCtx, uint vertexCount, uint startVertex)
     {
+        if (_inHookDetour) { _drawHook?.Original(pCtx, vertexCount, startVertex); return; }
+        _inHookDetour = true;
         bool calledOriginal = false;
         try
         {
@@ -876,6 +950,7 @@ float4 main(VSOut input) : SV_TARGET {
         }
         finally
         {
+            _inHookDetour = false;
             if (!calledOriginal)
                 _drawHook?.Original(pCtx, vertexCount, startVertex);
         }
@@ -1005,9 +1080,9 @@ float4 main(VSOut input) : SV_TARGET {
     {
         _cbParams = _device!.CreateConstantBuffer<CbParams>();
 
-        ReadOnlyMemory<byte> vsBlob = Compiler.Compile(VS_SRC, "main", "screen_vs", "vs_5_0");
-        ReadOnlyMemory<byte> psBlob = Compiler.Compile(PS_SRC, "main", "screen_ps", "ps_5_0");
-
+        // Retrieve blobs from the pre-compiled task (guaranteed complete by TryInitialize check).
+        var (vsBlob, psBlob) = _shaderCompileTask!.Result;
+        _shaderCompileTask = null; // allow GC of the task
         Plugin.Log.Info($"[FFXIV-TV] Shader blobs: VS={vsBlob.Length}B PS={psBlob.Length}B");
 
         _vs = _device.CreateVertexShader(vsBlob.Span);
@@ -1419,6 +1494,7 @@ float4 main(VSOut input) : SV_TARGET {
     // ── Dispose ───────────────────────────────────────────────────────────────
     public void Dispose()
     {
+        _shaderCompileTask = null; // let task finish naturally; we just drop the reference
         DisposeResources();
         _context = null;
         _device?.Dispose();

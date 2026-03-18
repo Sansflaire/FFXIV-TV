@@ -1,6 +1,6 @@
 # FFXIV-TV — Active Issues
 
-Last updated: 2026-03-18 (v0.5.66)
+Last updated: 2026-03-18 (v0.5.72)
 
 ---
 
@@ -8,6 +8,38 @@ Last updated: 2026-03-18 (v0.5.66)
 
 **Goal:** Rect is visible as a D3D11 world-space object, with 2D HUD (chat, hotbar,
 map, inventory) rendering IN FRONT of it.
+
+---
+
+## Crash History
+
+### v0.5.51 — SwapChain.Present crash (E0434352, managed .NET exception) — FIXED in v0.5.72
+
+**Symptom:** Game crashes at `Client::Graphics::Kernel::SwapChain.Present` with CLR exception
+code E0434352 (~10–14 seconds after loading plugin with a visible screen). No exception
+logged before crash.
+
+**Root cause (hypothesis):** Re-entrant hook detour calls from inside `ExecuteInlineDraw` —
+when our PostTonemap inject calls `_context.OMSetRenderTargets(...)` and `_context.Draw(6, 0)`,
+those re-enter `OMSetRenderTargetsDetour` / `DrawDetour`. If any Vortice call inside the
+re-entrant detour throws a managed exception (e.g., DXGI_ERROR_INVALID_CALL from a COM HRESULT),
+that exception can escape the re-entrant detour's finally block and propagate upward through
+the native D3D call stack to `SwapChain.Present`, crashing the game.
+
+**Secondary cause:** Shader compilation in `CreateResources()` called on the render thread →
+340ms hitch on first frame (Dalamud "[HITCH] Long UiBuilder(FFXIV-TV) detected"). This blocks
+the render thread, potentially triggering GPU driver timeouts or AMD RX 9070 driver-level
+errors that corrupt the device state.
+
+**Fix (v0.5.72):**
+1. `[ThreadStatic] private static bool _inHookDetour` re-entrancy guard: all four hook detours
+   check this flag at entry. If already set (re-entrant call from ExecuteInlineDraw), they
+   immediately call Original and return, bypassing all managed logic and exception surface.
+   The flag is set in the detour's try-entry and cleared in the finally, ensuring it resets
+   even on exception.
+2. Shader compilation (`Compiler.Compile`) moved to a background `Task.Run` in the
+   `D3DRenderer` constructor. `TryInitialize` checks `_shaderCompileTask.IsCompleted` and
+   returns false (defers) until compilation finishes. Eliminates the 340ms render-thread hitch.
 
 ---
 
