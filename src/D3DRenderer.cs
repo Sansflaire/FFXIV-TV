@@ -52,13 +52,18 @@ public sealed unsafe class D3DRenderer : IDisposable
     public float Contrast { get; set; } = 1.0f;
     /// <summary>RGBA tint multiplier. (1,1,1,1) = no change. A &lt; 1 makes screen transparent.</summary>
     public Vector4 Tint { get; set; } = Vector4.One;
+    /// <summary>HDR output scale: maps sRGB [0,1] values into linear HDR range before FFXIV tone-mapping.
+    /// We inject into R16G16B16A16_Float (HDR accumulation buffer) so raw sRGB values are too bright.
+    /// Default 0.18 (~photographic 18% gray reference). Range 0.01–1.0.</summary>
+    public float HdrScale { get; set; } = 0.18f;
 
     private ID3D11VertexShader?      _vs;
     private ID3D11PixelShader?       _ps;
     private ID3D11BlendState?        _blendState;
     private ID3D11RasterizerState?   _rasterizer;
     private ID3D11DepthStencilState? _dsNoDepth;
-    private ID3D11DepthStencilState? _dsReverseZ;
+    private ID3D11DepthStencilState? _dsReverseZ;       // DepthWriteMask.Zero — BB inject (nothing renders after)
+    private ID3D11DepthStencilState? _dsReverseZWrite;  // DepthWriteMask.All  — scene inject (FFXIV geometry must depth-test against our rect)
     private ID3D11SamplerState?      _sampler;
 
     // ── Vtable hook delegates ─────────────────────────────────────────────────
@@ -162,6 +167,28 @@ public sealed unsafe class D3DRenderer : IDisposable
     private int _omsetBlockedLogCount = 0;
     // Total DrawIndexed seq entries emitted (prevents infinite spam when _cbkFrameCount stays 0).
     private int _drawSeqLogTotal = 0;
+    // ── Scene-pass inject (PyonPix RendererServiceAlt approach) ──────────────
+    // Fire inject when FFXIV transitions AWAY from the 3D scene pass.
+    // At that moment all 3D geometry is drawn; depth buffer is valid.
+    // We manually re-bind MainSceneDSV+MainSceneRTV and draw our rect.
+    // Post-processing + HUD render after → naturally appear in front of rect.
+    //
+    // MainSceneDSV  = first full-resolution (device w×h) DSV seen before _inUiPass.
+    // MainSceneRTV  = first full-res BGRA8 (B8G8R8A8_UNorm) RTV seen alongside MainSceneDSV.
+    //                 PyonPix analysis: B8G8R8A8_UNorm scores +500; R16G16B16A16_Float scores 0.
+    //                 Reset every frame (PyonPix AutoSetRTV equivalent) so it re-latches on first BGRA8 bind.
+    // _prevSceneRendered: true when the PREVIOUS OMSetRenderTargets call bound MainDSV+MainRTV.
+    //                 Inject fires when _prevSceneRendered=true && currentSceneRendered=false
+    //                 (i.e., FFXIV just left the scene pass). RendererServiceAlt pattern.
+    private nint _mainSceneDsvPtr        = 0;  // set once, stable
+    private nint _mainSceneRtvPtr        = 0;  // updated each frame
+    private bool _sceneDrawnThisFrame    = false;
+    private bool _prevSceneRendered      = false;  // RendererServiceAlt: previous-call scene state
+    private bool _omSetRtSceneInjectActive = false;  // re-entrancy guard for scene inject
+    private int  _sceneInjectCount       = 0;
+    // Cache: rtvPtr → isSceneRtv (full-res + non-BGRA8). Avoids repeated COM queries.
+    private readonly System.Collections.Generic.Dictionary<nint, bool> _sceneRtvCache = new();
+    private int _sceneRtvLogCount = 0;  // throttle per-ptr identification logs
     // Total PrepareHooks calls — used for periodic heartbeat log.
     private int _prepareHooksCallCount = 0;
     // Throttle for _pendingLearnBackbuffer-consumed-but-skipped log.
@@ -213,7 +240,7 @@ public sealed unsafe class D3DRenderer : IDisposable
         public float     Brightness;      // 4 — linear exposure multiplier
         public float     Gamma;           // 4 — power curve (1/Gamma applied to rgb)
         public float     Contrast;        // 4 — contrast around 0.5 midpoint
-        public float     _pad0;           // 4 — 16-byte alignment
+        public float     HdrScale;        // 4 — HDR output scale: maps sRGB [0,1] into linear HDR range before tone-mapping
         public Vector4   Tint;            // 16 — rgba multiplier (1,1,1,1 = no change)
     }
 
@@ -224,7 +251,7 @@ public sealed unsafe class D3DRenderer : IDisposable
 cbuffer CbParams : register(b0) {
     row_major float4x4 ViewProj;
     row_major float4x4 ScreenTransform;
-    float Brightness; float Gamma; float Contrast; float _pad0;
+    float Brightness; float Gamma; float Contrast; float HdrScale;
     float4 Tint;
 };";
 
@@ -264,7 +291,7 @@ float4 main(VSOut input) : SV_TARGET {
     color.rgb *= Brightness;
     color.rgb  = saturate((color.rgb - 0.5f) * Contrast + 0.5f);
     color.rgb  = pow(saturate(color.rgb), 1.0f / max(Gamma, 0.001f));
-    return float4(color.rgb * Tint.rgb, color.a * Tint.a);
+    return float4(color.rgb * Tint.rgb * HdrScale, color.a * Tint.a);
 }";
 
     private readonly IGameInteropProvider _interop;
@@ -368,8 +395,9 @@ float4 main(VSOut input) : SV_TARGET {
 
                     // Track the main-scene DSV for depth testing during our inject.
                     // Only update BEFORE _inUiPass — once we enter post-processing/2D, freeze it.
-                    // Post-processing passes may bind DSVs with different dimensions (would mismatch BB).
-                    if (hasDsv && !_inUiPass)
+                    // Skip update during scene inject (re-entrant call) to avoid disposing the
+                    // DSV wrapper we are currently using inside ExecuteInlineDraw.
+                    if (hasDsv && !_inUiPass && !_omSetRtSceneInjectActive)
                     {
                         _trackedDsv?.Dispose();
                         _trackedDsv = new ID3D11DepthStencilView(pDSV);
@@ -381,6 +409,138 @@ float4 main(VSOut input) : SV_TARGET {
                             Plugin.Log.Info($"[FFXIV-TV] main-scene DSV captured: 0x{pDSV:X}");
                         }
                     }
+
+                    if (hasDsv && !_inUiPass)
+                    {
+                        // ── Scene-pass identification (PyonPix approach) ──────────────────
+                        // Step 1: identify MainSceneDSV (one-time).
+                        var kdev = FFXIVClientStructs.FFXIV.Client.Graphics.Kernel.Device.Instance();
+                        if (kdev != null && _mainSceneDsvPtr == 0)
+                        {
+                            try
+                            {
+                                var dsvView = new ID3D11DepthStencilView(pDSV);
+                                dsvView.AddRef();
+                                try
+                                {
+                                    using var dsvRes = dsvView.Resource;
+                                    var dsvTex = new ID3D11Texture2D(dsvRes.NativePointer);
+                                    dsvTex.AddRef();
+                                    try
+                                    {
+                                        var d = dsvTex.Description;
+                                        if (d.Width == kdev->Width && d.Height == kdev->Height)
+                                        {
+                                            _mainSceneDsvPtr = pDSV;
+                                            Plugin.Log.Info($"[FFXIV-TV] MainSceneDSV: 0x{pDSV:X} {d.Width}x{d.Height}");
+                                        }
+                                    }
+                                    finally { dsvTex.Dispose(); }
+                                }
+                                finally { dsvView.Dispose(); }
+                            }
+                            catch (Exception ex) { Plugin.Log.Warning($"[FFXIV-TV] MainSceneDSV check: {ex.Message}"); }
+                        }
+
+                        // Step 2: update MainSceneRTV when paired with MainSceneDSV.
+                        // Uses _sceneRtvCache to avoid re-querying known pointers.
+                        if (kdev != null && _mainSceneDsvPtr != 0 && pDSV == _mainSceneDsvPtr)
+                        {
+                            nint rtvPtr3d = ppRTVs[0];
+                            if (!_sceneRtvCache.TryGetValue(rtvPtr3d, out bool isSceneRtv))
+                            {
+                                isSceneRtv = false;
+                                try
+                                {
+                                    var rv = new ID3D11RenderTargetView(rtvPtr3d);
+                                    rv.AddRef();
+                                    try
+                                    {
+                                        using var rtvRes = rv.Resource;
+                                        var rtvTex = new ID3D11Texture2D(rtvRes.NativePointer);
+                                        rtvTex.AddRef();
+                                        try
+                                        {
+                                            var d = rtvTex.Description;
+                                            bool fullRes = d.Width == kdev->Width && d.Height == kdev->Height;
+                                            // PyonPix RendererServiceAlt targets R16G16B16A16_Float —
+                                            // FFXIV's HDR accumulation buffer (MainRTV).
+                                            // The 71973 DrawIndexed READS from R16 as SRV and writes to a
+                                            // different intermediate → our inject into R16 survives into
+                                            // the post-processing chain. BGRA8 fails because FFXIV clears
+                                            // it immediately after binding AND 71973 overwrites it.
+                                            bool isR16 = d.Format == Format.R16G16B16A16_Float;
+                                            isSceneRtv = fullRes && isR16;
+                                            if (_sceneRtvLogCount < 15)
+                                            {
+                                                _sceneRtvLogCount++;
+                                                Plugin.Log.Info($"[FFXIV-TV] SceneRTV candidate 0x{rtvPtr3d:X} {d.Width}x{d.Height} fmt={d.Format} fullRes={fullRes} isR16={isR16} → isScene={isSceneRtv}");
+                                            }
+                                        }
+                                        finally { rtvTex.Dispose(); }
+                                    }
+                                    finally { rv.Dispose(); }
+                                }
+                                catch (Exception ex) { Plugin.Log.Warning($"[FFXIV-TV] SceneRTV check 0x{rtvPtr3d:X}: {ex.Message}"); }
+                                _sceneRtvCache[rtvPtr3d] = isSceneRtv;
+                            }
+                            if (isSceneRtv)
+                                _mainSceneRtvPtr = rtvPtr3d;  // always update → converges to LAST qualifying R16 each frame (PyonPix AutoSetRTV)
+                        }
+                    }
+
+                    // ── RendererServiceAlt inject: fire when game LEAVES MainDSV+MainRTV ──────
+                    // PyonPix RendererServiceAlt pattern: check _prevSceneRendered BEFORE
+                    // updating it. Fires on the OMSetRenderTargets call that transitions AWAY
+                    // from MainDSV+R16G16B16A16_Float (i.e., after 3D scene is fully drawn).
+                    // At that moment we re-bind R16+MainDSV, draw rect, restore state.
+                    // Post-processing reads R16 (with our rect baked in) → composites to
+                    // intermediates → BB. HUD draws after all of this → naturally in front.
+                    bool currentSceneRendered = hasDsv && !_inUiPass
+                        && _mainSceneDsvPtr != 0 && _mainSceneRtvPtr != 0
+                        && pDSV == _mainSceneDsvPtr && ppRTVs[0] == _mainSceneRtvPtr;
+
+                    if (_prevSceneRendered && !currentSceneRendered && !_sceneDrawnThisFrame
+                        && !_omSetRtSceneInjectActive
+                        && _initialized && _storedScreen != null
+                        && _dsReverseZ != null && _dsReverseZWrite != null && _dsNoDepth != null && _cbParams != null)
+                    {
+                        _sceneDrawnThisFrame = true;
+                        _frameInjectionDone = true;  // block BB inject — only scene path runs
+                        _sceneInjectCount++;
+                        if (_sceneInjectCount <= 5 || _sceneInjectCount % 300 == 0)
+                            Plugin.Log.Info($"[FFXIV-TV] RendererServiceAlt inject #{_sceneInjectCount} → rtv=0x{_mainSceneRtvPtr:X} dsv=0x{_mainSceneDsvPtr:X}");
+
+                        _omSetRtSceneInjectActive = true;
+                        var sceneRtv = new ID3D11RenderTargetView(_mainSceneRtvPtr);
+                        sceneRtv.AddRef();
+                        // Create a fresh DSV wrapper for this inject (avoids aliasing _trackedDsv).
+                        var sceneInjectDsv = new ID3D11DepthStencilView(_mainSceneDsvPtr);
+                        sceneInjectDsv.AddRef();
+                        var savedTrackedDsv = _trackedDsv;
+                        _trackedDsv = sceneInjectDsv;  // ExecuteInlineDraw reads _trackedDsv
+                        try
+                        {
+                            // restoreAfterDraw=true: restore state + unbind DSV after draw.
+                            // ExecuteInlineDraw re-binds (sceneRtv, sceneInjectDsv) explicitly,
+                            // draws, then restores. PyonPix DrawRenderer pattern.
+                            // _dsReverseZWrite: DepthWriteMask.All so FFXIV geometry depth-tests
+                            // against our written depth values after this inject returns.
+                            ExecuteInlineDraw(sceneRtv, useDepth: true, restoreAfterDraw: true, overrideDepthState: _dsReverseZWrite);
+                        }
+                        catch (Exception ex) { Plugin.Log.Warning($"[FFXIV-TV] Scene-pass inject failed: {ex.Message}"); }
+                        finally
+                        {
+                            _trackedDsv = savedTrackedDsv;  // restore before re-entrancy guard lifts
+                            sceneInjectDsv.Dispose();
+                            _omSetRtSceneInjectActive = false;
+                            sceneRtv.Dispose();
+                        }
+                    }
+
+                    // Update _prevSceneRendered for next call (skip during re-entrant inject call).
+                    if (!_omSetRtSceneInjectActive)
+                        _prevSceneRendered = currentSceneRendered;
 
                     // Detect 3D→2D transition: first RTV-binding no-DSV call after a DSV call.
                     if (!hasDsv && _prevCallHadDsv)
@@ -567,16 +727,39 @@ float4 main(VSOut input) : SV_TARGET {
         }
     }
 
-    // DrawIndexedDetour: bookkeeping + sequential DrawIndexed diagnostics.
-    // DrawIndexed calls fire BEFORE OMSetRenderTargets(backbuffer), so _currentBbRtvPtr is
-    // always 0 here. Injection is handled by DrawDetour (fires after BB bind).
-    // Diagnostic: log each DrawIndexed during _inUiPass (index count + current RT + SRV[0] tex)
-    // to find which DrawIndexed is the true final composite before the BB bind.
+    // DrawIndexedDetour: primary injection point.
+    // BB is already bound when the composite-blit DrawIndexed fires, so _currentBbRtvPtr != 0.
+    // On the first DrawIndexed with BB bound we call Original first (composite blit runs),
+    // then inject our rect, then set _frameInjectionDone=true.  All subsequent DrawIndexed
+    // calls (HUD) and Draw calls just call Original → HUD renders on top of the rect.
     private void DrawIndexedDetour(nint pCtx, uint indexCount, uint startIndex, int baseVertex)
     {
         bool calledOriginal = false;
         try
         {
+            // BB-path inject: fires on the first DrawIndexed after BB is bound (composite blit).
+            if (pCtx == _contextPtr && _currentBbRtvPtr != 0
+                && !_frameInjectionDone
+                && _initialized && _storedScreen != null
+                && _dsReverseZ != null && _dsNoDepth != null && _cbParams != null)
+            {
+                _frameInjectionDone = true;
+                calledOriginal = true;
+                _drawIndexedHook?.Original(pCtx, indexCount, startIndex, baseVertex);
+                _drawDrvEligCount++;
+                if (_drawDrvEligCount <= 5 || _drawDrvEligCount % 300 == 0)
+                    Plugin.Log.Info($"[FFXIV-TV] DrawIndexed inject #{_drawDrvEligCount} into bb=0x{_currentBbRtvPtr:X}");
+                var bbRtv = new ID3D11RenderTargetView(_currentBbRtvPtr);
+                bbRtv.AddRef();
+                try
+                {
+                    bool useDepth = CheckDepthCompatibility(bbRtv);
+                    ExecuteInlineDraw(bbRtv, useDepth);
+                }
+                catch (Exception ex) { Plugin.Log.Warning($"[FFXIV-TV] DrawIndexed inject failed: {ex.Message}"); }
+                finally { bbRtv.Dispose(); }
+            }
+
             if (pCtx == _contextPtr && _inUiPass && _rtvToTexture.Count > 0)
             {
                 if (!_compositeInputsLogged)
@@ -649,7 +832,8 @@ float4 main(VSOut input) : SV_TARGET {
         bool calledOriginal = false;
         try
         {
-            if (pCtx == _contextPtr && _inUiPass && _currentBbRtvPtr != 0 && !_frameInjectionDone)
+            if (pCtx == _contextPtr && _inUiPass && _currentBbRtvPtr != 0
+                && !_frameInjectionDone)
             {
                 // Log which condition is blocking injection (throttled to first 5).
                 if (!_initialized || _storedScreen == null || _dsReverseZ == null || _dsNoDepth == null || _cbParams == null)
@@ -736,7 +920,13 @@ float4 main(VSOut input) : SV_TARGET {
 
     // useDepth=true: bind _trackedDsv (reversed-Z depth testing — correct for intermediate RTs).
     // useDepth=false: no DSV — safe for composite input texture which may differ in size from DSV.
-    private void ExecuteInlineDraw(ID3D11RenderTargetView rtv, bool useDepth = true)
+    // restoreAfterDraw=true  (default, BB inject): after draw, unbind the DSV so subsequent
+    //   FFXIV 2D UI draw calls aren't affected by the depth stencil we bound.
+    // restoreAfterDraw=false: leave bound targets as-is (caller manages state).
+    // overrideDepthState: when non-null, use this depth state instead of the default selection.
+    //   Scene inject passes _dsReverseZWrite (DepthWriteMask.All) so FFXIV geometry depth-tests
+    //   against our written depth values. BB inject uses default (_dsReverseZ, WriteZero).
+    private void ExecuteInlineDraw(ID3D11RenderTargetView rtv, bool useDepth = true, bool restoreAfterDraw = true, ID3D11DepthStencilState? overrideDepthState = null)
     {
         if (_context == null || _storedScreen == null) return;
         // Use active SRV when available; fall back to 1x1 black when _activeSrv is null
@@ -749,7 +939,7 @@ float4 main(VSOut input) : SV_TARGET {
         }
 
         ID3D11DepthStencilView? dsv = useDepth ? _trackedDsv : null;
-        var depthState = dsv != null ? _dsReverseZ! : _dsNoDepth!;
+        var depthState = overrideDepthState ?? (dsv != null ? _dsReverseZ! : _dsNoDepth!);
 
         UpdateCbParams();
 
@@ -763,17 +953,18 @@ float4 main(VSOut input) : SV_TARGET {
         finally
         {
             RestoreState(saved);
-            // Reset RT to (surface, no DSV) after our draw. Without this, the 3D depth
-            // stencil view we bound stays active for FFXIV's subsequent 2D UI draw calls
-            // (chat panel, hotbar, etc.), which can cause them to fail depth testing and
-            // disappear.
-            _context.OMSetRenderTargets(new[] { rtv }, (ID3D11DepthStencilView?)null);
+            if (restoreAfterDraw)
+            {
+                // BB inject: unset DSV so FFXIV's subsequent 2D UI draw calls aren't depth-tested.
+                _context.OMSetRenderTargets(new[] { rtv }, (ID3D11DepthStencilView?)null);
+            }
+            // When restoreAfterDraw=false (scene-pass inject), leave (rtv, mainDSV) bound.
             // rtv lifetime is managed by the caller — do NOT Dispose here.
         }
 
         _cbkFrameCount++;
         if (_cbkFrameCount <= 3 || _cbkFrameCount % 300 == 0)
-            Plugin.Log.Info($"[FFXIV-TV] inline draw frame={_cbkFrameCount} dsv={dsv != null}");
+            Plugin.Log.Info($"[FFXIV-TV] inline draw frame={_cbkFrameCount} dsv={dsv != null} restoreAfter={restoreAfterDraw}");
     }
 
     // Log the PS SRV inputs at composite DrawIndexed time; store SRV[0] texture ptr for injection.
@@ -842,8 +1033,18 @@ float4 main(VSOut input) : SV_TARGET {
         _dsReverseZ = _device.CreateDepthStencilState(new DepthStencilDescription
         {
             DepthEnable    = true,
-            DepthWriteMask = DepthWriteMask.Zero,
+            DepthWriteMask = DepthWriteMask.Zero,   // don't write depth — BB inject (nothing renders after)
             DepthFunc      = ComparisonFunction.Greater,
+            StencilEnable  = false,
+        });
+
+        // Scene inject: write depth so FFXIV geometry depth-tests against our rect.
+        // GreaterEqual matches FFXIV's reversed-Z convention (near=1, far=0; "pass if closer").
+        _dsReverseZWrite = _device.CreateDepthStencilState(new DepthStencilDescription
+        {
+            DepthEnable    = true,
+            DepthWriteMask = DepthWriteMask.All,    // write depth — scene inject (FFXIV geometry renders after)
+            DepthFunc      = ComparisonFunction.GreaterEqual,
             StencilEnable  = false,
         });
 
@@ -991,6 +1192,11 @@ float4 main(VSOut input) : SV_TARGET {
         _bbBindCountThisUiPass   = 0;
         _currentBbRtvPtr         = 0;
         _lastClearedUiPassRtvPtr = 0;
+        _sceneDrawnThisFrame     = false;
+        _prevSceneRendered       = false;
+        // Reset MainSceneRTV each frame so it re-converges to the LAST qualifying RTV
+        // (PyonPix AutoSetRTV equivalent — ensures we track pipeline changes across frames).
+        _mainSceneRtvPtr         = 0;
 
         var ctrl = Control.Instance();
         if (ctrl == null) return;
@@ -1013,7 +1219,7 @@ float4 main(VSOut input) : SV_TARGET {
                 $"bbTex={_knownBackbufferTexturePtrs.Count} bbRtv={_knownBackbufferRtvPtrs.Count} " +
                 $"cbkFrames={_cbkFrameCount} storedScreen={_storedScreen != null} " +
                 $"inUiPass={_inUiPass} currentBbRtv=0x{_currentBbRtvPtr:X} " +
-                $"init={_initialized} dsRZ={_dsReverseZ != null} dsND={_dsNoDepth != null} cb={_cbParams != null}");
+                $"init={_initialized} dsRZ={_dsReverseZ != null} dsRZW={_dsReverseZWrite != null} dsND={_dsNoDepth != null} cb={_cbParams != null}");
         }
     }
 
@@ -1112,6 +1318,7 @@ float4 main(VSOut input) : SV_TARGET {
             Brightness      = Brightness,
             Gamma           = Gamma,
             Contrast        = Contrast,
+            HdrScale        = HdrScale,
             Tint            = Tint,
         };
         _context.Unmap(_cbParams);
@@ -1223,6 +1430,9 @@ float4 main(VSOut input) : SV_TARGET {
     {
         _compositeInputRtv?.Dispose(); _compositeInputRtv  = null;
         _compositeInputTexPtr = 0;
+        _mainSceneDsvPtr     = 0;
+        _mainSceneRtvPtr     = 0;
+        _sceneRtvCache.Clear();
         _omSetRTHook?.Disable();
         _omSetRTHook?.Dispose();         _omSetRTHook      = null;
         _clearRtvHook?.Disable();
@@ -1239,6 +1449,7 @@ float4 main(VSOut input) : SV_TARGET {
         _imageSrv?.Dispose();     _imageSrv     = null;
         _loadedImagePath = string.Empty;
         _sampler?.Dispose();      _sampler      = null;
+        _dsReverseZWrite?.Dispose(); _dsReverseZWrite = null;
         _dsReverseZ?.Dispose();   _dsReverseZ   = null;
         _dsNoDepth?.Dispose();    _dsNoDepth    = null;
         _rasterizer?.Dispose();   _rasterizer   = null;

@@ -64,6 +64,11 @@ public sealed class Configuration : IPluginConfiguration
     /// <summary>Contrast around 0.5 midpoint. 1.0 = no change. >1 = more contrast. Range 0.0–3.0.</summary>
     public float Contrast { get; set; } = 1.0f;
 
+    /// <summary>HDR output scale: maps sRGB [0,1] values into linear HDR range before FFXIV tone-mapping.
+    /// We inject into R16G16B16A16_Float (HDR accumulation buffer) — raw sRGB 1.0 is too bright.
+    /// Default 0.18 (~18% gray reference). Increase if screen looks too dark; decrease if glowing.</summary>
+    public float HdrScale { get; set; } = 0.18f;
+
     /// <summary>Tint color applied to the displayed image/video (RGBA, 0–1 per channel).</summary>
     public float TintR { get; set; } = 1f;
     public float TintG { get; set; } = 1f;

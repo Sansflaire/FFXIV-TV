@@ -1,6 +1,6 @@
 # FFXIV-TV — Active Issues
 
-Last updated: 2026-03-16 (v0.5.47)
+Last updated: 2026-03-18 (v0.5.66)
 
 ---
 
@@ -46,11 +46,11 @@ map, inventory) rendering IN FRONT of it.
    UV is computed via bilinear inverse from SV_POSITION. This IS working.
    *Source: Phase2-D3D-Rendering-Notes.md, v0.5.18.*
 
-9. **PyonPix does NOT have UI in front of its rect either.**
-   The "fires at the right point (after scene, before UI)" claim is unverified or wrong.
-   PyonPix has the same unsolved UI layering problem. It is NOT a working reference for
-   UI-over-world-space. It only confirms that a rect CAN appear in 3D world space.
-   *Confirmed by user 2026-03-16. Previous "confirmed working competitor" note was misleading.*
+9. **PyonPix DOES have HUD in front of its rect.**
+   Confirmed by user screenshot (2026-03-17): chat box clearly renders over the PyonPix screen.
+   PyonPix IS a valid reference for UI-over-world-space rendering. Its approach (BGRA8 target +
+   DepthWriteMask.All + RendererService timing) is what v0.5.63 implements.
+   *Previous note was incorrect — that was based on an unverified assumption before decompilation.*
 
 ---
 
@@ -73,6 +73,14 @@ All attempts target the same goal: inject into the D3D pipeline so rect appears 
 | 11 | **DrawDetour inject with `useDepth=true` (naive — no dimension check)** | Rect entirely missing. | D3D11 silently renders nothing when DSV and RTV have different texture dimensions. If FFXIV's internal render resolution ≠ output resolution, `_trackedDsv` is the wrong size for the BB. No exception — just invisible. *v0.5.46.* |
 | 10 | **DrawIndexedDetour + DrawDetour both injecting into BB** | Flickering | DrawIndexedDetour missing `_currentBbRtvPtr != 0` guard → NullReferenceException. *v0.5.41.* |
 | 11 | **DrawDetour inject (Original-first) + DrawIndexedDetour composite inject (Original-first)** | Flickering | DrawIndexedDetour set `_frameInjectionDone=true` during post-processing (before BB bind), blocking DrawDetour's BB inject. *v0.5.43.* |
+| 12 | **OMSetRenderTargets scene-pass inject (PyonPix approach) — v0.5.57/v0.5.58: fire on FIRST MainSceneDSV+MainSceneRTV bind** | FAILED (rect invisible in v0.5.57; v0.5.58 reverted to dual-draw) | Fired too early — at the FIRST OMSetRenderTargets call for the scene pass, before FFXIV clears + draws the 3D scene. FFXIV's ClearDepthStencilView + 3D geometry draws immediately overwrote our inject. Also: v0.5.57 set `_frameInjectionDone=true` before BB fallback could run → no rect at all. v0.5.58 removed that flag so BB inject still fired (rect visible, HUD still behind). Root cause: need `RendererServiceAlt` pattern — inject AFTER scene draws, not before. |
+| 13 | **OMSetRenderTargets scene-pass inject — `RendererServiceAlt` pattern into R16G16B16A16_Float** | FAILED (v0.5.59) | `_mainSceneRtvPtr` was set to the LAST full-res non-BGRA8 RTV paired with MainDSV = R16G16B16A16_Float. Scene inject fired correctly (log confirmed). But R16G16B16A16_Float is a compositing/accumulation buffer — a 71973-index DrawIndexed in the no-DSV phase completely overwrites it every frame. Rect drew into R16G16B16A16_Float, then was immediately erased. `_frameInjectionDone=true` blocked BB fallback → rect invisible. Root cause: R16G16B16A16_Float is NOT a stable final scene surface. |
+| 14 | **OMSetRenderTargets scene-pass inject — `RendererServiceAlt` into BGRA8 (first full-res RTV with MainDSV)** | FAILED (v0.5.60) | Injected into BGRA8 at the DSV-phase exit. But the no-DSV DrawIndexed phase fires 71973 (and other calls) directly to BGRA8, completely overwriting our rect. Log confirmed: `idx=71973 rt=0x259B6254660` fires in no-DSV phase after our inject. Additionally `_frameInjectionDone=true` blocked BB fallback → rect invisible. Fix: removed `_frameInjectionDone=true` from scene inject (v0.5.61) — BB inject restored. Core problem: BGRA8 is rewritten in the no-DSV phase regardless of when we inject in the DSV phase. No injection point in the DSV phase survives into the final frame. |
+| 15 | **OMSetRenderTargets scene-pass inject — RendererService into R16G16B16A16_Float with DepthWriteMask.Zero** | FAILED (v0.5.62) | Two bugs combined: (a) `_mainSceneRtvPtr` filtered `notBgra` so it captured R16G16B16A16_Float instead of BGRA8 — the wrong target per PyonPix decompilation (R16 gets score 0; BGRA8 gets +500). (b) `_dsReverseZ` uses `DepthWriteMask.Zero` — depth not written, so FFXIV's subsequent geometry always passes the depth test against cleared depth=0 and overwrites our rect entirely. Both root causes confirmed by PyonPix decompilation. Fix for v0.5.63: target BGRA8 specifically + use `_dsReverseZWrite` (DepthWriteMask.All, GreaterEqual). |
+| 16 | **OMSetRenderTargets scene-pass inject into BGRA8 — fires on `currentSceneRendered && !_sceneDrawnThisFrame`** | FAILED (v0.5.63): rect invisible. Fixed `_frameInjectionDone` → v0.5.64: rect visible but HUD still behind. | v0.5.63: ClearRenderTargetView(BGRA8) fires immediately after OMSetRenderTargets before ANY geometry draws, wiping our inject. Also `_frameInjectionDone=true` blocked BB fallback → completely invisible. v0.5.64: removed `_frameInjectionDone=true` from scene inject so BB-path DrawDetour still fired → rect visible again. But DrawDetour (vtable[13]) fires on the FIRST `Draw()` call after BB bind, which comes AFTER all `DrawIndexed` (vtable[12]) HUD calls. FFXIV uses DrawIndexed for both the composite blit AND all 2D HUD elements. Result: HUD already baked into BB before we inject → HUD always behind rect. Fix for v0.5.65: move injection to DrawIndexedDetour — first DrawIndexed with BB bound is the composite blit; inject after it fires, before any HUD DrawIndexed. |
+| 17 | **DrawIndexedDetour BB inject (v0.5.65) — first DrawIndexed with `_currentBbRtvPtr != 0`** | FAILED: HUD still in front of rect (same as v0.5.64). | The composite DrawIndexed on BB fires AFTER the complete HUD rendering pipeline finishes. Despite our assumption, all HUD elements are fully composited into the BB before the first DrawIndexed on BB fires. DrawIndexed seq diagnostics confirm: `_inUiPass` DrawIndexed calls (#1-100+) all fire to intermediates (0x...C2EFE0, EB60, E860, ECE0) — NOT to the BB. The BB composite DrawIndexed reads from these pre-composited intermediates (which already contain HUD). Our inject after it = on top of HUD. Fix for v0.5.66: detect idx=71973 (the full-screen scene composite), inject AFTER it fires (before subsequent HUD DrawIndexed calls to the same RT). |
+| 18 | **71973 scene-layer inject (v0.5.66) — CATASTROPHIC FAILURE (white hellscape + rainbow rect)** | REVERTED in v0.5.67. | The 71973 DrawIndexed fires during `_inUiPass` and writes to an intermediate surface (0x259B6C2E860) that uses the **alpha channel for compositing**. Our `ExecuteInlineDraw` wrote alpha=1.0 (opaque) for rect pixels. FFXIV's compositor reads alpha=1 as "no background" → entire scene background became pure white. Rect showed as rainbow gradient (HDR float surface format, our LDR normalized values look wrong on R16G16B16A16_Float target). v0.5.67 emergency revert removed 71973 inject, cleaned up `_sceneLayerInjectDone` field. |
+| 19 | **RendererServiceAlt + R16G16B16A16_Float (v0.5.68) — PARTIAL SUCCESS** | HUD now draws in front. Rect is massively bright/glowing. | R16G16B16A16_Float is FFXIV's HDR accumulation buffer (linear light, pre-tone-mapping, pre-bloom). Our shader outputs sRGB-range values (0–1) which in linear HDR space are very bright. FFXIV's auto-exposure (eye adaptation) amplifies these further in dark indoor scenes. FFXIV's bloom post-process also fires on values above its threshold. Result: rect appears as overexposed white with colorful glow edges. Fix: add `HdrScale` multiplier to cbuffer + PS, default ~0.18, so output values are in the correct HDR linear range before tone-mapping. |
 
 ---
 
@@ -129,19 +137,19 @@ and non-BB RT → no double-injection. Original in finally uses trampoline (bypa
 **To try:** Implement in v0.5.51.
 
 ### 2. DrawIndexedDetour: Original-first injection into BB when `_currentBbRtvPtr != 0`
-**NOT YET TRIED.** The v0.5.44 DrawDetour approach applied to DrawIndexed instead.
+**NOW TRYING in v0.5.65.**
 
-The composite blit IS a DrawIndexed. If HUD elements are also DrawIndexed calls that
-follow on the same BB bind, then:
+The composite blit IS a DrawIndexed. v0.5.64 diagnostics confirmed call order:
+`OMSetRT(BB)` → `DrawIndexed[composite]` → `DrawIndexed[HUD...]` → `Draw[...]`
+
 - DrawIndexedDetour fires on composite blit: call Original (blit runs) → inject rect → set `_frameInjectionDone=true`
 - All subsequent DrawIndexed (HUD) fire normally (Original via `finally`, no inject)
 - Result: rect appears after composite blit (3D scene), HUD draws on top ✓
 
-This has never been attempted because every v0.5.41-44 iteration either injected-first or
-moved injection out of DrawIndexedDetour entirely.
-
-**To try:** In DrawIndexedDetour, when `_currentBbRtvPtr != 0 && !_frameInjectionDone`,
-call Original first, then inject into bb, then set `_frameInjectionDone = true`.
+Note: v0.5.45 attempted "DrawIndexedDetour inject into BB when `_currentBbRtvPtr != 0`" and
+found condition was always false. v0.5.64 diagnostics disproved that assumption — `_currentBbRtvPtr`
+IS non-zero when DrawIndexed fires (OMSetRT sets it, then DrawIndexed follows on same BB).
+The v0.5.45 failure was likely a tracking bug, not a fundamental pipeline ordering issue.
 
 ### 2. Composite input injection (SRV[0]) in DrawIndexedDetour BEFORE Original
 **IN PROGRESS (v0.5.49).** v0.5.39 planned this but cascade was broken; v0.5.40+ abandoned it.
@@ -284,10 +292,10 @@ whether to bind `_trackedDsv`. Falls back to no-depth if DSV/RTV sizes mismatch.
 **Remaining problem:** 2D HUD draws on top of the rect. DrawDetour fires AFTER all HUD is
 composited into the BB. No injection point between composite blit and HUD draw has been found.
 
-**Next target:** Get 2D HUD to render in front of the rect.
-Best untried approach: Approach #2 (composite input injection via `_compositeInputRtv`) —
-inject into SRV[0] (3D scene texture) BEFORE the composite DrawIndexed reads it. If this
-surface is the 3D scene only (not HUD baked in), our rect ends up under HUD after composite.
+**Next target (v0.5.57):** Scene-pass inject (Approach #12, PyonPix method).
+Identify `_mainSceneDsvPtr` (first full-res DSV) + `_mainSceneRtvPtr` (last full-res R8G8B8A8_UNorm
+RTV bound alongside it). Inject into those targets during the 3D scene render pass. HUD renders
+after → should appear in front. DrawDetour kept as fallback if this fails.
 
 ---
 

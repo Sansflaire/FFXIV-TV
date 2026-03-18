@@ -705,3 +705,184 @@ long-term architecture. For FFXIV-TV this means:
    With LibVLC we'd need to adjust the `Volume` property based on distance, which we can do.
 
 6. **Multiple screens** is the right product direction. Single-screen is a limitation.
+
+---
+
+## 13. HOW PYONPIX GETS HUD ON TOP OF THE SCREEN (Second Analysis — 2026-03-17)
+
+**Context:** FFXIV-TV injects at the backbuffer/Dalamud ImGui pass, so the rect renders on top of
+everything including the game HUD. PyonPix has HUD visible over the rect. This section documents
+exactly how.
+
+### The Root Cause Difference
+
+| | FFXIV-TV (current) | PyonPix |
+|---|---|---|
+| Injection point | Last OMSetRenderTargets before Present (backbuffer / Dalamud ImGui pass) | OMSetRenderTargets during the **3D scene render pass** |
+| Renders into | Swapchain backbuffer (BGRA8) | Game's HDR 3D render target (R16G16B16A16_Float + MainDSV) |
+| Depth testing | None (injecting into UI layer) | Full depth test against game's depth buffer |
+| Relationship to HUD | Rect drawn ON TOP of HUD (HUD renders before this pass) | Rect drawn INTO the 3D world; HUD renders after → naturally on top |
+| Relationship to post-processing | After post-processing (misses bloom/tonemap) | Before post-processing (gets bloom, tonemap, DOF) |
+
+### Exactly How PyonPix Identifies the Draw Moment
+
+Both `OMSetRenderTargets` and `Present` are hooked. `Present` does nothing except increment `PresentIndex`.
+
+In `OMSetRenderTargetsDetour` (called after calling `Original`), they track two targets:
+
+**MainDSV** — the game's main 3D depth stencil:
+```csharp
+// First DSV whose texture dimensions == device width × height
+if (MainDSV == null && device.Width == dsvItem.Desc.Width && device.Height == dsvItem.Desc.Height)
+    MainDSV = dsvItem;
+```
+
+**MainRTV** — the game's main 3D render target:
+```csharp
+// Full-res RTV matching a configured format (set in GlobalProperties.Renderer.Format)
+// FFXIV's HDR 3D scene target is typically R16G16B16A16_Float or similar
+if (device.Width == rtvItem.Desc.Width && device.Height == rtvItem.Desc.Height
+    && rtvItem.Desc.Format == config.Global.Renderer.Format)
+    MainRTV = rtvItem;
+```
+
+The `Format` is a user-configurable setting in their global properties — they let users pick which
+DXGI format corresponds to the game's 3D scene RTV if auto-detection fails.
+
+**SceneRendered** flag and draw trigger:
+```csharp
+// flag = "current OMSetRenderTargets call is binding MainRTV"
+bool flag = MainRTV != null && MainRTV.RTV.NativePointer == currentRtvPtr;
+
+// SceneRendered = current call binds BOTH MainDSV AND MainRTV together
+SceneRendered = MainDSV != null && MainDSV.DSV.NativePointer == depthStencilView && flag;
+
+// Draw once per frame: when scene was just rendered and a new Present frame has started
+if (SceneRendered && LastPresentIndex != PresentIndex)
+{
+    LastPresentIndex = PresentIndex;
+    Draw();
+}
+```
+
+Note: `RendererServiceAlt` checks `if (SceneRendered && LastPresentIndex != PresentIndex)` BEFORE
+the `SceneRendered = ...` assignment (i.e., fires on the PREVIOUS call that matched), while
+`RendererService` fires on the SAME call. Both are variations of the same pattern.
+
+### What Draw() Actually Does
+
+```csharp
+private void Draw()
+{
+    DeviceContext ctx = _dx.D3D11Context;
+
+    // 1. Save ALL current GPU state
+    var renderTargets = ctx.OutputMerger.GetRenderTargets(1, out var savedDSV);
+    var viewport      = ctx.Rasterizer.GetViewports<Viewport>()[0];
+    var blendState    = ctx.OutputMerger.BlendState;
+    var depthState    = ctx.OutputMerger.DepthStencilState;
+    var rastState     = ctx.Rasterizer.State;
+    var vs            = ctx.VertexShader.Get();
+    var ps            = ctx.PixelShader.Get();
+    var layout        = ctx.InputAssembler.InputLayout;
+    var topology      = ctx.InputAssembler.PrimitiveTopology;
+
+    try {
+        Matrix4x4 camView = Matrix4x4.Transpose(CameraService.GetViewMatrix());
+        Matrix4x4 camProj = Matrix4x4.Transpose(CameraService.GetProjectionMatrix());
+
+        foreach (var renderer in Renderers.Values)
+            DrawRenderer(ctx, renderer, tab.SRV, camView, camProj);
+    }
+    finally {
+        // 2. Restore ALL GPU state — game pipeline continues unaffected
+        ctx.OutputMerger.SetRenderTargets(savedDSV, renderTargets);
+        ctx.Rasterizer.SetViewport(viewport);
+        ctx.OutputMerger.SetBlendState(blendState);
+        ctx.OutputMerger.SetDepthStencilState(depthState);
+        ctx.Rasterizer.State = rastState;
+        ctx.VertexShader.Set(vs);
+        ctx.PixelShader.Set(ps);
+        ctx.InputAssembler.InputLayout = layout;
+        ctx.InputAssembler.PrimitiveTopology = topology;
+    }
+}
+```
+
+### What DrawRenderer() Does
+
+```csharp
+// Set the game's 3D scene targets (not the backbuffer — the actual HDR 3D RTV + DSV)
+ctx.OutputMerger.SetRenderTargets(MainDSV.DSV, MainRTV.RTV);
+ctx.Rasterizer.SetViewport(new Viewport(0, 0, MainRTV.Width, MainRTV.Height, 0f, 1f));
+
+// No vertex buffer — procedural geometry from SV_VertexID in the vertex shader
+ctx.InputAssembler.InputLayout = null;
+ctx.InputAssembler.PrimitiveTopology = PrimitiveTopology.TriangleList;
+
+ctx.Rasterizer.State        = r.RasterizerState;   // cull mode from config
+ctx.OutputMerger.SetBlendState(BlendS);             // alpha blend
+ctx.OutputMerger.SetDepthStencilState(r.DepthState); // depth test ON, reversed Z
+
+// Upload cbuffer: CameraView, CameraProjection, ScreenTransform (TRS), tints, border params
+ctx.UpdateSubresource(ref data, ShaderParams);
+
+ctx.VertexShader.Set(VS);
+ctx.PixelShader.Set(PS);
+ctx.PixelShader.SetShaderResource(0, srv); // browser frame SRV
+
+ctx.Draw(36, 0); // 6 faces × 2 tris × 3 verts, all procedural in VS
+```
+
+### Depth State (Reverse-Z Aware)
+
+```csharp
+r.DepthState = new DepthStencilState(device, new DepthStencilStateDescription {
+    IsDepthEnabled  = renderer.Depth,   // configurable on/off
+    DepthWriteMask  = DepthWriteMask.All,
+    // FFXIV uses reverse-Z. PyonPix flips the comparison:
+    DepthComparison = (renderer.DepthComparison == DepthComparison.LessEqual)
+                      ? Comparison.GreaterEqual   // for reverse-Z hardware
+                      : Comparison.LessEqual,
+    IsStencilEnabled = false
+});
+```
+
+FFXIV uses a reverse-Z depth buffer (near=1.0, far=0.0). PyonPix's config lets you select
+`LessEqual` or `GreaterEqual` for the depth comparison, and then flips it internally to match
+the actual hardware convention. So "LessEqual" in the config means "draw if in front" which
+maps to `GreaterEqual` in reverse-Z.
+
+### What This Means for FFXIV-TV
+
+To get HUD on top of our rect, we need to:
+
+1. **Stop trying to inject at the backbuffer.** The `_lastNoDsvRtvPtr` / backbuffer identification
+   approach (v0.5.56) draws into the UI/Dalamud pass — HUD will always be behind.
+
+2. **Identify `MainDSV` and `MainRTV`** — the game's actual 3D scene targets, NOT the swapchain
+   backbuffer. MainRTV is a high-bit-depth HDR format (not BGRA8). The format must be discovered
+   experimentally or exposed as a user config (as PyonPix does).
+
+3. **Inject when both are bound together** — `SceneRendered = (dsv == MainDSV && rtv == MainRTV)`.
+
+4. **Draw into MainDSV + MainRTV** with depth testing enabled and reverse-Z comparison.
+
+5. **Use camera matrices from CameraService** (same as current approach via FFXIVClientStructs).
+
+6. **Restore all state** in a finally block.
+
+This is a significant architectural change to `D3DRenderer.cs`. The current backbuffer detection
+code becomes obsolete. The new flow is: detect 3D scene pass → draw there → HUD/UI renders after
+naturally on top.
+
+### Known Risk: MainRTV Format Discovery
+
+The game's 3D HDR RTV format is not publicly documented. PyonPix handles this with a
+`RendererGlobalProperties.Format` user config field (DXGI_FORMAT integer). We would need to either:
+- Expose the same config and let users set it, OR
+- Log all full-res RTVs seen during a frame and let the user pick, OR
+- Hard-code the most likely FFXIV format and verify experimentally.
+
+The format is likely `R16G16B16A16_Float` (format 10 in DXGI_FORMAT enum) based on FFXIV's
+known HDR rendering pipeline, but this should be verified in logs before assuming.

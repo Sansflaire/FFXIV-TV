@@ -296,7 +296,7 @@ Goal: Host PC serves a WebSocket server; all connected clients play the same con
 - [x] Fix: UPnP discovery too narrow — sends all M-SEARCH targets simultaneously and listens in one 4s window instead of 3.5s × N sequential waits; adds IGD:2, WANIPConnection:2, WANPPPConnection:1, ssdp:all; sends each packet twice for UDP reliability
 - [x] Fix: UPnP fallback — add direct gateway IP probe (common UPnP ports) running in parallel with SSDP so routers with SSDP disabled still auto-forward
 - [x] Fix: Client has no way to cancel a pending Connect/reconnect — add Stop button visible during Connecting/Reconnecting state
-- [ ] Diagnose: client sees no rect — add injection-blocking diagnostic logs (which condition blocks DrawDetour/OMSetRT inject per frame)
+- [x] Diagnose: client sees no rect — add injection-blocking diagnostic logs (which condition blocks DrawDetour/OMSetRT inject per frame)
 
 ---
 
@@ -326,6 +326,17 @@ Goal: Host PC serves a WebSocket server; all connected clients play the same con
 - [x] Fix: hook ClearRenderTargetView (vtable[50]); call Original first then draw; rect now stable and visible with correct depth testing (v0.5.24)
 - [x] Fix: FFXIV swapchain double-buffering causes 30 Hz flicker — HashSet tracks all backbuffer RTV ptrs; fallback no longer blocked by _frameInjectionDone (v0.5.25)
 - [ ] Fix: chat box panel background still renders BEHIND rect (ClearRTV fires after chat background draw) — see BROKEN.md active issue
+- [x] v0.5.57/v0.5.58: Scene-pass inject (PyonPix approach) — attempted; fired too early (before FFXIV clears+draws scene); v0.5.57 blocked BB fallback causing invisible rect; v0.5.58 restored BB fallback
+- [x] v0.5.59: Scene-pass inject RendererServiceAlt pattern — FAILED: inject target was R16G16B16A16_Float, overwritten by 71973-index composite DrawIndexed every frame; rect invisible
+- [x] v0.5.60: Scene-pass inject into BGRA8 — FAILED: 71973 DrawIndexed in no-DSV phase overwrites BGRA8 after our inject; `_frameInjectionDone=true` blocked BB fallback → rect invisible
+- [x] v0.5.61: Remove `_frameInjectionDone=true` from scene inject → BB inject fallback restored; rect visible again (scene inject fires but is overwritten, BB inject provides the visible rect)
+- [x] v0.5.62: RendererService timing + R16G16B16A16_Float target + DepthWriteMask.Zero — FAILED: wrong target (PyonPix targets BGRA8, not R16F) + Zero write mask means FFXIV geometry always overwrites our rect against unwritten depth=0; rect invisible
+- [x] v0.5.63: RendererService timing + BGRA8 target + DepthWriteMask.All (_dsReverseZWrite) — PyonPix-exact approach; added `overrideDepthState` param to ExecuteInlineDraw; scene inject passes `_dsReverseZWrite` (GreaterEqual+All) so FFXIV geometry depth-tests against our written depth values; rect invisible because FFXIV clears BGRA8 immediately after our inject (ClearRenderTargetView follows OMSetRT before geometry begins) AND 71973 no-DSV DrawIndexed overwrites BGRA8 in the post-processing phase regardless
+- [x] v0.5.64: Remove `_frameInjectionDone=true` from scene inject — BB inject (DrawDetour) runs as fallback; rect visible again; BUT HUD still behind rect because DrawDetour fires on `Draw` (vtable[13]) which comes AFTER all `DrawIndexed` (vtable[12]) HUD calls; FFXIV renders composite + HUD via DrawIndexed before any Draw call fires
+- [x] v0.5.65: Move injection to DrawIndexedDetour (vtable[12]) — first DrawIndexed with BB bound triggers Original-first inject; subsequent DrawIndexed (HUD) and all Draw calls render on top → HUD in front; FAILED: HUD already composited into BB before DrawIndexed-on-BB fires; same result as DrawDetour
+- [x] v0.5.66: 71973 scene-layer inject — CATASTROPHIC FAILURE (white hellscape + rainbow rect); injecting into alpha-compositing intermediate corrupts entire scene background; reverted in v0.5.67
+- [x] v0.5.68: RendererServiceAlt + R16G16B16A16_Float — HUD now in front! Rect massively overexposed (HDR linear space + FFXIV bloom/auto-exposure)
+- [x] v0.5.69: Add HdrScale to cbuffer + PS shader — scale output to HDR-appropriate linear range; expose as slider in settings (default 0.18)
 - [x] Fix: ALL base game UI hidden behind rect — ClearRTV ptr-matching fails because FFXIV clears intermediate scene buffer (not DXGI backbuffer); replace ptr check with _inUiPass transition detection (v0.5.30)
 - [x] Improve sampler quality: anisotropic filtering (16x) for screens at steep angles
 - [x] Revert UNorm_SRgb texture change (caused double-gamma darkening — FFXIV RT is linear UNorm)

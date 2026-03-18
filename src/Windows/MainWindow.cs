@@ -254,6 +254,16 @@ public sealed class MainWindow
         ImGui.Spacing();
         ImGui.Separator();
 
+        float hdrScale = _config.HdrScale;
+        ImGui.SetNextItemWidth(200);
+        if (ImGui.SliderFloat("HDR Scale##hdrscale", ref hdrScale, 0.01f, 1.0f, "%.3f"))
+        {
+            _config.HdrScale = hdrScale;
+            _config.Save();
+        }
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("Scales output into FFXIV's HDR linear buffer.\n0.18 = photographic 18% gray reference.\nDecrease if rect is too bright/glowing; increase if too dark.");
+
         float brightness = _config.Brightness;
         ImGui.SetNextItemWidth(200);
         if (ImGui.SliderFloat("Brightness##bright", ref brightness, 0f, 4f, "%.2f"))

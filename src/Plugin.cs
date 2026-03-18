@@ -241,6 +241,7 @@ public sealed class Plugin : IDalamudPlugin
             _d3dRenderer.Brightness = Config.Brightness;
             _d3dRenderer.Gamma      = Config.Gamma;
             _d3dRenderer.Contrast   = Config.Contrast;
+            _d3dRenderer.HdrScale   = Config.HdrScale;
             _d3dRenderer.Tint       = new Vector4(Config.TintR, Config.TintG, Config.TintB, Config.TintA);
 
             // Only load the image texture when in Image mode.
