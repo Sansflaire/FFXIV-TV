@@ -1,0 +1,115 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [ master ]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Download Dalamud
+        shell: pwsh
+        run: |
+          Invoke-WebRequest "https://raw.githubusercontent.com/goatcorp/dalamud-distrib/main/latest.zip" -OutFile dalamud.zip
+          Expand-Archive dalamud.zip -DestinationPath dalamud
+
+      - name: Restore
+        run: dotnet restore src/FFXIV-TV.csproj
+
+      - name: Build
+        shell: pwsh
+        run: |
+          dotnet build src/FFXIV-TV.csproj -c Release `
+            /p:DalamudLibPath="${{ github.workspace }}/dalamud/" `
+            /p:CopyToDevPlugins=false
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $out = "src/bin/x64/Release"
+          $pkg = "package"
+          New-Item -ItemType Directory -Path $pkg | Out-Null
+
+          # Main DLL + managed NuGet DLLs
+          Copy-Item "$out/*.dll" $pkg
+
+          # Native libvlc DLLs
+          Copy-Item "$out/libvlc/win-x64/libvlc.dll"     $pkg -ErrorAction SilentlyContinue
+          Copy-Item "$out/libvlc/win-x64/libvlccore.dll" $pkg -ErrorAction SilentlyContinue
+
+          # VLC codec plugins
+          if (Test-Path "$out/libvlc/win-x64/plugins") {
+            Copy-Item "$out/libvlc/win-x64/plugins" "$pkg/plugins" -Recurse
+          }
+
+          # Dalamud manifest
+          Copy-Item "FFXIV-TV.json" $pkg
+
+          Compress-Archive -Path "$pkg/*" -DestinationPath FFXIV-TV.zip
+
+      - name: Get version
+        id: version
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path src/FFXIV-TV.csproj -Pattern '<Version>(.*)</Version>').Matches[0].Groups[1].Value
+          echo "version=$v" >> $env:GITHUB_OUTPUT
+
+      - name: Update pluginmaster.json
+        shell: pwsh
+        run: |
+          $v = "${{ steps.version.outputs.version }}"
+          # ConvertFrom-Json with -NoEnumerate keeps the array wrapper instead of unwrapping single-element arrays.
+          # ConvertTo-Json with -AsArray forces array output even for single-element inputs.
+          # Both are required — without them PowerShell silently converts [{...}] → {...} and breaks Dalamud.
+          $json = Get-Content pluginmaster.json -Raw | ConvertFrom-Json -NoEnumerate
+          $json[0].AssemblyVersion = $v
+          $json[0].TestingAssemblyVersion = $v
+          $json | ConvertTo-Json -Depth 10 -AsArray | Set-Content pluginmaster.json
+
+      - name: Verify pluginmaster.json is a JSON array
+        shell: pwsh
+        run: |
+          $raw = Get-Content pluginmaster.json -Raw
+          $first = $raw.TrimStart()[0]
+          if ($first -ne '[') {
+            Write-Error "pluginmaster.json must start with '[' (JSON array). First non-whitespace char was '$first'. Dalamud requires an array of plugin entries."
+            exit 1
+          }
+          # Must parse as array (not bare object) — this is the exact invariant Dalamud enforces.
+          $parsed = $raw | ConvertFrom-Json -NoEnumerate
+          if ($parsed.GetType().Name -ne 'Object[]') {
+            Write-Error "pluginmaster.json parsed as $($parsed.GetType().Name), not Object[] (array). Would break Dalamud repo fetch."
+            exit 1
+          }
+          Write-Host "pluginmaster.json is a valid JSON array with $($parsed.Count) entries."
+
+      - name: Commit pluginmaster.json
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add pluginmaster.json
+          git diff --staged --quiet || git commit -m "chore: bump pluginmaster.json to ${{ steps.version.outputs.version }} [skip ci]"
+          git push
+
+      - name: Create or update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: v${{ steps.version.outputs.version }}
+          files: FFXIV-TV.zip
+          body: ""
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

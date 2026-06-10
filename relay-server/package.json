@@ -1,0 +1,18 @@
+{
+  "name": "ffxiv-tv-relay",
+  "version": "1.0.0",
+  "description": "WebSocket relay server for FFXIV-TV sync — no port forwarding required",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "@flydotio/dockerfile": "^0.7.10"
+  }
+}
