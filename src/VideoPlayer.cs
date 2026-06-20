@@ -2,6 +2,9 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.IO.Compression;
+using System.Linq;
+using System.Net.Http;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
@@ -53,6 +56,19 @@ public sealed class VideoPlayer : IDisposable
     // Incremented atomically on every Play() call. Async tasks capture the version
     // at the point they are launched and abort before StartPlayback() if it changed.
     private volatile int _playVersion = 0;
+
+    // ── yt-dlp / Deno auto-download ───────────────────────────────────────────
+    // Started in constructor; awaited before first yt-dlp invocation.
+    private readonly Task _ensureYtDlpTask;
+
+    private const string YtDlpDownloadUrl =
+        "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe";
+    private const string DenoDownloadUrl =
+        "https://github.com/denoland/deno/releases/download/v2.8.2/deno-x86_64-pc-windows-msvc.zip";
+    private const string DenoExeName = "deno.exe";
+
+    private string YtDlpExePath  => Path.Combine(_pluginDir, "yt-dlp.exe");
+    private string DenoExePath   => Path.Combine(_pluginDir, DenoExeName);
 
     // ── yt-dlp pipe process (for video-only DASH streams, e.g. Reddit) ────────
     // When yt-dlp detects acodec=none (video-only), we pipe yt-dlp's merged
@@ -194,6 +210,84 @@ public sealed class VideoPlayer : IDisposable
         _lockCb    = LockCallback;
         _unlockCb  = UnlockCallback;
         _displayCb = DisplayCallback;
+
+        // Kick off yt-dlp + Deno download in background immediately at plugin load.
+        // By the time the user clicks Play, both will already be on disk.
+        _ensureYtDlpTask = Task.Run(EnsureYtDlpAndDenoAsync);
+    }
+
+    // ── yt-dlp + Deno auto-setup ──────────────────────────────────────────────
+
+    private async Task EnsureYtDlpAndDenoAsync()
+    {
+        using var http = new HttpClient { Timeout = TimeSpan.FromMinutes(5) };
+
+        // Download yt-dlp.exe if missing
+        if (!File.Exists(YtDlpExePath))
+        {
+            Plugin.Log.Info("[FFXIV-TV] yt-dlp.exe not found — downloading from GitHub");
+            try
+            {
+                var bytes = await http.GetByteArrayAsync(YtDlpDownloadUrl);
+                await File.WriteAllBytesAsync(YtDlpExePath, bytes);
+                Plugin.Log.Info($"[FFXIV-TV] yt-dlp downloaded ({bytes.Length / 1024 / 1024} MB)");
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.Error($"[FFXIV-TV] yt-dlp download failed: {ex.Message}");
+                return;
+            }
+        }
+
+        // Download and extract Deno if missing (bundled JS runtime — no Node.js required)
+        if (!File.Exists(DenoExePath))
+        {
+            Plugin.Log.Info("[FFXIV-TV] deno.exe not found — downloading from GitHub");
+            try
+            {
+                var zipBytes = await http.GetByteArrayAsync(DenoDownloadUrl);
+                using var ms  = new MemoryStream(zipBytes);
+                using var zip = new ZipArchive(ms, ZipArchiveMode.Read);
+                var entry = zip.GetEntry(DenoExeName)
+                    ?? zip.Entries.FirstOrDefault(e => e.Name.Equals(DenoExeName, StringComparison.OrdinalIgnoreCase));
+                if (entry != null)
+                {
+                    using var entryStream = entry.Open();
+                    using var outFile     = File.OpenWrite(DenoExePath);
+                    await entryStream.CopyToAsync(outFile);
+                    Plugin.Log.Info("[FFXIV-TV] deno.exe extracted");
+                }
+                else
+                {
+                    Plugin.Log.Error("[FFXIV-TV] deno.exe not found inside downloaded ZIP");
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.Error($"[FFXIV-TV] Deno download failed: {ex.Message}");
+            }
+        }
+
+        // Self-update yt-dlp so it stays current for new sites and format changes
+        try
+        {
+            using var updProc = Process.Start(new ProcessStartInfo(YtDlpExePath, "-U")
+            {
+                UseShellExecute        = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError  = true,
+                CreateNoWindow         = true,
+            });
+            if (updProc != null)
+            {
+                await updProc.WaitForExitAsync();
+                Plugin.Log.Info("[FFXIV-TV] yt-dlp self-update complete");
+            }
+        }
+        catch (Exception ex)
+        {
+            Plugin.Log.Warning($"[FFXIV-TV] yt-dlp self-update failed (non-fatal): {ex.Message}");
+        }
     }
 
     /// <summary>
@@ -544,13 +638,21 @@ public sealed class VideoPlayer : IDisposable
     /// </summary>
     private async Task<ResolvedStream?> ResolveWithYtDlpAsync(string url)
     {
+        // Wait for auto-download to complete before first use
+        await _ensureYtDlpTask;
+
         string? ytdlp = FindYtDlp();
         if (ytdlp == null)
         {
-            Plugin.Log.Warning("[FFXIV-TV] yt-dlp not found. Drop yt-dlp.exe into the plugin folder or set YtDlpPath in settings.");
+            Plugin.Log.Warning("[FFXIV-TV] yt-dlp not found even after auto-download attempt.");
             _status = "Error: yt-dlp not found";
             return null;
         }
+
+        // Build common args: impersonate Chrome (bot-detection bypass), bundled Deno JS runtime,
+        // socket timeout so stalled connections don't hang forever.
+        string jsRuntime = File.Exists(DenoExePath) ? $"deno:{DenoExePath}" : "node";
+        string commonArgs = $"--impersonate chrome --js-runtimes \"{jsRuntime}\" --socket-timeout 30";
 
         try
         {
@@ -558,7 +660,7 @@ public sealed class VideoPlayer : IDisposable
             // No -f flag: let yt-dlp pick the best available format per site.
             // "-f best" was broken for DASH-only sites (Reddit) — it selected a non-existent
             // pre-merged format and returned nothing. Without -f, yt-dlp picks correctly.
-            var psi = new ProcessStartInfo(ytdlp, $"-j --no-playlist --js-runtimes node \"{url}\"")
+            var psi = new ProcessStartInfo(ytdlp, $"{commonArgs} -j --no-playlist \"{url}\"")
             {
                 RedirectStandardOutput = true,
                 RedirectStandardError  = true,
@@ -576,9 +678,9 @@ public sealed class VideoPlayer : IDisposable
             string json   = stdoutTask.Result;
             string stderr = stderrTask.IsCompleted ? stderrTask.Result : string.Empty;
 
-            // Surface JS-runtime warning prominently — YouTube extraction requires deno/node.
+            // Surface JS-runtime warning — means deno.exe failed to load or is corrupted.
             if (stderr.Contains("No supported JavaScript runtime"))
-                Plugin.Log.Warning($"[FFXIV-TV] yt-dlp: YouTube requires a JS runtime (deno). Install deno and add it to PATH, or use Browser (WebView2) mode for YouTube. stderr: {stderr.Trim()}");
+                Plugin.Log.Warning($"[FFXIV-TV] yt-dlp: JS runtime unavailable (deno path: {DenoExePath}, exists: {File.Exists(DenoExePath)}). Try deleting deno.exe from the plugin folder to re-download. stderr: {stderr.Trim()}");
 
             if (string.IsNullOrWhiteSpace(json))
             {
@@ -664,8 +766,10 @@ public sealed class VideoPlayer : IDisposable
 
         // bestvideo+bestaudio: yt-dlp merges the best video and audio tracks.
         // /best: fallback to a single combined format if merging is impossible.
+        string jsRuntime = File.Exists(DenoExePath) ? $"deno:{DenoExePath}" : "node";
+        string commonArgs = $"--impersonate chrome --js-runtimes \"{jsRuntime}\" --socket-timeout 30";
         var psi = new ProcessStartInfo(ytdlpPath,
-            $"-f \"bestvideo+bestaudio/best\" -o - --no-playlist --js-runtimes node \"{url}\"")
+            $"{commonArgs} -f \"bestvideo+bestaudio/best\" -o - --no-playlist \"{url}\"")
         {
             RedirectStandardOutput = true,
             RedirectStandardError  = true,
