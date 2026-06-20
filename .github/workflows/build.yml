@@ -78,6 +78,21 @@ jobs:
           $json[0].TestingAssemblyVersion = $v
           $json | ConvertTo-Json -Depth 10 -AsArray | Set-Content pluginmaster.json
 
+      - name: Update FFXIV-TV.json (in-zip manifest)
+        shell: pwsh
+        run: |
+          # Dalamud rejects installs when the manifest inside the zip disagrees with
+          # the pluginmaster entry. The Package step copies the repo's FFXIV-TV.json
+          # into the zip, so we must bump its AssemblyVersion to match the csproj.
+          $v = "${{ steps.version.outputs.version }}"
+          $json = Get-Content FFXIV-TV.json -Raw | ConvertFrom-Json
+          $json.AssemblyVersion = $v
+          $json | ConvertTo-Json -Depth 10 | Set-Content FFXIV-TV.json
+          # Re-copy the updated manifest into the already-built package before zipping.
+          Copy-Item "FFXIV-TV.json" "package/FFXIV-TV.json" -Force
+          Remove-Item FFXIV-TV.zip -ErrorAction SilentlyContinue
+          Compress-Archive -Path "package/*" -DestinationPath FFXIV-TV.zip
+
       - name: Verify pluginmaster.json is a JSON array
         shell: pwsh
         run: |
