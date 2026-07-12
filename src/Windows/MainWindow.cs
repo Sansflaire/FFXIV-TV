@@ -44,8 +44,9 @@ public sealed class MainWindow
     private int     _syncPortAtLastIpQuery = -1;
 
 
-    private static readonly string[] ContentModeNames = { "Image", "Local Video", "URL / Stream", "Browser (WebView2)" };
-    private static readonly string[] NetworkModeNames = { "Off", "Host", "Client" };
+    private static readonly string[] ContentModeNames  = { "Image", "Local Video", "URL / Stream", "Browser (WebView2)" };
+    private static readonly string[] NetworkModeNames  = { "Off", "Host", "Client" };
+    private static readonly string[] RenderModeNames   = { "Legacy", "CopyBlit", "PyonPix", "PyonPixExact (recommended)" };
 
     public MainWindow(Configuration config, IObjectTable objectTable)
     {
@@ -945,142 +946,28 @@ public sealed class MainWindow
     }
 
     // ─── Debug Tab ────────────────────────────────────────────────────────────
-    // Live render-inject controls and live state. Intended for iteration during
-    // debugging sessions — contents change per problem being worked on.
-    private int    _debugTraceFrames  = 3;
-    private string _debugTestLabel    = string.Empty;
-
-    // Current-iteration test plan. Update in-place alongside any behavioural change.
-    private const string CurrentTestPlan =
-        "ITERATION: diagnostic infrastructure port (v0.5.211 baseline)\n" +
-        "Goal: surface the Debug tab + /fftv sysinfo + /fftv trace N + Debug-red shader so\n" +
-        "we can diagnose client-side inject issues without rebuilding. AlphaMode/DepthMode\n" +
-        "radios are INERT in this build — they only write to config, the renderer does not\n" +
-        "consult them yet. The hot path is byte-for-byte identical to v0.5.190 when every\n" +
-        "toggle in this tab is left at its default.\n\n" +
-        "STEPS:\n" +
-        "1. Confirm 'ActiveSrv' + 'HasTexture' below. If ActiveSrv=gradient, you're seeing\n" +
-        "   the idle screensaver — load content via the Player tab first.\n" +
-        "2. Click 'Clear log', then 'Append state' with a blank label as a baseline.\n" +
-        "3. Toggle 'Debug red shader' ON, click 'Append state' (label 'red-test').\n" +
-        "   EXPECTED: if the TV turns solid red, the draw path is landing correctly and\n" +
-        "   any visual bug is a content/blend issue. If it stays the same, the draw path\n" +
-        "   isn't reaching the BB — we're injecting at the wrong point.\n" +
-        "4. Toggle 'Debug red shader' OFF.\n" +
-        "5. Click 'Trace 3 frames', wait a few seconds, click 'Append state' (label\n" +
-        "   'trace-captured').\n" +
-        "6. Click 'Show log file' and drag the highlighted file into chat along with\n" +
-        "   your dalamud.log (they are separate files and must be paired).\n\n" +
-        "The AlphaMode / DepthMode radios are intentionally wired to config only; they are\n" +
-        "inert until a future patch re-introduces the resolver.";
-
+    // Sole control: rendering-mode picker. Everything else was removed as of
+    // v0.5.246 — PyonPixExact is the confirmed-working renderer for peers and
+    // no diagnostic knobs are needed in the shipping UI. Live diagnostics still
+    // available via the StatusApi HTTP endpoints for developers.
     private void DrawDebugTab()
     {
-        var r = _d3dRenderer;
-        if (r == null) { ImGui.TextDisabled("D3D renderer not ready."); return; }
-
-        // Version + header
-        var ver = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version?.ToString(3) ?? "?";
-        ImGui.Text($"FFXIV-TV v{ver}");
-
-        // Current-iteration test plan block.
-        if (ImGui.CollapsingHeader("Current test plan (open me first)", ImGuiTreeNodeFlags.DefaultOpen))
+        int rmIdx = (int)_config.RenderMode;
+        ImGui.TextUnformatted("Renderer");
+        ImGui.SetNextItemWidth(260);
+        if (ImGui.Combo("##rendermode", ref rmIdx, RenderModeNames, RenderModeNames.Length))
         {
-            ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(0.85f, 0.85f, 1f, 1f));
-            ImGui.TextWrapped(CurrentTestPlan);
-            ImGui.PopStyleColor();
+            _config.RenderMode = (RenderingMode)rmIdx;
+            _config.Save();
         }
-        ImGui.Separator();
-
-        // One-click debug log workflow.
-        ImGui.TextColored(new Vector4(0.9f, 0.7f, 1f, 1f), "Debug log (one-click export)");
-        ImGui.SetNextItemWidth(200);
-        ImGui.InputTextWithHint("##testlabel", "optional test label (e.g. 'red-test')", ref _debugTestLabel, 64);
-        ImGui.SameLine();
-        if (ImGui.Button("Append state"))
-        {
-            var label = string.IsNullOrWhiteSpace(_debugTestLabel) ? null : _debugTestLabel;
-            r.AppendDiagnosticReport(label);
-        }
-        ImGui.SameLine();
-        if (ImGui.Button("Show log file"))
-        {
-            var path = r.DiagnosticReportPath;
-            try
-            {
-                if (!System.IO.File.Exists(path))
-                    r.AppendDiagnosticReport("empty log — showing folder");
-                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
-                {
-                    FileName = "explorer.exe",
-                    Arguments = $"/select,\"{path}\"",
-                    UseShellExecute = true,
-                });
-            }
-            catch (Exception ex) { Plugin.Log.Warning($"[FFXIV-TV] Show log file: {ex.Message}"); }
-        }
-        ImGui.SameLine();
-        if (ImGui.SmallButton("Clear log"))
-            r.ClearDiagnosticReport();
-        ImGui.TextDisabled("Workflow: toggle → Append state → repeat → Show log file → drag to chat.");
-
-        ImGui.Separator();
-        ImGui.TextColored(new Vector4(0.7f, 1f, 0.7f, 1f), "Live state (read-only)");
-        ImGui.BulletText($"ActiveSrv: {r.ActiveSrvSource}   HasTexture: {r.HasTexture}");
-        ImGui.BulletText($"LastInject: {r.LastInjectPath}   fmt: {r.LastInjectFmt} {r.LastInjectW}x{r.LastInjectH}");
-        ImGui.BulletText($"Counters — diBb: {r.DiBbCount}   omsetrt: {r.OmSetRtCount}   cfDi: {r.CfDiCount}   cfDraw: {r.CfDrawCount}");
-        ImGui.BulletText($"Counters — ldrInject: {r.LdrInjectCount}   omsetrtLdr: {r.OmSetRtLdrCount}   bbSkipped: {r.OmSetRtSkippedBbCount}");
-        ImGui.BulletText($"BB draws prev frame: {r.BbDrawCount}   BbDrawSkip: {D3DRenderer.BbDrawSkip}");
-        ImGui.BulletText($"LdrTexPtr: 0x{r.LdrTexPtr:X}   DSV set: {r.MainSceneDsvSet}   bbLearned: {r.BackbufferLearned}");
-        ImGui.BulletText($"cbkFrames: {r.CbkFrameCount}   lastRtv: 0x{r.LastInjectRtvPtr:X}   wasBB: {r.LastInjectWasBackbuffer}");
-
-        ImGui.Separator();
-        ImGui.TextColored(new Vector4(1f, 1f, 0.6f, 1f), "Inject path (INERT — config only, renderer does not consult yet)");
-
-        // AlphaMode radio — writes to config only, does not affect the renderer.
-        ImGui.Text("AlphaMode:");
-        foreach (var m in new[] { AlphaMode.Auto, AlphaMode.Hud, AlphaMode.Opaque })
-        {
-            ImGui.SameLine();
-            if (ImGui.RadioButton(m.ToString() + "##am", _config.AlphaMode == m))
-            { _config.AlphaMode = m; _config.Save(); }
-        }
-
-        // DepthMode radio — writes to config only, does not affect the renderer.
-        ImGui.Text("DepthMode:");
-        foreach (var m in new[] { DepthMode.Auto, DepthMode.ReadWrite, DepthMode.ReadOnly, DepthMode.NoDepth })
-        {
-            ImGui.SameLine();
-            if (ImGui.RadioButton(m.ToString() + "##dm", _config.DepthMode == m))
-            { _config.DepthMode = m; _config.Save(); }
-        }
-        ImGui.TextDisabled("Note: AlphaMode / DepthMode are INERT in this build — not yet consulted by renderer.");
-
-        ImGui.Separator();
-        ImGui.TextColored(new Vector4(1f, 0.8f, 0.8f, 1f), "Diagnostics");
-
-        bool dbgRed = r.DebugShaderRed;
-        if (ImGui.Checkbox("Debug red shader (force TV to solid red — proves draw path reaches target RTV)", ref dbgRed))
-            r.DebugShaderRed = dbgRed;
-
-        ImGui.SetNextItemWidth(80);
-        ImGui.InputInt("##traceN", ref _debugTraceFrames);
-        _debugTraceFrames = System.Math.Clamp(_debugTraceFrames, 1, 30);
-        ImGui.SameLine();
-        if (ImGui.Button($"Trace {_debugTraceFrames} frames"))
-        {
-            D3DRenderer.TraceSequence        = 0;
-            D3DRenderer.TraceFramesRemaining = _debugTraceFrames;
-        }
-        ImGui.SameLine();
-        if (D3DRenderer.TraceFramesRemaining > 0)
-            ImGui.TextColored(new Vector4(1f, 1f, 0f, 1f), $"capturing… ({D3DRenderer.TraceFramesRemaining} left)");
-
-        if (ImGui.Button("Reset alpha detection"))
-            r.ResetAlphaDetection();
-
-        ImGui.Separator();
-        ImGui.TextDisabled("Debug tab contents change per session — refer to current instructions from the developer.");
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip(
+                "PyonPixExact  — recommended. Ports priprii/PyonPix's rendering pipeline\n" +
+                "                exactly using their compiled shader bytecode.\n" +
+                "                Confirmed working end-to-end.\n" +
+                "PyonPix       — from-scratch shader variant of PyonPixExact (A/B).\n" +
+                "CopyBlit      — ImGui composite path (no game hooks).\n" +
+                "Legacy        — historical D3DRenderer path; invisible/grayscale on peers.");
     }
 
 }
