@@ -375,6 +375,11 @@ public sealed unsafe class PyonPixExactRenderer : IDisposable
         {
             OmSetRtCount++;
 
+            // Honor a pending cache reset from Plugin.OnDraw (mode switch).
+            // Safe here — we're on the render thread and hold _inDetour.
+            if (Interlocked.Exchange(ref _resetPending, 0) == 1)
+                ClearViews();
+
             if (_screen == null || !_screen.Visible) return;
             if (_gameDevice == null) return;
 
@@ -680,6 +685,7 @@ public sealed unsafe class PyonPixExactRenderer : IDisposable
     {
         _presentIndex = 0;
         _lastPresentIndex = 0;
+        _lastRescoredIndex = 0;
         _targetRtv = null;
         TargetRtvScore = 0;
 
@@ -693,6 +699,16 @@ public sealed unsafe class PyonPixExactRenderer : IDisposable
 
         _pairCounts.Clear();
     }
+
+    /// <summary>Requests the render-thread detour to clear RTV/DSV caches at
+    /// the top of its next call. Set from Plugin.OnDraw (UI thread) when the
+    /// user switches back to PyonPixExact from another mode — otherwise the
+    /// caches accumulate stale state during the inactive period and the
+    /// reverse-walk selector converges on a wrong surface. NOT a direct
+    /// clear: touching _rtvCache from the UI thread races with the detour
+    /// on the render thread (Dictionary iteration + Dispose = crash).</summary>
+    private int _resetPending;
+    public void ResetTargeting() => Interlocked.Exchange(ref _resetPending, 1);
 
     // ── Draw ─────────────────────────────────────────────────────────────────
     // Mirrors ref-pyonpix/RendererService.cs::Draw + DrawRenderer:

@@ -164,11 +164,14 @@ public sealed class Configuration : IPluginConfiguration
 
     /// <summary>
     /// Active rendering mode. Overrides UseCopyBlitRenderer when reading.
-    /// v0.5.225 SAFETY: default flipped to Legacy after v0.5.224 crashed the
-    /// game hard on Trist's machine. The PyonPix path exists but is disabled
-    /// at load until the crash root cause is diagnosed.
+    /// v0.5.247 default flipped to PyonPixExact — the only mode confirmed to
+    /// render peer-visible TV. Legacy has a known "grayscale-shadow" bug on
+    /// non-host machines; CopyBlit shows a see-through rectangle for peers.
+    /// PyonPixExact is safe as a default because the v0.5.224 crash root
+    /// cause (hooking IDXGISwapChain::Present, already hooked by Dalamud)
+    /// has long been fixed — we hook only OMSetRenderTargets slot 33 now.
     /// </summary>
-    public RenderingMode RenderMode { get; set; } = RenderingMode.Legacy;
+    public RenderingMode RenderMode { get; set; } = RenderingMode.PyonPixExact;
 
     // ── Network Sync ──────────────────────────────────────────────────────────
 

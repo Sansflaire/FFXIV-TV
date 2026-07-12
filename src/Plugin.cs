@@ -52,6 +52,12 @@ public sealed class Plugin : IDalamudPlugin
     // Phase 3: Video playback via LibVLC
     private readonly VideoPlayer      _videoPlayer;
     private bool _videoSetupDone;
+    // Tracks the last RenderMode we routed through so we can detect user-driven
+    // mode changes. On change we reset _videoSetupDone (so the new renderer
+    // re-runs VideoPlayer.SetDevice with its own device wrapper) and clear the
+    // incoming renderer's transient state (PyonPix* cache went stale while it
+    // was passive, converging on wrong RTV; see v0.5.246 → v0.5.247 fix).
+    private RenderingMode? _lastActiveRenderMode;
 
     // Phase 3.7: Browser mode via WebView2
     private readonly BrowserPlayer    _browserPlayer;
@@ -351,6 +357,18 @@ public sealed class Plugin : IDalamudPlugin
 
         var screen = Config.Screen;
         if (!screen.Visible) return;
+
+        // ── Renderer-mode change detection ──────────────────────────────────
+        // When the user picks a different mode in the Debug tab, the previously
+        // bound VideoPlayer device wrapper is stale for the new renderer, and
+        // PyonPix* caches accumulated stale RTV/DSV entries during their passive
+        // period. Reset both so the new active renderer starts clean.
+        if (_lastActiveRenderMode != Config.RenderMode)
+        {
+            _videoSetupDone = false;
+            if (Config.RenderMode == RenderingMode.PyonPixExact) _pyonPixExact.ResetTargeting();
+            _lastActiveRenderMode = Config.RenderMode;
+        }
 
         // v0.5.237: safety guard removed. The v0.5.235 freeze root cause was
         // `_omSetRtHook.Original(...)` at the tail of the detour racing with
