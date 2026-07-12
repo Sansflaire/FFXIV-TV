@@ -327,19 +327,11 @@ public sealed class Plugin : IDalamudPlugin
         var screen = Config.Screen;
         if (!screen.Visible) return;
 
-        // v0.5.222 SAFETY: force the CopyBlit path off at load time regardless of
-        // what previous versions saved to disk. The shader is still broken (dark-blue
-        // fullscreen fill), and we do NOT want that appearing on any user's screen
-        // when they reload after updating.
-        if (Config.UseCopyBlitRenderer)
-        {
-            Config.UseCopyBlitRenderer = false;
-            Config.Save();
-            Log.Warning("[FFXIV-TV] v0.5.222: forcing UseCopyBlitRenderer=false — XMP-style path is still broken (fullscreen fill). Legacy D3DRenderer takes over.");
-        }
-
-        // ── XMP-style CopyBlit path (opt-in via /set/copyblit?v=true) ─────────
-        // OFF by default until the ray-plane math is verified working.
+        // ── XMP-style CopyBlit path (default; toggle in Configuration) ───────
+        // Runs entirely at UiBuilder.Draw time — no game render hooks. Renders
+        // identically on every peer's machine because the whole compositing
+        // surface is plugin-owned; nothing depends on pattern-matching the game's
+        // CF-DI inject point.
         if (Config.UseCopyBlitRenderer)
         {
             if (!_copyBlit.IsAvailable)

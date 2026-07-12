@@ -10,9 +10,8 @@ using Vortice.Direct3D11;
 using Vortice.DXGI;
 using Vortice.Mathematics;
 using CSDevice = FFXIVClientStructs.FFXIV.Client.Graphics.Kernel.Device;
+using CSControl = FFXIVClientStructs.FFXIV.Client.Game.Control.Control;
 using CSRtm = FFXIVClientStructs.FFXIV.Client.Graphics.Render.RenderTargetManager;
-using CSAtkMgr = FFXIVClientStructs.FFXIV.Client.UI.RaptureAtkUnitManager;
-using CSSceneCameraMgr = FFXIVClientStructs.FFXIV.Client.Graphics.Scene.CameraManager;
 
 namespace FFXIVTv;
 
@@ -105,25 +104,16 @@ public sealed unsafe class CopyBlitRenderer : IDisposable
     public ID3D11Device? Device => _device;
 
     // Constant buffer layout — mirrors the HLSL cbuffer below.
-    // XMP-style: camera basis + FoV + world corners so the PS can do ray-plane
-    // intersection per pixel (fullscreen triangle path).
+    // Must be 16-byte aligned. Total = 208 B.
     [StructLayout(LayoutKind.Sequential, Pack = 4)]
     private struct CbData
     {
-        public Matrix4x4 ViewProj;       // 64 B — used only for the depth-compare hit-depth calc
-        public Vector4   CameraPos;      // 16 B — xyz = camera origin in world space
-        public Vector4   CameraRight;    // 16 B — camera basis
-        public Vector4   CameraUp;       // 16 B
-        public Vector4   CameraForward;  // 16 B
-        public Vector4   CornerTL;       // 16 B — TV plane world corners
-        public Vector4   CornerTR;       // 16 B
-        public Vector4   CornerBL;       // 16 B
-        public Vector4   FovAspect;      // 16 B — x=fovY (radians), y=aspect, z=nearPlane, w=farPlane
-        public Vector4   ViewportSize;   // 16 B — xy=w,h  zw=1/w,1/h
-        public Vector4   Tint;           // 16 B
-        public Vector4   Options;        // 16 B — x=brightness y=gamma z=contrast w=depthEnable
-        public Vector4   Options2;       // 16 B — x=hasVideo y=hasDepth
-        // Total = 64 + 12*16 = 256 B
+        public Matrix4x4 ViewProj;         // 64 B — camera view * projection
+        public Matrix4x4 ScreenTransform;  // 64 B — TRS for the TV quad
+        public Vector4   ViewportSize;     // xy=w,h  zw=1/w,1/h
+        public Vector4   Tint;             // rgba
+        public Vector4   Options;          // x=brightness y=gamma z=contrast w=depthEnable
+        public Vector4   Options2;         // x=hasVideo y=hasDepth z=0 w=0
     }
 
     public CopyBlitRenderer() { }
@@ -272,11 +262,6 @@ public sealed unsafe class CopyBlitRenderer : IDisposable
         //    UploadFrame is a no-op unless VideoPlayer has a dirty frame ready.
         _videoPlayer?.UploadFrame(_context);
         nint videoSrvPtr = _videoPlayer?.FrameSrv?.NativePointer ?? nint.Zero;
-
-        // SAFETY: if there's no video texture, do NOT run the pipeline at all.
-        // The shader also discards when Options2.x < 0.5, but skipping here means
-        // we don't even blit the offscreen — nothing appears on the user's screen.
-        if (videoSrvPtr == nint.Zero) return;
 
         // 3. Ensure offscreen composite RTV matches viewport size.
         if (!EnsureOffscreen((uint)vpW, (uint)vpH)) return;
@@ -504,47 +489,41 @@ public sealed unsafe class CopyBlitRenderer : IDisposable
 
     private unsafe void RestoreUiAddons(int vpW, int vpH)
     {
-        if (_bbCopySrv == null) return;
-
-        var mgr = CSAtkMgr.Instance();
-        if (mgr == null) return;
+        if (_bbCopySrv == null || _gameGui == null) return;
 
         var dl    = ImGui.GetBackgroundDrawList();
         var texId = new ImTextureID(_bbCopySrv.NativePointer);
         int restored = 0;
 
-        // Enumerate every currently loaded ATK unit. AllLoadedUnitsList holds up
-        // to 256 pointers with a Count field; iterating this list catches every
-        // addon (HotBars, ChatLog + panels, Inventory, Map, Journal, etc.) without
-        // us maintaining a name list that goes stale each patch.
-        ref var list = ref mgr->AllLoadedUnitsList;
-        int count    = list.Count;
-        for (int i = 0; i < count; i++)
+        foreach (var name in NativeUiAddonNames)
         {
-            var addon = list.Entries[i].Value;
+            var wrap = _gameGui.GetAddonByName(name);
+            nint ptr = (nint)wrap;
+            if (ptr == nint.Zero) continue;
+            var addon = (AtkUnitBase*)ptr;
             if (addon == null || !addon->IsVisible) continue;
-            var root = addon->RootNode;
-            if (root == null) continue;
 
+            short ax    = addon->X;
+            short ay    = addon->Y;
             float scale = addon->Scale;
-            if (scale <= 0f) scale = 1f;
-
-            int aw = (int)MathF.Ceiling(root->Width  * scale);
-            int ah = (int)MathF.Ceiling(root->Height * scale);
+            int aw = (int)(addon->RootNode == null ? 0 : addon->RootNode->Width  * scale);
+            int ah = (int)(addon->RootNode == null ? 0 : addon->RootNode->Height * scale);
             if (aw <= 0 || ah <= 0) continue;
 
-            // Pad 1px each side so anti-aliased edges of the addon are covered.
-            int x0 = Math.Max((int)addon->X - 1, 0);
-            int y0 = Math.Max((int)addon->Y - 1, 0);
-            int x1 = Math.Min((int)addon->X + aw + 1, vpW);
-            int y1 = Math.Min((int)addon->Y + ah + 1, vpH);
+            int x0 = Math.Max((int)ax, 0);
+            int y0 = Math.Max((int)ay, 0);
+            int x1 = Math.Min((int)ax + aw, vpW);
+            int y1 = Math.Min((int)ay + ah, vpH);
             if (x1 <= x0 || y1 <= y0) continue;
 
-            var pMin  = new Vector2(x0, y0);
-            var pMax  = new Vector2(x1, y1);
+            var pMin = new Vector2(x0, y0);
+            var pMax = new Vector2(x1, y1);
             var uvMin = new Vector2((float)x0 / vpW, (float)y0 / vpH);
             var uvMax = new Vector2((float)x1 / vpW, (float)y1 / vpH);
 
+            // Use AddImageQuad with matching corners — AddImage takes ImTextureID
+            // in Dalamud's bindings but the quad variant is what other renderers use
+            // and it accepts our nint-wrapped ImTextureID cleanly.
             dl.AddImageQuad(texId,
                 pMin, new Vector2(x1, y0), pMax, new Vector2(x0, y1),
                 uvMin, new Vector2(uvMax.X, uvMin.Y), uvMax, new Vector2(uvMin.X, uvMax.Y),
@@ -554,74 +533,58 @@ public sealed unsafe class CopyBlitRenderer : IDisposable
         UiRestoreAddonCount = restored;
     }
 
+    // Native FFXIV addons whose screen rects we restore on top of the video.
+    // Same list StatusApi.BuildHud uses — visible HUD elements only. Windows the
+    // user opens (Inventory, Character, Map, etc.) are handled by their own entries.
+    private static readonly string[] NativeUiAddonNames = {
+        "_HotBar", "_HotBar1", "_HotBar2", "_HotBar3", "_HotBar4",
+        "_HotBar5", "_HotBar6", "_HotBar7", "_HotBar8", "_HotBar9",
+        "_NaviMap", "_ParameterWidget", "_PartyList",
+        "_TargetInfo", "_FocusTargetInfo", "_TargetInfoMainTarget", "_TargetInfoBuffDebuff", "_TargetInfoCastBar",
+        "_ChatLog", "_ChatLogPanel_0", "_ChatLogPanel_1", "_ChatLogPanel_2", "_ChatLogPanel_3",
+        "_ExpBar", "_LimitBreak", "_ScenarioTree",
+        "_ActionBar", "_ActionBar01", "_ActionBar02", "_ActionBar03",
+        "_ActionBar04", "_ActionBar05", "_ActionBar06", "_ActionBar07", "_ActionBar08", "_ActionBar09",
+        "_ActionCross", "_ActionDoubleCrossL", "_ActionDoubleCrossR", "_ActionContents",
+        "_StatusCustom0", "_StatusCustom1", "_StatusCustom2", "_StatusCustom3",
+        "_Status", "_StatusEnhancements", "_StatusEnfeeblements", "_StatusEnfeeblementsOther", "_StatusEnhancementsOther", "_StatusOthers",
+        "_ToDoList", "_MJI",
+        "Inventory", "InventoryLarge", "InventoryExpansion", "InventoryGrid", "InventoryGridCrystal",
+        "InventoryRetainer", "InventoryRetainerLarge",
+        "Character", "CharacterInspect", "CharacterStatus",
+        "Map", "AreaMap", "GatheringMasterpiece", "GatheringPointBase",
+        "RecipeNote", "RecipeTree", "Synthesis", "Gathering", "Fishing", "FishingNotes",
+        "SelectYesno", "SelectString", "SelectIconString", "Talk", "TalkSubtitle",
+        "SystemMenu", "ConfigCharacter", "ConfigSystem", "ConfigKeybind", "ConfigLog",
+        "Buddy", "PvpProfile", "PvPTeam", "PvPTeamSetup",
+        "MountNoteBook", "MinionNoteBook", "OrnamentNoteBook",
+        "FateProgress", "ContentsInfo", "ContentsFinder", "ContentsFinderSetting",
+        "ArmouryBoard", "GearSetList", "Currency", "MoneyString",
+        "Journal", "JournalDetail", "JournalResult",
+        "MonsterNote", "MonsterNoteDetail",
+        "Shop", "ShopExchangeCurrency", "ShopExchangeItem", "InclusionShop",
+        "Trade", "Retainer", "RetainerList", "RetainerSell", "RetainerTaskAsk",
+        "BannerEditor", "BannerList", "BannerPreview",
+        "AreaTitleBanner", "InstanceTitleBanner", "EnemyMouseOverIcon",
+    };
+
     private void UpdateCbuffer(Configuration config, ScreenDefinition screen,
         int vpW, int vpH, bool hasVideo, bool hasDepth)
     {
-        // Read camera state directly from Render.Camera — this is exactly what XMP
-        // does (Plugin.cs:2925-2978 in their repo). No matrix inversion is required
-        // for the ray reconstruction because we have the basis vectors + FoV as
-        // discrete fields on the camera struct.
-        Matrix4x4 viewProj  = Matrix4x4.Identity;
-        Vector3 camPos      = Vector3.Zero;
-        Vector3 camRight    = Vector3.UnitX;
-        Vector3 camUp       = Vector3.UnitY;
-        Vector3 camForward  = -Vector3.UnitZ;
-        float   fovY        = MathF.PI * 0.25f;
-        float   aspect      = (float)vpW / Math.Max(1, vpH);
-        float   nearPlane   = 0.1f;
-        float   farPlane    = 1000f;
-
-        var sceneMgr = CSSceneCameraMgr.Instance();
-        if (sceneMgr != null)
-        {
-            var sceneCam = sceneMgr->CurrentCamera;
-            if (sceneCam != null)
-            {
-                var rc = sceneCam->RenderCamera;
-                if (rc != null)
-                {
-                    var view = rc->ViewMatrix;
-                    var proj = rc->ProjectionMatrix;
-                    viewProj  = view * proj;
-                    camPos    = rc->Origin;
-                    fovY      = rc->FoV;
-                    aspect    = rc->AspectRatio;
-                    nearPlane = rc->NearPlane;
-                    farPlane  = rc->FarPlane;
-
-                    // XMP's approach: derive camera basis from the inverse view matrix.
-                    // Rows [0], [1], [2] of invView are camera-space X, Y, Z axes in world.
-                    if (Matrix4x4.Invert(view, out var invView))
-                    {
-                        camRight   = new Vector3(invView.M11, invView.M12, invView.M13);
-                        camUp      = new Vector3(invView.M21, invView.M22, invView.M23);
-                        camForward = new Vector3(invView.M31, invView.M32, invView.M33);
-                    }
-                }
-            }
-        }
-
-        // TV plane world corners from the full TRS matrix — honors yaw/pitch/roll.
-        var st = screen.ComputeScreenTransform();
-        var tl = Vector3.Transform(new Vector3(-0.5f,  0.5f, 0f), st);
-        var tr = Vector3.Transform(new Vector3( 0.5f,  0.5f, 0f), st);
-        var bl = Vector3.Transform(new Vector3(-0.5f, -0.5f, 0f), st);
+        // Same source D3DRenderer uses. No M44 fix / inversion — the vertex-based
+        // path only needs the forward transform. This matches the working D3DRenderer
+        // convention at D3DRenderer.cs:520-522.
+        var viewProj        = CSControl.Instance()->ViewProjectionMatrix;
+        var screenTransform = screen.ComputeScreenTransform();
 
         var cb = new CbData
         {
-            ViewProj      = viewProj,
-            CameraPos     = new Vector4(camPos,     0f),
-            CameraRight   = new Vector4(camRight,   0f),
-            CameraUp      = new Vector4(camUp,      0f),
-            CameraForward = new Vector4(camForward, 0f),
-            CornerTL      = new Vector4(tl, 0f),
-            CornerTR      = new Vector4(tr, 0f),
-            CornerBL      = new Vector4(bl, 0f),
-            FovAspect     = new Vector4(fovY, aspect, nearPlane, farPlane),
-            ViewportSize  = new Vector4(vpW, vpH, 1f / vpW, 1f / vpH),
-            Tint          = new Vector4(config.TintR, config.TintG, config.TintB, config.TintA),
-            Options       = new Vector4(config.Brightness, config.Gamma, config.Contrast, hasDepth ? 1f : 0f),
-            Options2      = new Vector4(hasVideo ? 1f : 0f, hasDepth ? 1f : 0f, 0f, 0f),
+            ViewProj        = viewProj,
+            ScreenTransform = screenTransform,
+            ViewportSize    = new Vector4(vpW, vpH, 1f / vpW, 1f / vpH),
+            Tint            = new Vector4(config.TintR, config.TintG, config.TintB, config.TintA),
+            Options         = new Vector4(config.Brightness, config.Gamma, config.Contrast, hasDepth ? 1f : 0f),
+            Options2        = new Vector4(hasVideo ? 1f : 0f, hasDepth ? 1f : 0f, 0f, 0f),
         };
 
         var mapped = _context!.Map(_cbuffer!, 0, MapMode.WriteDiscard, Vortice.Direct3D11.MapFlags.None);
@@ -678,10 +641,9 @@ public sealed unsafe class CopyBlitRenderer : IDisposable
         // t1 = depth SRV (or null if capture failed).
         ctx.PSSetShaderResource(1, hasDepth ? _depthCopySrv : null);
 
-        // Three vertices — SV_VertexID emits a screen-covering triangle. The PS
-        // decides per-pixel whether it lies on the TV plane. Exactly XMP's pattern
-        // (DepthTestedRenderer.cs:1420-1453).
-        ctx.Draw(3, 0);
+        // Six vertices, generated in the VS from SV_VertexID (no VB / IB / IL needed).
+        // Rasterizer only fills pixels covered by the TV quad — outside stays cleared.
+        ctx.Draw(6, 0);
 
         // Unbind our outputs so Dalamud's ImGui pass isn't confused by leftover
         // RTV / SRV bindings. Dalamud's ImGui backend restores full state on its
@@ -692,26 +654,26 @@ public sealed unsafe class CopyBlitRenderer : IDisposable
     }
 
     // ── HLSL ─────────────────────────────────────────────────────────────────
-    // XivMediaPlayer's rendering: fullscreen triangle + per-pixel ray-plane
-    // intersection using camera basis + FoV read from Render.Camera. Direct port
-    // of XMP's DepthTestedRenderer (DepthTestedRenderer.cs:258-352 in their repo).
-    // NO ViewProj inversion — the ray is built straight from CameraPos + basis + FoV.
+    // Vertex-based quad (D3DRenderer-style) + 5x5 Gaussian PCF depth compare (XMP-style).
+    //
+    // The vertex path (mul(local, ScreenTransform) → mul(world, ViewProj)) is identical
+    // to the shipping D3DRenderer convention (D3DRenderer.cs:519-524). Only pixels the
+    // rasterizer covers hit the PS — everywhere else the RTV keeps the transparent
+    // clear color, so ImGui blits the game through unchanged.
+    //
+    // Ray-plane / InvViewProj was tried first (XMP-clone) but produced a fullscreen
+    // artifact because inverting Control->ViewProjectionMatrix with M44=0 required a
+    // hack (M44:=1) that broke the resulting inverse. Vertex path avoids the inversion
+    // entirely.
     private const string ShaderCode = @"
 cbuffer Constants : register(b0)
 {
-    row_major float4x4 ViewProj;   // only for computing hit-depth in the depth compare
-    float4   CameraPos;
-    float4   CameraRight;
-    float4   CameraUp;
-    float4   CameraForward;
-    float4   CornerTL;             // TV plane world corners
-    float4   CornerTR;
-    float4   CornerBL;
-    float4   FovAspect;            // x=fovY(rad) y=aspect z=near w=far
-    float4   ViewportSize;         // xy=w,h  zw=1/w,1/h
+    row_major float4x4 ViewProj;
+    row_major float4x4 ScreenTransform;
+    float4   ViewportSize;   // xy = w,h    zw = 1/w, 1/h
     float4   Tint;
-    float4   Options;              // x=brightness y=gamma z=contrast w=depthEnable
-    float4   Options2;             // x=hasVideo   y=hasDepth
+    float4   Options;        // x=brightness  y=gamma  z=contrast  w=depthEnable(0/1)
+    float4   Options2;       // x=hasVideo    y=hasDepth
 };
 
 Texture2D    VideoTexture : register(t0);
@@ -719,65 +681,64 @@ Texture2D    DepthTexture : register(t1);
 SamplerState VideoSampler : register(s0);
 SamplerState DepthSampler : register(s1);
 
-struct VS_OUT
-{
-    float4 pos : SV_Position;
-    float2 uv  : TEXCOORD0;
+// Two triangles covering a unit quad in local XY. Same layout as D3DRenderer.cs:506-513.
+static const float3 kPos[6] = {
+    float3(-0.5f,  0.5f, 0.0f),  // TL
+    float3( 0.5f,  0.5f, 0.0f),  // TR
+    float3(-0.5f, -0.5f, 0.0f),  // BL
+    float3( 0.5f,  0.5f, 0.0f),  // TR
+    float3( 0.5f, -0.5f, 0.0f),  // BR
+    float3(-0.5f, -0.5f, 0.0f),  // BL
+};
+static const float2 kUV[6] = {
+    float2(0.0f, 0.0f), float2(1.0f, 0.0f), float2(0.0f, 1.0f),
+    float2(1.0f, 0.0f), float2(1.0f, 1.0f), float2(0.0f, 1.0f),
 };
 
-// Standard SV_VertexID → fullscreen triangle trick (same as XMP).
+struct VS_OUT
+{
+    float4 pos      : SV_Position;
+    float2 uv       : TEXCOORD0;
+    float3 worldPos : TEXCOORD1;
+};
+
 VS_OUT VS(uint id : SV_VertexID)
 {
+    float4 world = mul(float4(kPos[id], 1.0f), ScreenTransform);
     VS_OUT o;
-    o.uv  = float2((id << 1) & 2, id & 2);
-    o.pos = float4(o.uv * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.pos      = mul(world, ViewProj);
+    o.uv       = kUV[id];
+    o.worldPos = world.xyz;
     return o;
 }
 
 float4 PS(VS_OUT input) : SV_Target
 {
-    // ─ Reconstruct camera ray for this pixel (XMP's exact approach) ──────
-    float2 ndc = input.pos.xy * ViewportSize.zw * float2(2, -2) + float2(-1, 1);
-    float  fovDist = 1.0f / tan(FovAspect.x * 0.5f);
-    float3 rayDir = normalize(ndc.x * FovAspect.y * CameraRight.xyz
-                            + ndc.y                * CameraUp.xyz
-                            - fovDist              * CameraForward.xyz);
-    float3 rayOrigin = CameraPos.xyz;
-
-    // ─ Ray vs TV plane ───────────────────────────────────────────────────
-    float3 tvRight  = CornerTR.xyz - CornerTL.xyz;
-    float3 tvDown   = CornerBL.xyz - CornerTL.xyz;
-    float3 tvNormal = cross(tvDown, tvRight);
-    float  nlen     = length(tvNormal);
-    if (nlen < 1e-6f) discard;
-    tvNormal /= nlen;
-
-    float denom = dot(tvNormal, rayDir);
-    if (abs(denom) < 1e-6f) discard;
-    float t = dot(CornerTL.xyz - rayOrigin, tvNormal) / denom;
-    if (t < 0.0f) discard;
-
-    float3 hit = rayOrigin + rayDir * t;
-    float3 rel = hit - CornerTL.xyz;
-
-    float rightLenSq = dot(tvRight, tvRight);
-    float downLenSq  = dot(tvDown,  tvDown);
-    if (rightLenSq < 1e-8f || downLenSq < 1e-8f) discard;
-
-    float u = dot(rel, tvRight) / rightLenSq;
-    float v = dot(rel, tvDown)  / downLenSq;
-    if (u < 0.0f || u > 1.0f || v < 0.0f || v > 1.0f) discard;
-
-    // ─ Depth test (5x5 Gaussian PCF against captured game depth) ─────────
-    float occlusion = 0.0f;
-    if (Options.w > 0.5f && Options2.y > 0.5f)
+    // ─ Sample video / placeholder ────────────────────────────────────────
+    float4 videoColor;
+    if (Options2.x > 0.5)
     {
-        float4 hitClip = mul(float4(hit, 1.0f), ViewProj);
-        if (hitClip.w > 0.0f)
+        videoColor = VideoTexture.Sample(VideoSampler, input.uv);
+    }
+    else
+    {
+        // Placeholder gradient — visible when no video is loaded.
+        videoColor = float4(0.05 + 0.5 * input.uv.x,
+                            0.05 + 0.5 * input.uv.y,
+                            0.15,
+                            1.0);
+    }
+
+    // ─ Depth test (5x5 Gaussian PCF against the captured game depth) ─────
+    float occlusion = 0.0;
+    if (Options.w > 0.5 && Options2.y > 0.5)
+    {
+        float4 hitClip = mul(float4(input.worldPos, 1.0f), ViewProj);
+        if (hitClip.w > 0.0)
         {
             float hitDepth    = hitClip.z / hitClip.w;
-            float occCount    = 0.0f;
-            float totalWeight = 0.0f;
+            float occCount    = 0.0;
+            float totalWeight = 0.0;
             float2 texel      = ViewportSize.zw;
             [unroll] for (int dy = -2; dy <= 2; dy++)
             {
@@ -786,7 +747,8 @@ float4 PS(VS_OUT input) : SV_Target
                     float2 sampleUV = (input.pos.xy + float2(dx * 1.5f, dy * 1.5f)) * texel;
                     float  sceneDepth = DepthTexture.SampleLevel(DepthSampler, sampleUV, 0).r;
                     float  weight     = exp(-0.3f * (dx * dx + dy * dy));
-                    // Reverse-Z: sceneDepth > hitDepth => scene closer => hit occluded.
+                    // Reverse-Z: closer to camera = higher value.
+                    // sceneDepth > hitDepth → scene sample is CLOSER → hit is occluded.
                     if (sceneDepth > hitDepth + 0.0001f) occCount += weight;
                     totalWeight += weight;
                 }
@@ -796,21 +758,16 @@ float4 PS(VS_OUT input) : SV_Target
     }
     if (occlusion >= 0.999f) discard;
 
-    // ─ Sample video (no placeholder — safety) ────────────────────────────
-    // If there's no video texture, discard immediately. NEVER draw a full-screen
-    // placeholder fill — a broken ray-plane math combined with a placeholder gradient
-    // is what black/blue-covered the user's screen previously.
-    if (Options2.x < 0.5f) discard;
-    float4 videoColor = VideoTexture.Sample(VideoSampler, float2(u, v));
-
     // ─ Post-processing ───────────────────────────────────────────────────
-    videoColor.rgb *= Options.x;
-    videoColor.rgb = pow(saturate(videoColor.rgb), max(Options.y, 0.01f));
-    videoColor.rgb = saturate((videoColor.rgb - 0.5f) * Options.z + 0.5f);
+    videoColor.rgb *= Options.x;                                            // brightness
+    videoColor.rgb = pow(saturate(videoColor.rgb), max(Options.y, 0.01f));  // gamma
+    videoColor.rgb = saturate((videoColor.rgb - 0.5f) * Options.z + 0.5f);  // contrast
     videoColor    *= Tint;
 
     videoColor.a *= (1.0f - occlusion);
-    videoColor.rgb *= videoColor.a;  // premultiply
+
+    // Premultiply so the offscreen->ImGui blit blends correctly.
+    videoColor.rgb *= videoColor.a;
     return videoColor;
 }
 ";
