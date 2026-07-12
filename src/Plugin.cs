@@ -36,6 +36,19 @@ public sealed class Plugin : IDalamudPlugin
     // Selected by Configuration.UseCopyBlitRenderer (default: true).
     private readonly CopyBlitRenderer _copyBlit;
 
+    // Phase 6: PyonPix-style renderer (port of priprii/PyonPix). Hooks
+    // OMSetRenderTargets + Present, scores game RTVs, draws into the game's
+    // own render target. The only architecture known to render for peers.
+    // Default rendering mode as of v0.5.224.
+    private readonly PyonPixRenderer _pyonPix;
+
+    // Phase 6b: PyonPixExact — same OMSetRT hook + RTV scoring as PyonPix, but
+    // uses PyonPix's actual compiled .cso bytecode (extracted from their DLL)
+    // and mirrors their 288-byte cbuffer + 36-vertex cube-shell draw exactly.
+    // Enabled via /set/rendermode?v=pyonpixexact so we can A/B against the
+    // from-scratch shader in RenderingMode.PyonPix.
+    private readonly PyonPixExactRenderer _pyonPixExact;
+
     // Phase 3: Video playback via LibVLC
     private readonly VideoPlayer      _videoPlayer;
     private bool _videoSetupDone;
@@ -65,6 +78,8 @@ public sealed class Plugin : IDalamudPlugin
         _screenRenderer = new ScreenRenderer(GameGui, TextureProvider);
         _d3dRenderer    = new D3DRenderer(GameInterop);
         _copyBlit       = new CopyBlitRenderer();
+        _pyonPix        = new PyonPixRenderer(GameInterop);
+        _pyonPixExact   = new PyonPixExactRenderer(GameInterop);
         _videoPlayer    = new VideoPlayer(PluginInterface.AssemblyLocation.DirectoryName!);
         _browserPlayer  = new BrowserPlayer(PluginInterface.AssemblyLocation.DirectoryName!);
         _sync           = new SyncCoordinator(_videoPlayer);
@@ -76,8 +91,16 @@ public sealed class Plugin : IDalamudPlugin
         _copyBlit.SetVideoPlayer(_videoPlayer);
         _copyBlit.SetGameGui(GameGui);
 
+        _pyonPix.SetVideoPlayer(_videoPlayer);
+        _pyonPix.SetConfig(Config);
+
+        _pyonPixExact.SetVideoPlayer(_videoPlayer);
+        _pyonPixExact.SetConfig(Config);
+
         _statusApi.SetSubsystems(_d3dRenderer, _videoPlayer, _browserPlayer, _sync, Config, GameGui);
         _statusApi.SetCopyBlit(_copyBlit);
+        _statusApi.SetPyonPix(_pyonPix);
+        _statusApi.SetPyonPixExact(_pyonPixExact);
 
         _sync.Volume = Config.Volume;
         _sync.Muted  = Config.Muted;
@@ -134,6 +157,8 @@ public sealed class Plugin : IDalamudPlugin
         _sync.Dispose();
         _videoPlayer.Dispose();
         _browserPlayer.Dispose();
+        _pyonPix.Dispose();
+        _pyonPixExact.Dispose();
         _copyBlit.Dispose();
         _d3dRenderer.Dispose();
         _screenRenderer.Dispose();
@@ -326,6 +351,85 @@ public sealed class Plugin : IDalamudPlugin
 
         var screen = Config.Screen;
         if (!screen.Visible) return;
+
+        // v0.5.237: safety guard removed. The v0.5.235 freeze root cause was
+        // `_omSetRtHook.Original(...)` at the tail of the detour racing with
+        // hot-reload teardown. That call is replaced by `ctx.OMSetRenderTargets`
+        // (goes through the re-entry guard cleanly), plus Dispose spin-waits on
+        // an in-flight detour counter before tearing down hooks. See BROKEN.md
+        // for the full fix. PyonPix is opt-in via /set/rendermode?v=pyonpix.
+
+        // ── PyonPix-style path ─────────────────────────────────────────────
+        // v0.5.226 fix: crash root-cause was hooking IDXGISwapChain::Present,
+        // which Dalamud already hooks — Reloaded.Hooks AVs when it tries to
+        // relocate the existing trampoline. We now hook ONLY OMSetRenderTargets
+        // (which Dalamud doesn't hook) and drive the frame counter from OnDraw
+        // via _pyonPix.IncrementFrameCounter().
+        //
+        // Opt-in via config or `curl "http://localhost:17777/set/rendermode?v=pyonpix"`
+        // until confirmed working on your peer.
+        if (Config.RenderMode == RenderingMode.PyonPix)
+        {
+            if (!_pyonPix.IsAvailable)
+                _pyonPix.TryInitialize();
+
+            if (_pyonPix.IsAvailable && !_videoSetupDone && _pyonPix.Device != null)
+            {
+                _videoPlayer.SetDevice(_pyonPix.Device);
+                _videoSetupDone = true;
+            }
+
+            _pyonPix.SetScreen(screen);
+            _pyonPix.IncrementFrameCounter();
+
+            _sync.Mode          = Config.SyncMode;
+            _sync.YtDlpPath     = Config.YtDlpPath;
+            _sync.Playlist      = Config.Playlist;
+            _sync.PlaylistIndex = Config.PlaylistIndex;
+            _sync.PlaylistLoop  = Config.PlaylistLoop;
+
+            if (Config.SyncMode == NetworkMode.Host && Config.SyncServerRunning
+                && !_sync.Server.IsRunning && string.IsNullOrEmpty(_sync.Server.LastError))
+                _sync.Server.Start(Config.SyncPort);
+            else if ((!Config.SyncServerRunning || Config.SyncMode != NetworkMode.Host)
+                && _sync.Server.IsRunning)
+                _sync.Server.Stop();
+
+            return;
+        }
+
+        // ── PyonPixExact — same architecture as PyonPix, but real PyonPix ──
+        // compiled bytecode + 288-byte cbuffer + 36-vert cube-shell draw.
+        // Enable via /set/rendermode?v=pyonpixexact.
+        if (Config.RenderMode == RenderingMode.PyonPixExact)
+        {
+            if (!_pyonPixExact.IsAvailable)
+                _pyonPixExact.TryInitialize();
+
+            if (_pyonPixExact.IsAvailable && !_videoSetupDone && _pyonPixExact.Device != null)
+            {
+                _videoPlayer.SetDevice(_pyonPixExact.Device);
+                _videoSetupDone = true;
+            }
+
+            _pyonPixExact.SetScreen(screen);
+            _pyonPixExact.IncrementFrameCounter();
+
+            _sync.Mode          = Config.SyncMode;
+            _sync.YtDlpPath     = Config.YtDlpPath;
+            _sync.Playlist      = Config.Playlist;
+            _sync.PlaylistIndex = Config.PlaylistIndex;
+            _sync.PlaylistLoop  = Config.PlaylistLoop;
+
+            if (Config.SyncMode == NetworkMode.Host && Config.SyncServerRunning
+                && !_sync.Server.IsRunning && string.IsNullOrEmpty(_sync.Server.LastError))
+                _sync.Server.Start(Config.SyncPort);
+            else if ((!Config.SyncServerRunning || Config.SyncMode != NetworkMode.Host)
+                && _sync.Server.IsRunning)
+                _sync.Server.Stop();
+
+            return;
+        }
 
         // ── XMP-style CopyBlit path (default; toggle in Configuration) ───────
         // Runs entirely at UiBuilder.Draw time — no game render hooks. Renders

@@ -4,6 +4,206 @@ Last updated: 2026-07-11 (v0.5.219)
 
 ---
 
+## PyonPixRenderer (Phase 6, v0.5.224+) — Bug Journal
+
+### v0.5.235 — DEADLOCK during hot-reload (game hung, crashhandler killed it)
+
+**Symptom**: Trist stepped away from the PC while v0.5.234 was actively drawing
+in PyonPix mode. Came back to a fully frozen FFXIV window. No crash dump. No
+new dalamud.log entries after `01:09:22 yt-dlp complete`. Crash handler killed
+the process at `02:15:48` with `ERROR_BROKEN_PIPE (0x6D)` — the crash handler
+couldn't read exception info because there was NO exception, just an
+unresponsive render thread.
+
+**Root cause** (inferred, not directly captured because there was no dump):
+
+While Trist was away, my `dotnet build` command dropped v0.5.235.dll on disk.
+Dalamud's file-change watcher scheduled a plugin reload. During the reload:
+
+1. `Plugin.Dispose()` runs on the render thread.
+2. It calls `_pyonPix.Dispose()` which calls `_omSetRtHook.Disable()` then
+   `_omSetRtHook.Dispose()`.
+3. Reloaded.Hooks' `Disable()` waits for any in-flight detour to complete
+   before removing the JMP patch.
+4. If the render thread was mid-detour at the exact instant of Dispose, and
+   our detour ended with a call to `_omSetRtHook!.Original(...)` (the RTV
+   restore we added in v0.5.231), that Original call could race with the
+   hook teardown — leading to either a deadlock (both waiting on the other)
+   or a jump to freed trampoline code.
+5. Render thread stalls indefinitely. Game window stops updating. StatusApi
+   background thread stays alive so /pyonpix and /version still respond,
+   masking the hang.
+
+**Fix (v0.5.236)**:
+- Add a `Plugin.OnDraw` safety guard that force-flips `RenderMode = Legacy`
+  the moment a saved config with `RenderMode = PyonPix` loads. This prevents
+  `_pyonPix.TryInitialize()` from ever installing the OMSetRT hook until the
+  underlying race condition is fixed.
+- No functional PyonPix change yet — the hook install itself is fine; the
+  problem is teardown-during-detour.
+- To eventually re-enable PyonPix safely, the detour must either:
+  1. Skip the RTV restore entirely (accept some game-side visual corruption
+     as a cost of safety)
+  2. Use a semaphore that Dispose can wait on before starting hook teardown
+  3. Never call `Original(...)` after the primary hook body
+
+**Lessons**:
+- **Never call `_hook.Original(...)` from a non-trivial code path in a
+  detour that outlives the primary hook body.** The RTV restore was
+  well-motivated (prevent state corruption of the game's subsequent draws)
+  but it turns the detour into a nested Original call, which is exactly the
+  window where a hot-reload teardown can race.
+- **A hang looks nothing like a crash in the logs.** No exception, no dump,
+  just a broken pipe when the crash handler eventually gives up. Search
+  criteria: `dalamud.log` stops updating + `crashhandler.log` has
+  `Failed to read exception information` + `Terminating target process`.
+- **Hot-reload triggered by unattended builds is a real risk.** Not just
+  "you'll lose a session" — an unattended reload while the detour is
+  in-flight bricks the game. Consider requiring an explicit user action
+  (config setting, environment flag) before allowing hot-reload of a
+  plugin that installs render-path hooks.
+
+---
+
+### v0.5.224 — HARD CRASH (Trist's game killed on plugin load)
+
+**Symptom**: The moment `Config.RenderMode == RenderingMode.PyonPix` (the new default)
+and `Plugin.OnDraw()` fired for the first time after the v0.5.224 DLL loaded,
+`_pyonPix.TryInitialize()` was called → `InstallHooks(ctxPtr)` → and the game
+process died with `System.AccessViolationException`. No FFXIV window, no
+Dalamud recovery — full crash to desktop, dump file written to
+`%AppData%\XIVLauncher\dalamud_appcrash_*.log` + `.dmp`.
+
+**Root cause** (from crash dump call stack):
+```
+System.AccessViolationException: Attempted to read or write protected memory
+   at Reloaded.Memory.Sources.Memory.Read[UIntPtr]
+   at Reloaded.Hooks.Internal.FunctionPatcher.GetRewriteRIPRelativeJumpTarget
+   at Reloaded.Hooks.Internal.FunctionPatcher.PatchRIPRelativeJump
+   at Reloaded.Hooks.Hook.CreateHook
+   at Dalamud.Hooking.HookFromAddress<PresentDelegate>
+   at FFXIVTv.PyonPixRenderer.InstallHooks
+```
+
+I tried to hook `IDXGISwapChain::Present` (vtable slot 8). **Dalamud already
+hooks that function** — the crash-time game-side call stack shows Dalamud's
+own `DxgiSwapChainPresentDetour` at frame [32]. When my `HookFromAddress<T>`
+called `Reloaded.Hooks` to install a chained hook on top, its `FunctionPatcher`
+tried to disassemble the target function's instructions to relocate any
+RIP-relative jumps for the trampoline. Dalamud's existing hook has replaced
+that memory with structures the analyzer can't safely walk — the memory read
+hit protected pages and the AV killed the process.
+
+**Why the OMSetRenderTargets hook (slot 33) worked**: Dalamud does NOT hook
+that slot, so my chained hook was on top of the game's raw vtable entry and
+`FunctionPatcher` could analyze it cleanly.
+
+**Fix (v0.5.226)**:
+- Remove the `Present` hook entirely.
+- PyonPix used it only as a frame counter (`PresentIndex++`).
+- Add `PyonPixRenderer.IncrementFrameCounter()` and call it from
+  `Plugin.OnDraw` — same functional behavior for the RTV-scoring recency
+  bonus, zero hook conflict.
+- OMSetRenderTargets hook stays (it works and it's the actual peer-portability
+  mechanism).
+
+**Immediate remediation (v0.5.225, no functional change)**: flipped
+`Configuration.RenderMode` default to `Legacy` and added a `Plugin.OnDraw`
+force-off so any user with the crashed 0.5.224 DLL cached could reload
+safely into the legacy hook path.
+
+**The exact mechanism**:
+
+1. `HookFromAddress<T>(addr, detour)` uses `Reloaded.Hooks` under the hood.
+2. To install a hook, Reloaded writes a `JMP` at `addr` to the detour. But
+   that overwrites the first few bytes of the target function — those bytes
+   need to still execute somewhere, so Reloaded copies them into a
+   **trampoline** and rewrites any RIP-relative jumps in them to point back
+   into the original function's original location.
+3. To do that rewriting, `FunctionPatcher.GetRewriteRIPRelativeJumpTarget`
+   calls `Reloaded.Memory.Sources.Memory.Read` to walk the target function's
+   instructions with Iced.
+4. Dalamud had already hooked Present. At `addr` there was no longer the
+   original `Present` prologue — there was **Dalamud's own trampoline**,
+   which contains structures Reloaded doesn't recognize. When Iced tried to
+   disassemble past the end of what Reloaded expected, it read into
+   protected memory.
+5. That memory read is a native `MOV` — no `try/catch` can catch it. The
+   CLR sees an `AccessViolationException`, propagates it up the stack, and
+   the process dies because AV is fatal by default in the runtime.
+
+**The reason OMSetRenderTargets (slot 33) worked**: Dalamud doesn't hook
+slot 33. Reloaded found the raw D3D11 vtable entry pointing at the game's
+own OMSetRT code, which Iced knows how to disassemble cleanly.
+
+**The reason the fix (v0.5.226) works**: we don't hook Present at all.
+PyonPix hooked it only to increment `PresentIndex` once per frame for
+RTV-scoring recency bonuses. `Plugin.OnDraw` fires once per frame too —
+Dalamud invokes it from *inside* Dalamud's own Present hook, which is
+exactly why `HookFromAddress<PresentDelegate>` conflicted in the first
+place. Incrementing our counter from `OnDraw` gives us the identical
+per-frame tick without touching the vtable.
+
+---
+
+**PERMANENT RULE — hook only slots Dalamud does not touch**
+
+Before installing ANY vtable hook via `HookFromAddress` or `HookFromSignature`
+on a D3D-adjacent object (`ID3D11Device`, `ID3D11DeviceContext`,
+`IDXGISwapChain`, `IDXGIFactory*`), verify Dalamud does not already hook
+that slot. Chaining Reloaded.Hooks on top of Dalamud's own hook is not a
+"maybe it works" situation — it is a **guaranteed process-terminating AV**
+that will kill the game every time, and no `try/catch` can prevent it
+because the fault is in native disassembler code.
+
+**Known-Dalamud-hooked functions as of Dalamud v15.0.2.2 — DO NOT HOOK**:
+
+| Target | Slot | Dalamud detour (from crash stack) |
+|---|---|---|
+| `IDXGISwapChain::Present` | 8 | `InterfaceManager.DxgiSwapChainPresentDetour` |
+| `IDXGISwapChain::ResizeBuffers` | 13 | `InterfaceManager.ResizeBuffersDetour` (likely) |
+
+**Confirmed-safe D3D vtable slots (used by shipping FFXIV-TV code)**:
+
+| Target | Slot | Notes |
+|---|---|---|
+| `ID3D11DeviceContext::DrawIndexed` | 12 | Used by D3DRenderer, works chained |
+| `ID3D11DeviceContext::Draw` | 13 | Used by D3DRenderer, works chained |
+| `ID3D11DeviceContext::OMSetRenderTargets` | 33 | Used by D3DRenderer + PyonPixRenderer |
+| `ID3D11DeviceContext::ClearRenderTargetView` | 50 | Used by D3DRenderer |
+| `ID3D11DeviceContext::Dispatch` | 41 | Used by D3DRenderer |
+
+**How to check a candidate slot before you hook it**:
+1. Search Dalamud source (or crash dumps from other people) for
+   `InterfaceManager.*Detour` names.
+2. Enable the plugin with an intentional crash-early code path
+   (`throw new Exception("about to hook X")` right before the
+   `HookFromAddress`) — if the game survives that throw but crashes on
+   your `HookFromAddress` call, the slot is Dalamud-hooked.
+3. Look at the crash dump call stack. If you see any
+   `Dalamud.Interface.Internal.InterfaceManager.*Detour` above your
+   `InstallHooks`, that's the confirmation.
+
+**How to substitute when the slot you want is Dalamud-hooked**:
+- Present → use `UiBuilder.Draw` for frame ticks (fires once per frame
+  inside Dalamud's Present detour anyway).
+- ResizeBuffers → poll `Device.Instance()->SwapChain->BackBuffer` pointer
+  each frame; when it changes, treat as resize.
+
+**Lessons**:
+- **Crash dumps are the fastest diagnostic.** The dalamud.log only
+  contained events up to yt-dlp completion — the plugin never wrote its
+  "PyonPixRenderer initialized" log line because the AV happened before
+  the log could flush. `dalamud_appcrash_*.log` had the full CoreCLR call
+  stack **plus** the game-side native stack, which independently confirmed
+  Dalamud's Present hook was live at the moment of the crash.
+- **AV in Reloaded.Hooks' `FunctionPatcher` is uncatchable.** The frames
+  above your managed code are pure native disassembly walking. There is
+  no `try/catch` you can wrap around `HookFromAddress` that will save
+  you — the process dies before the throw returns.
+
+---
+
 ## CopyBlitRenderer (Phase 5, v0.5.216+) — Bug Journal
 
 Purpose of the renderer: mirror XivMediaPlayer's no-hooks pipeline so peers see the TV

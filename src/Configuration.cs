@@ -11,6 +11,40 @@ public enum ContentMode
     Browser,
 }
 
+/// <summary>
+/// World-render pipeline selection. Peer visibility is the axis that matters:
+///
+/// PyonPix       — port of priprii/PyonPix's RendererService written against our
+///                 own HLSL. Same hook + RTV-scoring architecture, but shader math
+///                 is a from-scratch approximation because upstream ships only
+///                 compiled .cso bytecode (no HLSL source). Uses a 6-vert quad.
+///
+/// PyonPixExact  — same architecture, but loads PyonPix's actual compiled
+///                 vsmain.cso / psmain.cso bytecode from embedded resources
+///                 and mirrors their exact 288-byte ShaderParams cbuffer +
+///                 36-vertex cube-shell draw + separated CameraView/Projection
+///                 matrices (transposed for column-major HLSL). Highest-fidelity
+///                 replica of the reference plugin — used when the from-scratch
+///                 shader in "PyonPix" mode gets the target RTV right but the
+///                 pixels are still wrong.
+///
+/// CopyBlit  — no game hooks. CopyResource depth + composite in a plugin-owned
+///             offscreen RTV + blit via ImGui.AddImageQuad + native ATK addon
+///             UI restore. Peer failure mode: see-through on peers, probably a
+///             colorspace/alpha mismatch on the ImGui blit path.
+///
+/// Legacy    — the original D3DRenderer. Hooks DrawIndexed (slot 12) and
+///             pattern-matches a specific LDR post-tonemap surface. Works on the
+///             host, fails on peers with different GPU/settings/patch combos.
+/// </summary>
+public enum RenderingMode
+{
+    Legacy,
+    CopyBlit,
+    PyonPix,
+    PyonPixExact,
+}
+
 public enum NetworkMode
 {
     Off,
@@ -127,6 +161,14 @@ public sealed class Configuration : IPluginConfiguration
     /// Default: true (the XMP-clone path is what peers see).
     /// </summary>
     public bool UseCopyBlitRenderer { get; set; } = true;
+
+    /// <summary>
+    /// Active rendering mode. Overrides UseCopyBlitRenderer when reading.
+    /// v0.5.225 SAFETY: default flipped to Legacy after v0.5.224 crashed the
+    /// game hard on Trist's machine. The PyonPix path exists but is disabled
+    /// at load until the crash root cause is diagnosed.
+    /// </summary>
+    public RenderingMode RenderMode { get; set; } = RenderingMode.Legacy;
 
     // ── Network Sync ──────────────────────────────────────────────────────────
 

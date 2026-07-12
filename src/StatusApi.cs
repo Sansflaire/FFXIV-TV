@@ -74,6 +74,14 @@ internal sealed class StatusApi : IDisposable
     /// <summary>Wire up the CopyBlit renderer once it's constructed in Plugin.cs.</summary>
     internal void SetCopyBlit(CopyBlitRenderer cb) => _cb = cb;
 
+    private PyonPixRenderer? _pp;
+    /// <summary>Wire up the PyonPix renderer once it's constructed in Plugin.cs.</summary>
+    internal void SetPyonPix(PyonPixRenderer pp) => _pp = pp;
+
+    private PyonPixExactRenderer? _ppe;
+    /// <summary>Wire up the PyonPixExact renderer (real bytecode variant).</summary>
+    internal void SetPyonPixExact(PyonPixExactRenderer ppe) => _ppe = ppe;
+
     public void Dispose()
     {
         _running = false;
@@ -105,6 +113,10 @@ internal sealed class StatusApi : IDisposable
                 "/version" or "/status" or "" => BuildVersion(),
                 "/render"                      => BuildRender(),
                 "/copyblit" or "/get/copyblit" => BuildCopyBlit(),
+                "/pyonpix" or "/get/pyonpix"   => BuildPyonPix(),
+                "/pyonpix/rtvs"                => BuildPyonPixRtvs(),
+                "/pyonpixexact"                => BuildPyonPixExact(),
+                "/pyonpixexact/rtvs"           => BuildPyonPixExactRtvs(),
                 "/video"                       => BuildVideo(),
                 "/browser"                     => BuildBrowser(),
                 "/sync"                        => BuildSync(),
@@ -234,6 +246,59 @@ internal sealed class StatusApi : IDisposable
                 }
                 return $"{{\"useCopyBlitRenderer\":{B(c.UseCopyBlitRenderer)}}}";
 
+            // Rendering mode toggle. Accepts "legacy", "copyblit", "pyonpix",
+            // "pyonpixexact" (case-insensitive).
+            //   curl "http://localhost:17777/set/rendermode?v=pyonpix"
+            //   curl "http://localhost:17777/set/rendermode?v=pyonpixexact"
+            //   curl "http://localhost:17777/set/rendermode?v=legacy"
+            //   curl "http://localhost:17777/pyonpix"                    → PyonPix diagnostics
+            //   curl "http://localhost:17777/pyonpixexact"               → PyonPixExact diagnostics
+            case "/set/rendermode":
+                if (q.TryGetValue("v", out var modeStr) && !string.IsNullOrEmpty(modeStr))
+                {
+                    if (Enum.TryParse<RenderingMode>(modeStr, ignoreCase: true, out var newMode))
+                    {
+                        c.RenderMode = newMode;
+                        c.Save();
+                    }
+                }
+                return $"{{\"renderMode\":{Q(c.RenderMode.ToString())}}}";
+
+            // PyonPix diagnostic toggles — no config save, runtime-only.
+            //   curl "http://localhost:17777/set/pyonpix/debugred?v=true"
+            //   curl "http://localhost:17777/set/pyonpix/disabledepth?v=true"
+            case "/set/pyonpix/debugred":
+                if (TryBoolQ(q, "v", out bool dr) && _pp != null) _pp.DebugRed = dr;
+                return $"{{\"debugRed\":{B(_pp?.DebugRed ?? false)}}}";
+
+            case "/set/pyonpix/disabledepth":
+                if (TryBoolQ(q, "v", out bool dd) && _pp != null) _pp.DisableDepth = dd;
+                return $"{{\"disableDepth\":{B(_pp?.DisableDepth ?? false)}}}";
+
+            case "/set/pyonpixexact/disabledepth":
+                if (TryBoolQ(q, "v", out bool ddx) && _ppe != null) _ppe.DisableDepth = ddx;
+                return $"{{\"disableDepth\":{B(_ppe?.DisableDepth ?? false)}}}";
+
+            case "/set/pyonpixexact/disableblend":
+                if (TryBoolQ(q, "v", out bool dbx) && _ppe != null) _ppe.DisableBlend = dbx;
+                return $"{{\"disableBlend\":{B(_ppe?.DisableBlend ?? false)}}}";
+
+            // Force target selection by RTV insertion index (0..RtvCacheCount-1).
+            // -1 restores PyonPix's reverse-walk. Use /pyonpixexact/rtvs to see
+            // available candidates + their insertion order.
+            //   curl "http://localhost:17777/set/pyonpixexact/targetindex?v=5"
+            case "/set/pyonpixexact/targetindex":
+                if (q.TryGetValue("v", out var tix) && int.TryParse(tix, out int newIdx) && _ppe != null)
+                    _ppe.TargetOverrideIndex = newIdx;
+                return $"{{\"targetOverrideIndex\":{_ppe?.TargetOverrideIndex ?? -1}}}";
+
+            // Toggle PyonPix's DSV-required Draw gate. When false, we draw on ANY
+            // bind of the target RTV — required to hit the SwapChain back buffer
+            // (bound alone during composite/UI passes, never with a DSV).
+            case "/set/pyonpixexact/requiredsv":
+                if (TryBoolQ(q, "v", out bool rdsv) && _ppe != null) _ppe.RequireDsv = rdsv;
+                return $"{{\"requireDsv\":{B(_ppe?.RequireDsv ?? true)}}}";
+
             // Inject-path controls — no config save needed (runtime only).
             case "/set/omsetrtenable":
                 if (TryBoolQ(q, "v", out bool ome)) D3DRenderer.OmSetRtInjectEnabled = ome;
@@ -321,6 +386,91 @@ internal sealed class StatusApi : IDisposable
     {
         var v = Assembly.GetExecutingAssembly().GetName().Version?.ToString(3) ?? "unknown";
         return $"{{\"version\":\"{v}\",\"loaded\":true}}";
+    }
+
+    private string BuildPyonPixRtvs()
+    {
+        var pp = _pp;
+        if (pp == null) return "{\"rtvs\":[]}";
+        var entries = new System.Text.StringBuilder();
+        bool first = true;
+        var target = pp.TargetRtvPtr;
+        foreach (var (ptr, fmt, w, h, calls, lastPresent, isBound, score) in pp.EnumerateCachedRtvs())
+        {
+            if (!first) entries.Append(',');
+            first = false;
+            entries.Append($"{{\"ptr\":\"0x{ptr:X}\",\"fmt\":{Q(fmt.ToString())},\"w\":{w},\"h\":{h}," +
+                           $"\"calls\":{calls},\"lastPresent\":{lastPresent},\"isBound\":{B(isBound)}," +
+                           $"\"score\":{F((float)score)},\"target\":{B(ptr == target)}}}");
+        }
+        return $"{{\"rtvs\":[{entries}]}}";
+    }
+
+    private string BuildPyonPix()
+    {
+        var pp = _pp;
+        var c  = _cfg;
+        var (tw, th) = pp?.TargetRtvSize ?? (0, 0);
+        return $$"""
+        {
+          "renderMode":         {{Q(c?.RenderMode.ToString() ?? "unknown")}},
+          "isAvailable":        {{B(pp?.IsAvailable ?? false)}},
+          "activeState":        {{Q(pp?.ActiveState ?? "uninit")}},
+          "frameCount":         {{pp?.FrameCount ?? 0}},
+          "omSetRtCount":       {{pp?.OmSetRtCount ?? 0}},
+          "drawCount":          {{pp?.DrawCount ?? 0}},
+          "rtvCacheCount":      {{pp?.RtvCacheCount ?? 0}},
+          "dsvCacheCount":      {{pp?.DsvCacheCount ?? 0}},
+          "targetRtvPtr":       "0x{{(pp?.TargetRtvPtr ?? 0):X}}",
+          "targetRtvFormat":    {{Q(pp?.TargetRtvFormat ?? "none")}},
+          "targetRtvSize":      { "w": {{tw}}, "h": {{th}} },
+          "targetRtvScore":     {{F((float)(pp?.TargetRtvScore ?? 0))}},
+          "lastError":          {{Q(pp?.LastError ?? "")}}
+        }
+        """;
+    }
+
+    private string BuildPyonPixExactRtvs()
+    {
+        var ppe = _ppe;
+        if (ppe == null) return "{\"rtvs\":[]}";
+        var entries = new System.Text.StringBuilder();
+        bool first = true;
+        var target = ppe.TargetRtvPtr;
+        foreach (var (idx, ptr, fmt, w, h, calls, lastPresent, isBound, score) in ppe.EnumerateCachedRtvs())
+        {
+            if (!first) entries.Append(',');
+            first = false;
+            entries.Append($"{{\"idx\":{idx},\"ptr\":\"0x{ptr:X}\",\"fmt\":{Q(fmt.ToString())},\"w\":{w},\"h\":{h}," +
+                           $"\"calls\":{calls},\"lastPresent\":{lastPresent},\"isBound\":{B(isBound)}," +
+                           $"\"score\":{F((float)score)},\"target\":{B(ptr == target)}}}");
+        }
+        return $"{{\"rtvs\":[{entries}]}}";
+    }
+
+    private string BuildPyonPixExact()
+    {
+        var ppe = _ppe;
+        var c   = _cfg;
+        var (tw, th) = ppe?.TargetRtvSize ?? (0, 0);
+        return $$"""
+        {
+          "renderMode":         {{Q(c?.RenderMode.ToString() ?? "unknown")}},
+          "isAvailable":        {{B(ppe?.IsAvailable ?? false)}},
+          "activeState":        {{Q(ppe?.ActiveState ?? "uninit")}},
+          "frameCount":         {{ppe?.FrameCount ?? 0}},
+          "omSetRtCount":       {{ppe?.OmSetRtCount ?? 0}},
+          "drawCount":          {{ppe?.DrawCount ?? 0}},
+          "rtvCacheCount":      {{ppe?.RtvCacheCount ?? 0}},
+          "dsvCacheCount":      {{ppe?.DsvCacheCount ?? 0}},
+          "targetRtvPtr":       "0x{{(ppe?.TargetRtvPtr ?? 0):X}}",
+          "targetRtvFormat":    {{Q(ppe?.TargetRtvFormat ?? "none")}},
+          "targetRtvSize":      { "w": {{tw}}, "h": {{th}} },
+          "targetRtvScore":     {{F((float)(ppe?.TargetRtvScore ?? 0))}},
+          "disableDepth":       {{B(ppe?.DisableDepth ?? false)}},
+          "lastError":          {{Q(ppe?.LastError ?? "")}}
+        }
+        """;
     }
 
     private string BuildCopyBlit()

@@ -4,6 +4,36 @@
 
 ---
 
+## Phase 6b — PyonPixExact (real PyonPix bytecode)
+
+Goal: eliminate the shader-math unknown in the existing PyonPix port by shipping
+PyonPix's own compiled `.cso` bytecode as embedded resources. Same OMSetRT hook
++ RTV scoring architecture as `PyonPix`, but every downstream detail (cbuffer
+layout, matrix orientation, vertex count, camera matrix source) copied verbatim
+from ref-pyonpix/RendererService.cs.
+
+- [x] v0.5.239: Extract `vsmain.cso` / `psmain.cso` / `vsavg.cso` / `psavg.cso` from `installedPlugins/PyonPix/1.1.0.1/PyonPix.dll` — confirm byte-identical to 1.0.0.6 (they are)
+- [x] v0.5.239: Add `RenderingMode.PyonPixExact` to `Configuration.RenderingMode`
+- [x] v0.5.239: Add `<EmbeddedResource>` entries in `src/FFXIV-TV.csproj` (LogicalName=`FFXIVTv.Shaders.<name>.cso`)
+- [x] v0.5.239: Create `src/PyonPixExactRenderer.cs` — 288-byte `ShaderParams` cbuffer matching `ref-pyonpix/ShaderParams.cs` byte-for-byte
+- [x] v0.5.239: Load shaders via `Assembly.GetManifestResourceStream("FFXIVTv.Shaders.<name>.cso")`
+- [x] v0.5.239: Camera matrices — SEPARATE view + projection from FFXIVClientStructs `SceneCamera` / `RenderCamera`, transposed before upload (mirrors `ref-pyonpix/CameraService.cs`)
+- [x] v0.5.239: `ctx.Draw(36, 0)` with null input layout / null vertex buffer (compiled shader synthesizes cube shell from `SV_VertexID`)
+- [x] v0.5.239: Same OMSetRT hook + RTV scoring + resize detection + in-flight counter + `SwapChain->BackBuffer` sentinel as `PyonPixRenderer` (copied inline, not extracted)
+- [x] v0.5.239: Wire into `Plugin.OnDraw` as a peer branch of the `PyonPix` case
+- [x] v0.5.239: Add `SetPyonPixExact` on `StatusApi` + `/pyonpixexact` + `/pyonpixexact/rtvs` diagnostic endpoints
+- [x] v0.5.239: Extend `/set/rendermode?v=pyonpixexact` (via `Enum.TryParse<RenderingMode>`)
+- [x] v0.5.239: Add `/set/pyonpixexact/disabledepth?v=true|false` runtime toggle
+- [x] v0.5.239: Build clean; confirm all 4 .cso resources are embedded in shipped DLL; `/pyonpixexact` returns `isAvailable:true, activeState:ready, drawCount≈frameCount, targetRtvFormat:R8G8B8A8_UNorm, targetRtvScore:999999` (SwapChain back buffer matched directly)
+- [x] v0.5.241: Fix "white glowing mess that breaks as camera turns" — swap raw `RenderCamera->ProjectionMatrix` for `Control.Instance()->ViewProjectionMatrix` combined into `CameraProjection` slot with Identity for `CameraView`. FFXIV's raw projection matrix has reverse-Z encoding that shipped shader math didn't like; combined matrix collapses to `world * ViewProj = clip` in any shader path
+- [x] v0.5.242: Add PyonPix's second-pass reverse-walk target override (RendererService.cs:480-511) — walks `_rtvPtrs` in reverse insertion order, picks last RTV with a valid RTV/DSV pair. Target flips from `R16G16B16A16_Float` (bloomed pre-tonemap) to `B8G8R8A8_UNorm` (post-tonemap intermediate)
+- [x] v0.5.243/244: Diagnostic endpoints — `/set/pyonpixexact/targetindex`, `disableblend`, `disabledepth`, `requiredsv`. Expose insertion index in `/pyonpixexact/rtvs` so operators can walk every candidate live
+- [x] v0.5.245: **TV FRONT NOW VISIBLE WITH VIDEO** — root cause: LibVLC writes video frames as BGRA with alpha=0 (undefined pad channel). PyonPix's compiled shader multiplies output by sampled alpha; SrcAlpha/InvSrcAlpha blend then produces `dst = 0*src + 1*dst = unchanged` = invisible. Fix: set `DisableBlend=true` as default (opaque RGBA write ignores src alpha entirely). PyonPix's reference plugin uses a CEF browser texture that DOES write alpha=1 so their default blend works; our video pipeline needs blend disabled
+- [x] v0.5.245: Visual confirmation on host — video content plays on TV front face, back face draws as `BackColour` (black), characters occlude correctly, no bloom halo
+- [ ] Visual confirmation on peer that TV renders correctly (the whole point)
+
+---
+
 ## Phase 5 — CopyBlit Renderer (XMP-Style, No Game Hooks)
 
 Goal: Add an alternative renderer that follows the XivMediaPlayer architecture: no game hooks, capture depth via `CopyResource`, composite a fullscreen-triangle pixel shader into a plugin-owned offscreen RTV, then blit via `ImGui.AddImage`. Purpose: eliminate the peer-render fragility of the CF-DI hook path (invisible / grayscale-shadow bug on non-host machines).

@@ -12,7 +12,7 @@
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <AssemblyName>FFXIV-TV</AssemblyName>
     <RootNamespace>FFXIVTv</RootNamespace>
-    <Version>0.5.223</Version>
+    <Version>0.5.245</Version>
     <UseWindowsForms>true</UseWindowsForms>
   </PropertyGroup>
 
@@ -29,6 +29,17 @@
     <PackageReference Include="LibVLCSharp"              Version="3.9.0" />
     <PackageReference Include="VideoLAN.LibVLC.Windows"  Version="3.0.21" />
     <PackageReference Include="Microsoft.Web.WebView2"   Version="1.0.3065.32" />
+  </ItemGroup>
+
+  <!-- Phase 6: PyonPixExact renderer ships PyonPix's compiled shader bytecode.
+       Loaded at runtime from Assembly.GetManifestResourceStream("FFXIVTv.Shaders.<name>.cso").
+       Extracted from installedPlugins/PyonPix/1.1.0.1/PyonPix.dll (identical to 1.0.0.6).
+       See src/PyonPixExactRenderer.cs. -->
+  <ItemGroup>
+    <EmbeddedResource Include="Shaders\vsmain.cso" LogicalName="FFXIVTv.Shaders.vsmain.cso" />
+    <EmbeddedResource Include="Shaders\psmain.cso" LogicalName="FFXIVTv.Shaders.psmain.cso" />
+    <EmbeddedResource Include="Shaders\vsavg.cso"  LogicalName="FFXIVTv.Shaders.vsavg.cso" />
+    <EmbeddedResource Include="Shaders\psavg.cso"  LogicalName="FFXIVTv.Shaders.psavg.cso" />
   </ItemGroup>
 
   <ItemGroup>
