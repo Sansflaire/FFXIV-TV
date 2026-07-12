@@ -180,7 +180,30 @@ public sealed unsafe class PyonPixExactRenderer : IDisposable
     {
         _presentIndex++;
         FrameCount++;
+
+        // Auto-fallback: some players' D3D pipelines never bind our chosen target
+        // RTV together with a cached R24G8_Typeless DSV (observed 2026-07-12 on a
+        // peer test — their reverse-walk picked an R8G8B8A8_UNorm surface that's
+        // used in a DSV-free composite/UI pass). PyonPix's PreDraw semantics then
+        // gate Draw off forever. If we're past a reasonable warm-up window with a
+        // target selected but 0 draws, flip RequireDsv so Draw fires on any bind
+        // of the target. Safe on machines where it wasn't needed — their Draw
+        // already fires well before the threshold, so the flag never flips.
+        if (!_autoDisabledDsvGate
+            && RequireDsv
+            && DrawCount == 0
+            && _targetRtv != null
+            && FrameCount > 300)
+        {
+            RequireDsv = false;
+            _autoDisabledDsvGate = true;
+            Plugin.Log.Warning(
+                "[FFXIV-TV] PyonPixExact: 300 frames with a target selected but " +
+                "0 draws — auto-disabling RequireDsv so Draw can fire on any bind " +
+                "of the target RTV. Set via /set/pyonpixexact/requiredsv?v=true to override.");
+        }
     }
+    private bool _autoDisabledDsvGate;
 
     // ── PyonPix's 288-byte ShaderParams cbuffer, byte-for-byte ──────────────
     // Field order and padding match ref-pyonpix/ShaderParams.cs. HLSL cbuffer
