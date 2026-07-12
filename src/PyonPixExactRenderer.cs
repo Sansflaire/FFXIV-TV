@@ -110,6 +110,8 @@ public sealed unsafe class PyonPixExactRenderer : IDisposable
     private ID3D11SamplerState?      _sampler;
     private ID3D11BlendState?        _blend;
     private ID3D11BlendState?        _blendOff;   // BlendEnable=false — direct RGBA write
+    private ID3D11Texture2D?         _fallbackTex; // 1x1 opaque grey placeholder
+    private ID3D11ShaderResourceView? _fallbackSrv; // bound when _videoPlayer.FrameSrv is null
     private ID3D11DepthStencilState? _depthState;
     private ID3D11DepthStencilState? _dsNoDepth;
     private ID3D11RasterizerState?   _rasterState;
@@ -338,6 +340,40 @@ public sealed unsafe class PyonPixExactRenderer : IDisposable
             RenderTargetWriteMask = ColorWriteEnable.All,
         };
         _blendOff = _device.CreateBlendState(blendOffDesc);
+
+        // 1x1 opaque neutral-grey fallback texture. PyonPix's compiled pixel
+        // shader multiplies the sampled video texture into its output — when
+        // no video is playing, sampling an unbound SRV slot yields (0,0,0,0)
+        // and the shader outputs an alpha-0 pixel that some target surfaces
+        // treat as transparent (observed on a peer 2026-07-12: PyonPixExact
+        // drawing every frame, but the TV was totally invisible because no
+        // video was loaded and the shader output was fully transparent).
+        // Binding this fallback SRV instead gives the shader a defined
+        // (128, 128, 128, 255) sample so at least a grey rectangle appears
+        // where the TV is — a clear signal to the user that the plugin is
+        // placed correctly and just needs content.
+        var fallbackDesc = new Texture2DDescription
+        {
+            Width             = 1,
+            Height            = 1,
+            MipLevels         = 1,
+            ArraySize         = 1,
+            Format            = Format.B8G8R8A8_UNorm,
+            SampleDescription = new SampleDescription(1, 0),
+            Usage             = ResourceUsage.Immutable,
+            BindFlags         = BindFlags.ShaderResource,
+        };
+        // BGRA order = 0x80, 0x80, 0x80, 0xFF — mid-grey opaque.
+        var greyPixel = new byte[] { 0x80, 0x80, 0x80, 0xFF };
+        unsafe
+        {
+            fixed (byte* p = greyPixel)
+            {
+                var subData = new SubresourceData { DataPointer = (nint)p, RowPitch = 4, SlicePitch = 4 };
+                _fallbackTex = _device.CreateTexture2D(fallbackDesc, new[] { subData });
+            }
+        }
+        _fallbackSrv = _device.CreateShaderResourceView(_fallbackTex);
 
         // Reversed-Z (FFXIV): PyonPix flips LessEqual → GreaterEqual.
         _depthState = _device.CreateDepthStencilState(new DepthStencilDescription
@@ -750,7 +786,7 @@ public sealed unsafe class PyonPixExactRenderer : IDisposable
         if (_screen == null || !_screen.Visible) return;
 
         _videoPlayer?.UploadFrame(_context);
-        var videoSrv = _videoPlayer?.FrameSrv;
+        var videoSrv = _videoPlayer?.FrameSrv ?? _fallbackSrv;
 
         _dsvCache.TryGetValue(curDsvPtr, out var dsvItem);
         ID3D11DepthStencilView? drawDsv = dsvItem?.Dsv;
@@ -921,6 +957,8 @@ public sealed unsafe class PyonPixExactRenderer : IDisposable
         _sampler?.Dispose();     _sampler = null;
         _blend?.Dispose();       _blend = null;
         _blendOff?.Dispose();    _blendOff = null;
+        _fallbackSrv?.Dispose(); _fallbackSrv = null;
+        _fallbackTex?.Dispose(); _fallbackTex = null;
         _depthState?.Dispose();  _depthState = null;
         _dsNoDepth?.Dispose();   _dsNoDepth = null;
         _rasterState?.Dispose(); _rasterState = null;
