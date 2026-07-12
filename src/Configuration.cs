@@ -117,16 +117,31 @@ public sealed class Configuration : IPluginConfiguration
     public bool ShowBlackBacking { get; set; } = true;
 
     /// <summary>
-    /// When true, use the XMP-style CopyBlit renderer instead of the hook-based D3DRenderer.
-    /// CopyBlit runs entirely at UiBuilder.Draw time, uses CopyResource on the game's depth
-    /// buffer + a fullscreen-triangle pixel shader that samples the video and does a software
-    /// depth test, then blits an offscreen RTV via ImGui.AddImage. Trades ~2 full-screen
-    /// copies per frame of VRAM bandwidth for a render path that does not depend on
-    /// pattern-matching a specific GPU/settings-dependent inject point, so it renders
-    /// correctly on every peer's machine rather than only the host's.
-    /// Default: true (the XMP-clone path is what peers see).
+    /// Rendering mode toggle.
+    ///
+    /// TRUE  (default) = XivMediaPlayer-style rendering. No game render hooks. Camera
+    ///                   basis + FoV read from RenderCamera; fullscreen triangle in the
+    ///                   PS does ray-plane intersection against the TV world corners;
+    ///                   5x5 Gaussian PCF depth test against a CopyResource'd depth
+    ///                   buffer; composite blit through ImGui + native ATK addon
+    ///                   restore. THIS IS WHAT WORKS ON PEERS' MACHINES.
+    ///
+    /// FALSE           = Legacy FFXIV-TV rendering (D3DRenderer). Hooks
+    ///                   ID3D11DeviceContext vtable slots and pattern-matches the LDR
+    ///                   post-tonemap surface at inject time. Works on the host, fails
+    ///                   on peers with different GPU/settings/patch combos (invisible
+    ///                   or "faint grayscale shadow" symptoms). Kept as a fallback
+    ///                   only for A/B comparison.
+    ///
+    /// Field name is kept as UseCopyBlitRenderer for on-disk config compatibility.
     /// </summary>
-    public bool UseCopyBlitRenderer { get; set; } = true;
+    /// <remarks>
+    /// v0.5.222: default flipped to FALSE. The XMP-style path is still broken (was
+    /// producing full-screen dark-blue fills). Legacy D3DRenderer stays the default
+    /// until the ray-plane math is verified working, so this toggle never covers a
+    /// user's screen on install.
+    /// </remarks>
+    public bool UseCopyBlitRenderer { get; set; } = false;
 
     // ── Network Sync ──────────────────────────────────────────────────────────
 
