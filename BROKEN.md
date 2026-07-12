@@ -1,6 +1,79 @@
 # FFXIV-TV — Active Issues
 
-Last updated: 2026-04-18 (v0.5.172)
+Last updated: 2026-07-11 (v0.5.219)
+
+---
+
+## CopyBlitRenderer (Phase 5, v0.5.216+) — Bug Journal
+
+Purpose of the renderer: mirror XivMediaPlayer's no-hooks pipeline so peers see the TV
+correctly (the CF-DI hook path only draws right on the machine whose GPU/settings match
+the pattern-matched inject moment; on peers it comes out invisible or as a "faint
+grayscale shadow over dark colors" — that is HDR pre-tonemap injection into the wrong
+surface, and the whole point of Phase 5 is to sidestep the hook entirely).
+
+### v0.5.216 — Diagonal wedge / stripe across the screen (missing `row_major`)
+
+**Symptom**: TV rendered as a thin diagonal stripe running from one corner to another
+across the whole screen — not a rectangle. Also a full-screen colored gradient wedge
+tapering to a vanishing point.
+
+**Root cause**: HLSL cbuffer declared `float4x4 InvViewProj; float4x4 ViewProj;`
+without the `row_major` keyword. `.NET Matrix4x4` stores in row-major memory; HLSL
+defaults to column-major when reading from a constant buffer, so it saw the transpose
+of both matrices. Ray reconstruction (`mul(ndc, InvViewProj)`) produced garbage
+directions for most pixels; only the narrow subset of pixels whose garbage-rays
+happened to graze the TV plane ended up filling — hence the stripe.
+
+**Fix**: Add `row_major` to both matrix declarations in the cbuffer (matches
+D3DRenderer.cs:495-496).
+
+### v0.5.217 — Full-screen black (M44=0 → forced-invert produced degenerate InvViewProj)
+
+**Symptom**: Whole screen goes black once the CopyBlit path activates. Not the
+game — an opaque black rectangle covering the entire viewport.
+
+**Diagnosis**: Swapped the shader for a solid-red output. Result was solid-red
+covering the whole screen (v0.5.218) — proving:
+1. RTV/blit pipeline works end-to-end.
+2. Ray-plane u/v gate was passing on every pixel — meaning the ray reconstruction
+   was producing hits at valid u/v for every ray direction.
+
+**Root cause**: FFXIV's `Control.Instance()->ViewProjectionMatrix` has `M44 = 0`
+(standard perspective-matrix layout in .NET row-major memory). I "fixed" that by
+setting `M44 = 1` before calling `Matrix4x4.Invert`, but this turns a valid
+perspective matrix into a DIFFERENT (invertible but wrong) matrix. Its inverse maps
+every NDC pixel to a fixed cluster of world points that all lie inside the TV plane's
+u/v rectangle. Solid black in the earlier version was the same broken u/v producing
+the placeholder gradient which then got zeroed by an alpha/premultiply cascade.
+
+**Fix (v0.5.219)**: Abandon the ray-plane / InvViewProj approach entirely. Switch to
+D3DRenderer's proven convention — a real 6-vertex quad emitted from `SV_VertexID`,
+transformed `local → world → clip` in the VS. The rasterizer only fills pixels
+covered by the projected TV quad; everything outside stays at the transparent clear
+color, which ImGui's straight-alpha blit passes through as the underlying game.
+
+Kept the XMP-style parts that don't need InvViewProj:
+- CopyResource depth capture from `RenderTargetManager.Instance()->DepthStencil`
+- 5x5 Gaussian PCF depth compare in the PS against the depth SRV
+- Offscreen RTV owned by the plugin, blitted via `ImGui.AddImageQuad`
+
+The remaining "no hooks / everything plugin-owned" property (which is what makes it
+render correctly on peers) is preserved. Only the ray-plane math is gone.
+
+### Lessons
+
+- **Never patch matrix elements to "make Invert work"**. If a matrix's M44=0 makes
+  it appear non-invertible, it usually means the matrix is designed for column-vector
+  math and .NET's row-vector `Invert` is confused, OR the matrix legitimately IS a
+  perspective matrix whose M44 SHOULD be 0. Either way, the fix is to change the
+  convention, not corrupt the input.
+- **Add `row_major` to every cbuffer matrix** in this codebase — .NET Matrix4x4 is
+  row-major memory but HLSL defaults column-major, and without the keyword the shader
+  silently reads transposes. This burned D3DRenderer years ago too (see line 495).
+- **Debug by tracing the pipeline top-down**. When a shader shows an unexpected
+  shape, before touching math swap the PS body for a solid color — that isolates
+  RTV/blit correctness from shader correctness in one build.
 
 ---
 

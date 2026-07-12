@@ -33,12 +33,13 @@ internal sealed class StatusApi : IDisposable
     private volatile bool         _running;
 
     // Subsystem references — set via SetSubsystems after all objects are constructed.
-    private D3DRenderer?     _d3d;
-    private VideoPlayer?     _vp;
-    private BrowserPlayer?   _bp;
-    private SyncCoordinator? _sync;
-    private Configuration?   _cfg;
+    private D3DRenderer?      _d3d;
+    private VideoPlayer?      _vp;
+    private BrowserPlayer?    _bp;
+    private SyncCoordinator?  _sync;
+    private Configuration?    _cfg;
     private IGameGui?         _gui;
+    private CopyBlitRenderer? _cb;
 
     internal StatusApi()
     {
@@ -70,6 +71,9 @@ internal sealed class StatusApi : IDisposable
         _gui  = gui;
     }
 
+    /// <summary>Wire up the CopyBlit renderer once it's constructed in Plugin.cs.</summary>
+    internal void SetCopyBlit(CopyBlitRenderer cb) => _cb = cb;
+
     public void Dispose()
     {
         _running = false;
@@ -100,6 +104,7 @@ internal sealed class StatusApi : IDisposable
             {
                 "/version" or "/status" or "" => BuildVersion(),
                 "/render"                      => BuildRender(),
+                "/copyblit" or "/get/copyblit" => BuildCopyBlit(),
                 "/video"                       => BuildVideo(),
                 "/browser"                     => BuildBrowser(),
                 "/sync"                        => BuildSync(),
@@ -217,6 +222,18 @@ internal sealed class StatusApi : IDisposable
                 c.Save();
                 return "{\"saved\":true}";
 
+            // XMP-style CopyBlit renderer toggle. Default is ON.
+            //   curl "http://localhost:17777/set/copyblit?v=true"   → force XMP-style path
+            //   curl "http://localhost:17777/set/copyblit?v=false"  → revert to legacy hook path
+            //   curl "http://localhost:17777/get/copyblit"          → status snapshot
+            case "/set/copyblit":
+                if (TryBoolQ(q, "v", out bool cbEnabled))
+                {
+                    c.UseCopyBlitRenderer = cbEnabled;
+                    c.Save();
+                }
+                return $"{{\"useCopyBlitRenderer\":{B(c.UseCopyBlitRenderer)}}}";
+
             // Inject-path controls — no config save needed (runtime only).
             case "/set/omsetrtenable":
                 if (TryBoolQ(q, "v", out bool ome)) D3DRenderer.OmSetRtInjectEnabled = ome;
@@ -304,6 +321,26 @@ internal sealed class StatusApi : IDisposable
     {
         var v = Assembly.GetExecutingAssembly().GetName().Version?.ToString(3) ?? "unknown";
         return $"{{\"version\":\"{v}\",\"loaded\":true}}";
+    }
+
+    private string BuildCopyBlit()
+    {
+        var cb = _cb;
+        var c  = _cfg;
+        var (vpW, vpH) = cb?.LastViewport ?? (0, 0);
+        return $$"""
+        {
+          "useCopyBlitRenderer": {{B(c?.UseCopyBlitRenderer ?? false)}},
+          "isAvailable":         {{B(cb?.IsAvailable ?? false)}},
+          "frameCount":          {{cb?.FrameCount ?? 0}},
+          "depthCaptureCount":   {{cb?.DepthCaptureCount ?? 0}},
+          "blitCount":           {{cb?.BlitCount ?? 0}},
+          "lastError":           {{Q(cb?.LastError ?? "")}},
+          "lastDepthFmt":        {{Q(cb?.LastDepthFmt ?? "none")}},
+          "lastDepthTexPtr":     "0x{{(cb?.LastDepthTexPtr ?? 0):X}}",
+          "lastViewport":        { "w": {{vpW}}, "h": {{vpH}} }
+        }
+        """;
     }
 
     private string BuildRender()

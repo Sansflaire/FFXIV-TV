@@ -4,6 +4,23 @@
 
 ---
 
+## Phase 5 — CopyBlit Renderer (XMP-Style, No Game Hooks)
+
+Goal: Add an alternative renderer that follows the XivMediaPlayer architecture: no game hooks, capture depth via `CopyResource`, composite a fullscreen-triangle pixel shader into a plugin-owned offscreen RTV, then blit via `ImGui.AddImage`. Purpose: eliminate the peer-render fragility of the CF-DI hook path (invisible / grayscale-shadow bug on non-host machines).
+
+- [ ] v0.5.216: Add `UseCopyBlitRenderer` config toggle (default **ON**) so the test path is what peers see by default; existing D3DRenderer path preserved for A/B compare
+- [ ] v0.5.216: Create `src/CopyBlitRenderer.cs` — no vtable hooks, runs entirely at `UiBuilder.Draw` time
+- [ ] v0.5.216: Depth capture via `RenderTargetManager.Instance()->DepthStencil->D3D11Texture2D` + `CopyResource` into plugin-owned texture with `DepthStencil | ShaderResource` bind flags
+- [ ] v0.5.216: HLSL shader — fullscreen triangle from `SV_VertexID`; PS reconstructs ray from `InvViewProj`, intersects TV plane using `CornerTL/TR/BL`, samples video texture, 5×5 Gaussian PCF depth compare
+- [ ] v0.5.216: Offscreen composite RTV (R8G8B8A8_UNorm) matching viewport size; recreate on resize
+- [ ] v0.5.216: Blit offscreen SRV to background draw list via `ImGui.GetBackgroundDrawList().AddImage`
+- [ ] v0.5.216: Wire `Plugin.OnDraw` to route to CopyBlitRenderer when toggle is on; skip all D3DRenderer hook activation in that mode
+- [ ] v0.5.216: StatusApi setters `/set/copyblit?v=true|false`, `/get/copyblit`; UI toggle in MainWindow
+- [ ] v0.5.216: Verify on-machine — video visible via CopyBlit path
+- [ ] v0.5.216: Verify on peer — should render identical rectangle (this is the whole point)
+
+---
+
 ## Phase 0 — Project Scaffolding
 
 - [x] Create `FFXIV-TV/` folder in devPlugins

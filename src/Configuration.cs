@@ -116,6 +116,18 @@ public sealed class Configuration : IPluginConfiguration
     /// </summary>
     public bool ShowBlackBacking { get; set; } = true;
 
+    /// <summary>
+    /// When true, use the XMP-style CopyBlit renderer instead of the hook-based D3DRenderer.
+    /// CopyBlit runs entirely at UiBuilder.Draw time, uses CopyResource on the game's depth
+    /// buffer + a fullscreen-triangle pixel shader that samples the video and does a software
+    /// depth test, then blits an offscreen RTV via ImGui.AddImage. Trades ~2 full-screen
+    /// copies per frame of VRAM bandwidth for a render path that does not depend on
+    /// pattern-matching a specific GPU/settings-dependent inject point, so it renders
+    /// correctly on every peer's machine rather than only the host's.
+    /// Default: true (the XMP-clone path is what peers see).
+    /// </summary>
+    public bool UseCopyBlitRenderer { get; set; } = true;
+
     // ── Network Sync ──────────────────────────────────────────────────────────
 
     /// <summary>Current network sync role (Off / Host / Client).</summary>

@@ -32,6 +32,10 @@ public sealed class Plugin : IDalamudPlugin
     // Phase 2: D3D11 world-space with depth (initialized on first draw frame)
     private readonly D3DRenderer _d3dRenderer;
 
+    // Phase 5: XMP-style CopyBlit renderer (no hooks; portable across peers).
+    // Selected by Configuration.UseCopyBlitRenderer (default: true).
+    private readonly CopyBlitRenderer _copyBlit;
+
     // Phase 3: Video playback via LibVLC
     private readonly VideoPlayer      _videoPlayer;
     private bool _videoSetupDone;
@@ -60,6 +64,7 @@ public sealed class Plugin : IDalamudPlugin
 
         _screenRenderer = new ScreenRenderer(GameGui, TextureProvider);
         _d3dRenderer    = new D3DRenderer(GameInterop);
+        _copyBlit       = new CopyBlitRenderer();
         _videoPlayer    = new VideoPlayer(PluginInterface.AssemblyLocation.DirectoryName!);
         _browserPlayer  = new BrowserPlayer(PluginInterface.AssemblyLocation.DirectoryName!);
         _sync           = new SyncCoordinator(_videoPlayer);
@@ -68,7 +73,11 @@ public sealed class Plugin : IDalamudPlugin
         _mainWindow.SetBrowserPlayer(_browserPlayer);
         _mainWindow.SetD3DRenderer(_d3dRenderer);
 
+        _copyBlit.SetVideoPlayer(_videoPlayer);
+        _copyBlit.SetGameGui(GameGui);
+
         _statusApi.SetSubsystems(_d3dRenderer, _videoPlayer, _browserPlayer, _sync, Config, GameGui);
+        _statusApi.SetCopyBlit(_copyBlit);
 
         _sync.Volume = Config.Volume;
         _sync.Muted  = Config.Muted;
@@ -125,6 +134,7 @@ public sealed class Plugin : IDalamudPlugin
         _sync.Dispose();
         _videoPlayer.Dispose();
         _browserPlayer.Dispose();
+        _copyBlit.Dispose();
         _d3dRenderer.Dispose();
         _screenRenderer.Dispose();
         Config.Save();
@@ -317,6 +327,40 @@ public sealed class Plugin : IDalamudPlugin
         var screen = Config.Screen;
         if (!screen.Visible) return;
 
+        // ── XMP-style CopyBlit path (default; toggle in Configuration) ───────
+        // Runs entirely at UiBuilder.Draw time — no game render hooks. Renders
+        // identically on every peer's machine because the whole compositing
+        // surface is plugin-owned; nothing depends on pattern-matching the game's
+        // CF-DI inject point.
+        if (Config.UseCopyBlitRenderer)
+        {
+            if (!_copyBlit.IsAvailable)
+                _copyBlit.TryInitialize();
+
+            if (_copyBlit.IsAvailable && !_videoSetupDone && _copyBlit.Device != null)
+            {
+                _videoPlayer.SetDevice(_copyBlit.Device);
+                _videoSetupDone = true;
+            }
+
+            _sync.Mode          = Config.SyncMode;
+            _sync.YtDlpPath     = Config.YtDlpPath;
+            _sync.Playlist      = Config.Playlist;
+            _sync.PlaylistIndex = Config.PlaylistIndex;
+            _sync.PlaylistLoop  = Config.PlaylistLoop;
+
+            if (Config.SyncMode == NetworkMode.Host && Config.SyncServerRunning
+                && !_sync.Server.IsRunning && string.IsNullOrEmpty(_sync.Server.LastError))
+                _sync.Server.Start(Config.SyncPort);
+            else if ((!Config.SyncServerRunning || Config.SyncMode != NetworkMode.Host)
+                && _sync.Server.IsRunning)
+                _sync.Server.Stop();
+
+            _copyBlit.Draw(Config);
+            return;
+        }
+
+        // ── Legacy hook-based D3DRenderer path (Config.UseCopyBlitRenderer = false) ──
         // Try to initialize the D3D11 renderer on the first draw frame
         // (device isn't available until after Dalamud's ImGui init completes).
         if (!_d3dRenderer.IsAvailable)
